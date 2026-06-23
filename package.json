@@ -1,0 +1,33 @@
+{
+  "name": "mustle-voice",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "scripts": {
+    "dev": "expo start --dev-client",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "build:android": "eas build --platform android --profile development",
+    "build:ios": "eas build --platform ios --profile development",
+    "build:prod": "eas build --platform ios --profile production"
+  },
+  "dependencies": {
+    "@config-plugins/react-native-webrtc": "^14.0.0",
+    "@elevenlabs/react-native": "^1.2.7",
+    "@livekit/react-native": "2.9.8",
+    "@livekit/react-native-expo-plugin": "1.0.1",
+    "@livekit/react-native-webrtc": "137.0.3",
+    "expo": "^55",
+    "expo-dev-client": "~55.0.35",
+    "expo-splash-screen": "~55.0.21",
+    "expo-status-bar": "~55.0.6",
+    "livekit-client": "^2.19.2",
+    "react": "19.2.0",
+    "react-native": "0.83.6",
+    "react-native-safe-area-context": "~5.6.2"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.10",
+    "typescript": "~5.9.2"
+  },
+  "private": true
+}
