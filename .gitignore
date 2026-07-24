@@ -18,3 +18,13 @@ ios/
 android/
 node_modules
 TESTING.md
+
+docs/
+
+# Inworld spike leftovers (throwaway audio + regenerable cost artifact)
+scripts/*.mp3
+scripts/*.wav
+scripts/*.m4a
+*.pdf
+*.html
+.expo
