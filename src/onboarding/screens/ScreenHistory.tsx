@@ -18,7 +18,6 @@ export const ScreenHistory = ({
   return (
     <ConversationalScreen
       coachMessage={`Nice to meet you, ${userName}. How long have you been lifting — if at all?`}
-      autoFillText="I've been training for about 2 years"
       typeInputPlaceholder="e.g. 2"
       typeInputUnit="years"
       dotIndex={4}

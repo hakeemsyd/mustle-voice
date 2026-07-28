@@ -1,11 +1,11 @@
-import { mediaDevices } from '@livekit/react-native-webrtc';
+import { requestRecordingPermissionsAsync } from 'expo-audio';
 
 export const requestMicPermission = async (): Promise<boolean> => {
   try {
-    const stream = await mediaDevices.getUserMedia({ audio: true });
-    stream.getTracks().forEach((track) => track.stop());
-    return true;
-  } catch {
+    const { granted } = await requestRecordingPermissionsAsync();
+    return granted;
+  } catch (err) {
+    console.error('[onboarding voice] mic permission request failed:', err);
     return false;
   }
 };

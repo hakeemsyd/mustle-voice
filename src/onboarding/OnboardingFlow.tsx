@@ -1,4 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
+import { ActivityIndicator, View } from "react-native";
+import { colors } from "../constants/theme";
 import { Splash } from "./screens/Splash";
 import { ScreenMic } from "./screens/ScreenMic";
 import { useOnboardingState } from "./useOnboardingState";
@@ -23,18 +25,23 @@ interface OnboardingFlowProps {
 const LAST_BUILT_SCREEN = 13;
 
 export const OnboardingFlow = ({ userId, onComplete }: OnboardingFlowProps) => {
-  const [screenIndex, setScreenIndex] = useState(0);
-  const { state, update, complete } = useOnboardingState();
-
-  const goTo = (index: number) => setScreenIndex(index);
-  const goNext = () => setScreenIndex((i) => i + 1);
-  const goBack = () => setScreenIndex(Math.max(0, screenIndex - 1));
+  const { state, screenIndex, ready, update, goTo, goNext, goBack, complete, clearDraft } =
+    useOnboardingState();
 
   useEffect(() => {
     if (screenIndex > LAST_BUILT_SCREEN) {
+      clearDraft();
       onComplete();
     }
-  }, [screenIndex, onComplete]);
+  }, [screenIndex, onComplete, clearDraft]);
+
+  if (!ready) {
+    return (
+      <View style={styles.loading}>
+        <ActivityIndicator color={colors.accent} />
+      </View>
+    );
+  }
 
   switch (screenIndex) {
     case 0:
@@ -178,9 +185,20 @@ export const OnboardingFlow = ({ userId, onComplete }: OnboardingFlowProps) => {
       );
 
     case 13:
-      return <ScreenLoading onComplete={onComplete} />;
+      return (
+        <ScreenLoading
+          onComplete={() => {
+            clearDraft();
+            onComplete();
+          }}
+        />
+      );
 
     default:
       return null;
   }
 };
+
+const styles = {
+  loading: { flex: 1, backgroundColor: colors.bg, alignItems: "center", justifyContent: "center" },
+} as const;

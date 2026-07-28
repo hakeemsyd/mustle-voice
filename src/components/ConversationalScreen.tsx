@@ -1,8 +1,9 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   KeyboardAvoidingView,
   Platform,
   StyleSheet,
+  Text,
   TouchableOpacity,
   View,
 } from "react-native";
@@ -17,14 +18,16 @@ import Animated, {
   useSharedValue,
   withTiming,
 } from "react-native-reanimated";
-
 import { Orb, type OrbState } from "../onboarding/Orb";
 import { ProgressDots } from "../onboarding/ProgressDots";
+import { useVoiceRecorder, type StopReason } from "../onboarding/useVoiceRecorder";
+import { useSpeakOnMount } from "../onboarding/useSpeakOnMount";
 
 import { BackIcon } from "../icons/BackIcon";
 
 import { colors, fonts } from "../constants/theme";
 import { useWordTyping } from "../hooks/useWordTyping";
+import { transcribeRecording } from "../lib/elevenLabsVoice";
 
 import { VoiceButton } from "./VoiceButton";
 import { TypeInsteadButton } from "./TypeInsteadButton";
@@ -33,11 +36,12 @@ import { ConversationContinueButton } from "./ConversationContinueButton";
 import { UseVoiceInsteadButton } from "./UseVoiceInsteadButton";
 
 type Phase =
-  | "speaking" // coach message revealing word by word
+  | "speaking" // coach message revealing word by word, TTS audio playing
   | "pause" // fully visible, waiting before shrink
   | "shrank" // message shrinking
-  | "listening" // YOU SPEAK zone visible
-  | "filling" // autofill text typing
+  | "listening" // YOU SPEAK zone visible, mic recording
+  | "transcribing" // recording stopped, awaiting STT result
+  | "filling" // real transcript typing in
   | "processing"; // orb processing, then advance
 
 const WORD_SPEED_COACH = 90;
@@ -46,7 +50,6 @@ const PAUSE_AFTER_COACH = 1500;
 
 interface ConversationalScreenProps {
   coachMessage: string;
-  autoFillText: string;
   typeInputPlaceholder?: string;
   typeInputUnit?: string;
   typeSlot?: React.ReactNode;
@@ -56,11 +59,12 @@ interface ConversationalScreenProps {
   showBack?: boolean;
   onBack?: () => void;
   onComplete: (value: string) => void;
+  /** Transforms the raw STT transcript before it's shown and passed to onComplete (e.g. normalizing spoken numbers). */
+  formatAnswer?: (rawTranscript: string) => string;
 }
 
 export const ConversationalScreen = ({
   coachMessage,
-  autoFillText,
   typeInputPlaceholder = "Type here...",
   typeInputUnit,
   typeSlot,
@@ -70,12 +74,18 @@ export const ConversationalScreen = ({
   showBack = true,
   onBack,
   onComplete,
+  formatAnswer,
 }: ConversationalScreenProps) => {
   const [phase, setPhase] = useState<Phase>(
     forceTypeMode ? "listening" : "speaking",
   );
   const [typeMode, setTypeMode] = useState(forceTypeMode);
   const [typeValue, setTypeValue] = useState("");
+  const [transcript, setTranscript] = useState("");
+
+  const { audioDone, audioStarted } = useSpeakOnMount(coachMessage, !forceTypeMode);
+  const { start: startRecording, stop: stopRecording } = useVoiceRecorder();
+  const voiceTapHandledRef = useRef(false);
 
   const fontSize = useSharedValue(26);
   const lineHeight = useSharedValue(34);
@@ -96,7 +106,7 @@ export const ConversationalScreen = ({
 
   const { count: coachCount, words: coachWords } = useWordTyping(
     coachMessage,
-    phase === "speaking",
+    phase === "speaking" && audioStarted,
     WORD_SPEED_COACH,
   );
 
@@ -104,15 +114,15 @@ export const ConversationalScreen = ({
     count: fillCount,
     isDone: fillDone,
     words: fillWords,
-  } = useWordTyping(autoFillText, phase === "filling", WORD_SPEED_FILL);
+  } = useWordTyping(transcript, phase === "filling", WORD_SPEED_FILL);
 
-  // speaking → pause
+  // speaking → pause (only once both the word reveal AND the TTS audio have finished)
   useEffect(() => {
-    if (phase === "speaking" && coachCount >= coachWords.length) {
+    if (phase === "speaking" && coachCount >= coachWords.length && audioDone) {
       const timer = setTimeout(() => setPhase("pause"), 100);
       return () => clearTimeout(timer);
     }
-  }, [phase, coachCount, coachWords.length]);
+  }, [phase, coachCount, coachWords.length, audioDone]);
 
   // pause → shrank (shrink animation)
   useEffect(() => {
@@ -135,6 +145,20 @@ export const ConversationalScreen = ({
     }
   }, [phase]);
 
+  // listening → start recording the user's answer; auto-stops once they pause after speaking
+  useEffect(() => {
+    if (phase === "listening" && !typeMode) {
+      voiceTapHandledRef.current = false;
+      startRecording((reason) => {
+        handleVoiceTap(reason);
+      }).catch((err) => {
+        console.error("[onboarding voice] failed to start recording:", err);
+        setTypeMode(true);
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, typeMode]);
+
   // filling → processing
   useEffect(() => {
     if (phase === "filling" && fillDone) {
@@ -149,7 +173,7 @@ export const ConversationalScreen = ({
       youSpeakFade.value = withTiming(0.35, { duration: 400 });
 
       const timer = setTimeout(() => {
-        onComplete(typeMode ? typeValue.trim() : autoFillText);
+        onComplete(typeMode ? typeValue.trim() : transcript);
       }, 1800);
       return () => clearTimeout(timer);
     } else {
@@ -165,6 +189,7 @@ export const ConversationalScreen = ({
       case "shrank":
         return "breathing";
       case "listening":
+      case "transcribing":
       case "filling":
         return "listening";
       case "processing":
@@ -173,11 +198,36 @@ export const ConversationalScreen = ({
   })();
 
   const youSpeakVisible =
-    phase === "listening" || phase === "filling" || phase === "processing";
+    phase === "listening" ||
+    phase === "transcribing" ||
+    phase === "filling" ||
+    phase === "processing";
 
-  const handleVoiceTap = () => {
-    if (phase === "listening") {
+  const handleVoiceTap = async (reason?: StopReason) => {
+    if (phase !== "listening" || voiceTapHandledRef.current) return;
+    voiceTapHandledRef.current = true;
+
+    if (reason === "no-speech") {
+      console.warn("[onboarding voice] nothing heard — switching to type mode");
+      await stopRecording().catch(() => null);
+      setTypeMode(true);
+      return;
+    }
+
+    setPhase("transcribing");
+
+    try {
+      const uri = await stopRecording();
+      if (!uri) throw new Error("No recording captured");
+
+      const text = await transcribeRecording(uri);
+      if (!text) throw new Error("Empty transcript");
+
+      setTranscript(formatAnswer ? formatAnswer(text) : text);
       setPhase("filling");
+    } catch (err) {
+      console.error("[onboarding voice] transcription failed:", err);
+      setTypeMode(true);
     }
   };
 
@@ -232,7 +282,14 @@ export const ConversationalScreen = ({
                 style={styles.bottomContainer}
               >
                 {phase === "listening" ? (
-                  <VoiceButton onPress={handleVoiceTap} />
+                  <VoiceButton onPress={() => handleVoiceTap()} />
+                ) : phase === "transcribing" ? (
+                  <Animated.View
+                    entering={FadeIn.duration(250)}
+                    style={[styles.responseCard, youSpeakFadeStyle]}
+                  >
+                    <Text style={styles.responseText}>Got it — one sec…</Text>
+                  </Animated.View>
                 ) : (
                   <Animated.View
                     layout={LinearTransition.springify()}
@@ -249,7 +306,10 @@ export const ConversationalScreen = ({
 
                 <TypeInsteadButton
                   disabled={phase !== "listening"}
-                  onPress={() => setTypeMode(true)}
+                  onPress={() => {
+                    stopRecording().catch(() => {});
+                    setTypeMode(true);
+                  }}
                 />
               </Animated.View>
             )}
@@ -379,4 +439,5 @@ const styles = StyleSheet.create({
     color: colors.text,
     textAlign: "center",
   },
+
 });

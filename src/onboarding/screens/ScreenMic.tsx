@@ -15,6 +15,7 @@ import Svg, { Line, Path, Rect } from "react-native-svg";
 import { Orb, type OrbState } from "../Orb";
 import { ProgressDots } from "../ProgressDots";
 import { requestMicPermission } from "../requestMicPermission";
+import { useSpeakOnMount } from "../useSpeakOnMount";
 
 import { colors, fonts } from "../../constants/theme";
 import { useWordTyping } from "../../hooks/useWordTyping";
@@ -58,20 +59,22 @@ export const ScreenMic = ({ onNext }: ScreenMicProps) => {
     onNext(granted);
   };
 
+  const { audioDone, audioStarted } = useSpeakOnMount(COACH_MSG);
+
   const { count, isDone, words } = useWordTyping(
     COACH_MSG,
-    phase === "typing" && subScreen === "main",
+    phase === "typing" && subScreen === "main" && audioStarted,
   );
 
   useEffect(() => {
-    if (phase === "typing" && isDone) {
+    if (phase === "typing" && isDone && audioDone) {
       const timer = setTimeout(() => {
         setPhase("shrinking");
       }, 300);
 
       return () => clearTimeout(timer);
     }
-  }, [phase, isDone]);
+  }, [phase, isDone, audioDone]);
 
   useEffect(() => {
     if (phase === "shrinking") {

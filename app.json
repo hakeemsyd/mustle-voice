@@ -47,7 +47,9 @@
       "@livekit/react-native-expo-plugin",
       "@config-plugins/react-native-webrtc",
       "expo-font",
-      "./plugins/withSwiftUICoreLinkFix"
+      "./plugins/withSwiftUICoreLinkFix",
+      "expo-audio",
+      "expo-asset"
     ]
   }
 }

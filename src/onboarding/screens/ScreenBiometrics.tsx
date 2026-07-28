@@ -4,6 +4,7 @@ import { Pressable, StyleSheet, Text, View } from "react-native";
 import { ConversationalScreen } from "../../components/ConversationalScreen";
 import { ConversationAnswerCard } from "../../components/ConversationAnswerCard";
 import { fonts } from "../../constants/theme";
+import { formatBiometricsAnswer, parseFormattedBiometrics } from "../formatBiometricsAnswer";
 
 type Units = "metric" | "imperial";
 
@@ -69,16 +70,26 @@ export const ScreenBiometrics = ({
     </View>
   );
 
+  const handleComplete = (formattedAnswer: string) => {
+    if (height && weight) {
+      onNext(height, weight, units);
+      return;
+    }
+
+    const parsed = parseFormattedBiometrics(formattedAnswer);
+    onNext(parsed.height ?? "5'11", parsed.weight ?? "176", parsed.units ?? units);
+  };
+
   return (
     <ConversationalScreen
       coachMessage="What's your height and weight? Rough numbers are fine."
-      autoFillText="5'11, 176 lbs"
       typeSlot={typeSlot}
       typeValid={typeValid}
       dotIndex={7}
       showBack
       onBack={onBack}
-      onComplete={() => onNext(height || "5'11", weight || "176", units)}
+      onComplete={handleComplete}
+      formatAnswer={formatBiometricsAnswer}
       forceTypeMode={forceTypeMode}
     />
   );

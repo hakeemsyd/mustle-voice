@@ -10,6 +10,7 @@ import Animated, {
 
 import { Orb, type OrbState } from "../Orb";
 import { ProgressDots } from "../ProgressDots";
+import { useSpeakOnMount } from "../useSpeakOnMount";
 
 import { colors, fonts } from "../../constants/theme";
 import { useWordTyping } from "../../hooks/useWordTyping";
@@ -38,14 +39,15 @@ export const ScreenPush = ({ onNext, onBack }: ScreenPushProps) => {
     opacity: opacity.value,
   }));
 
-  const { count, isDone, words } = useWordTyping(COACH_MSG, phase === "typing");
+  const { audioDone, audioStarted } = useSpeakOnMount(COACH_MSG);
+  const { count, isDone, words } = useWordTyping(COACH_MSG, phase === "typing" && audioStarted);
 
   useEffect(() => {
-    if (phase === "typing" && isDone) {
+    if (phase === "typing" && isDone && audioDone) {
       const timer = setTimeout(() => setPhase("shrinking"), 300);
       return () => clearTimeout(timer);
     }
-  }, [phase, isDone]);
+  }, [phase, isDone, audioDone]);
 
   useEffect(() => {
     if (phase === "shrinking") {

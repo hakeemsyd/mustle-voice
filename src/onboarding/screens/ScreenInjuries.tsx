@@ -17,9 +17,13 @@ export const ScreenInjuries = ({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [description, setDescription] = useState("");
 
-  const handleComplete = useCallback(() => {
-    onNext(Array.from(selected), description.trim() || undefined);
-  }, [selected, description, onNext]);
+  const handleComplete = useCallback(
+    (spokenAnswer: string) => {
+      const finalDescription = description.trim() || spokenAnswer.trim();
+      onNext(Array.from(selected), finalDescription || undefined);
+    },
+    [selected, description, onNext],
+  );
 
   const typeSlot = (
     <BodyDiagram
@@ -33,7 +37,6 @@ export const ScreenInjuries = ({
   return (
     <ConversationalScreen
       coachMessage="Any injuries or areas I should avoid?"
-      autoFillText="Right shoulder from an old rotator cuff issue — nothing heavy overhead. Lower back gets tight after deadlifts so I avoid going too heavy. Left knee's a bit dodgy on deep squats."
       typeSlot={typeSlot}
       typeValid={true}
       dotIndex={8}

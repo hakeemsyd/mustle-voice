@@ -12,7 +12,6 @@ export const ScreenGoal = ({ onNext, onBack, forceTypeMode }: ScreenGoalProps) =
   return (
     <ConversationalScreen
       coachMessage="What are you actually trying to get out of this? Be honest."
-      autoFillText="Build muscle"
       dotIndex={5}
       showBack
       onBack={onBack}
