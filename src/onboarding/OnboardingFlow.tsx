@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { ActivityIndicator, View } from "react-native";
 import { colors } from "../constants/theme";
 import { Splash } from "./screens/Splash";
@@ -16,6 +16,7 @@ import { ScreenHealthKit } from "./screens/ScreenHealthKit";
 import { ScreenSummary } from "./screens/ScreenSummary";
 import { ScreenLoading } from "./screens/ScreenLoading";
 import { syncOnboarding } from "../lib/onboardingSync";
+import { callBrain } from "../lib/brain";
 
 interface OnboardingFlowProps {
   userId: string | null;
@@ -27,6 +28,11 @@ const LAST_BUILT_SCREEN = 13;
 export const OnboardingFlow = ({ userId, onComplete }: OnboardingFlowProps) => {
   const { state, screenIndex, ready, update, goTo, goNext, goBack, complete, clearDraft } =
     useOnboardingState();
+
+  // Plan generation (~15s per audit) is far slower than ScreenLoading's fixed animation
+  // (5.8s) — without this, onboarding routinely hands off to Home before the plan exists,
+  // and Home has no way to know one is still coming. ScreenLoading waits on this instead.
+  const planReadyRef = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
     if (screenIndex > LAST_BUILT_SCREEN) {
@@ -173,9 +179,21 @@ export const OnboardingFlow = ({ userId, onComplete }: OnboardingFlowProps) => {
           onComplete={() => {
             complete();
             if (userId) {
-              syncOnboarding(userId, state).catch((err) =>
-                console.error("[onboarding] sync failed:", err),
-              );
+              // Resolves (never rejects) once the plan-generation call has settled either way —
+              // ScreenLoading awaits this so it never hands off to Home before the plan is real.
+              planReadyRef.current = syncOnboarding(userId, state)
+                .then(() =>
+                  callBrain(
+                    userId,
+                    "I just finished onboarding — please set up my training plan and nutrition targets from what you know about me.",
+                  ),
+                )
+                .then(
+                  () => undefined,
+                  (err) => {
+                    console.error("[onboarding] sync/plan generation failed:", err);
+                  },
+                );
             } else {
               console.warn("[onboarding] no session — skipping sync");
             }
@@ -187,6 +205,7 @@ export const OnboardingFlow = ({ userId, onComplete }: OnboardingFlowProps) => {
     case 13:
       return (
         <ScreenLoading
+          readyPromise={planReadyRef.current}
           onComplete={() => {
             clearDraft();
             onComplete();

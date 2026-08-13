@@ -53,7 +53,7 @@ export const VoiceButton = ({ onPress }: VoiceButtonProps) => {
 const styles = StyleSheet.create({
   container: {
     height: 72,
-    borderRadius: 26,
+    borderRadius: 16,
     borderWidth: 1,
     borderColor: "rgba(200,241,53,0.35)",
     backgroundColor: "rgba(200,241,53,0.08)",

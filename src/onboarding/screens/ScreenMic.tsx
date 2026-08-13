@@ -35,8 +35,8 @@ export const ScreenMic = ({ onNext }: ScreenMicProps) => {
   const [phase, setPhase] = useState<MicPhase>("typing");
   const [requesting, setRequesting] = useState(false);
 
-  const fontSize = useSharedValue(26);
-  const lineHeight = useSharedValue(34);
+  const fontSize = useSharedValue(22);
+  const lineHeight = useSharedValue(31);
   const marginTop = useSharedValue(56);
   const opacity = useSharedValue(1);
 
@@ -90,7 +90,7 @@ export const ScreenMic = ({ onNext }: ScreenMicProps) => {
         duration: 350,
       });
 
-      opacity.value = withTiming(0.6, {
+      opacity.value = withTiming(0.55, {
         duration: 350,
       });
 
@@ -124,10 +124,16 @@ export const ScreenMic = ({ onNext }: ScreenMicProps) => {
       </View>
 
       <View style={styles.orbArea}>
-        <Orb state={orbState} size={160} />
+        <Orb state={orbState} size={140} />
       </View>
 
-      <Animated.Text style={[styles.message, animatedMessageStyle]}>
+      <Animated.Text
+        style={[
+          styles.message,
+          { fontFamily: phase === "typing" ? fonts.bodyExtraBold : fonts.bodyMedium },
+          animatedMessageStyle,
+        ]}
+      >
         {phase === "typing" ? words.slice(0, count).join(" ") : COACH_MSG}
       </Animated.Text>
 

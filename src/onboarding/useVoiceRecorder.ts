@@ -10,11 +10,12 @@ import {
 const METERING_POLL_MS = 100;
 const WARMUP_MS = 600;
 const SMOOTHING_WINDOW = 4;
-const PEAK_DECAY_DB_PER_SEC = 3;
+const PEAK_DECAY_DB_PER_SEC = 6;
 const SILENCE_DROP_DB = 8;
 const RESUME_MARGIN_DB = 5;
 const SILENCE_DURATION_MS = 1300;
 const CONTENT_RANGE_DB = 8;
+const MIN_CONTENT_STREAK_MS = 350;
 const MIN_RECORDING_MS = 1500;
 const MAX_RECORDING_MS = 14000;
 
@@ -30,6 +31,9 @@ interface VadSession {
   peak: number | null;
   quietest: number | null;
   silenceSince: number | null;
+  activeStreakStartedAt: number | null;
+  hadSustainedContent: boolean;
+  pollCount: number;
   warnedNoMetering: boolean;
   fired: boolean;
 }
@@ -42,6 +46,9 @@ const createSession = (onPause: (reason: StopReason) => void): VadSession => ({
   peak: null,
   quietest: null,
   silenceSince: null,
+  activeStreakStartedAt: null,
+  hadSustainedContent: false,
+  pollCount: 0,
   warnedNoMetering: false,
   fired: false,
 });
@@ -115,20 +122,39 @@ export const useVoiceRecorder = () => {
 
     if (smoothed > resumeThreshold) {
       session.silenceSince = null;
-    } else if (smoothed < silenceThreshold && session.silenceSince === null) {
-      session.silenceSince = now;
+    } else if (smoothed < silenceThreshold) {
+      if (session.silenceSince === null) session.silenceSince = now;
+    }
+
+    // A single loud transient (a click, a door, a dropped weight) can swing `peak` up
+    // instantly, so "above peak - margin" is the wrong reference for detecting real content —
+    // peak reacts to the very spike we're trying to filter out. `quietest` only ratchets
+    // downward toward the true floor and never spikes, so it's the stable baseline: require
+    // the level to sit above it for MIN_CONTENT_STREAK_MS before counting as real content,
+    // since real speech sustains energy for hundreds of ms and a click doesn't.
+    if (smoothed > session.quietest + CONTENT_RANGE_DB) {
+      if (session.activeStreakStartedAt === null) session.activeStreakStartedAt = now;
+      if (now - session.activeStreakStartedAt >= MIN_CONTENT_STREAK_MS) session.hadSustainedContent = true;
+    } else {
+      session.activeStreakStartedAt = null;
     }
 
     const silenceElapsed = session.silenceSince ? now - session.silenceSince : 0;
     const range = session.peak - session.quietest;
-    const sawContent = range > CONTENT_RANGE_DB;
+    const sawContent = session.hadSustainedContent;
 
-    console.log(
-      `[onboarding voice] VAD trace: metering=${metering.toFixed(1)} smoothed=${smoothed.toFixed(1)} ` +
-        `peak=${session.peak.toFixed(1)} quietest=${session.quietest.toFixed(1)} range=${range.toFixed(1)} ` +
-        `silenceAt=${silenceThreshold.toFixed(1)} resumeAt=${resumeThreshold.toFixed(1)} ` +
-        `silenceElapsed=${silenceElapsed} elapsed=${elapsed}`,
-    );
+    session.pollCount += 1;
+    // Logging every 100ms poll floods the RN bridge during longer recordings, which can
+    // itself delay subsequent timers — throttle to every 5th sample (~500ms) for the running
+    // trace; the stop-reason line below always logs regardless.
+    if (session.pollCount % 5 === 0) {
+      console.log(
+        `[onboarding voice] VAD trace: metering=${metering.toFixed(1)} smoothed=${smoothed.toFixed(1)} ` +
+          `peak=${session.peak.toFixed(1)} quietest=${session.quietest.toFixed(1)} range=${range.toFixed(1)} ` +
+          `sustained=${session.hadSustainedContent} silenceAt=${silenceThreshold.toFixed(1)} resumeAt=${resumeThreshold.toFixed(1)} ` +
+          `silenceElapsed=${silenceElapsed} elapsed=${elapsed}`,
+      );
+    }
 
     const pausedAfterSpeaking = elapsed > MIN_RECORDING_MS && silenceElapsed > SILENCE_DURATION_MS;
     const timedOut = elapsed > MAX_RECORDING_MS;

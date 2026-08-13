@@ -7,7 +7,8 @@ import { NavigationContainer, DarkTheme, type Theme } from '@react-navigation/na
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { ConversationProvider } from '@elevenlabs/react-native';
 import { useAppFonts } from './src/theme/useAppFonts';
-import { RootNavigator } from './src/navigation/RootNavigator';
+import { RootStack } from './src/navigation/RootStack';
+import { ActiveSessionProvider } from './src/session/ActiveSessionContext';
 import { OnboardingFlow } from './src/onboarding/OnboardingFlow';
 import { colors } from './src/constants/theme';
 import { useEnsureSession } from './src/hooks/useEnsureSession';
@@ -65,7 +66,9 @@ const App = () => {
         ) : (
           <ConversationProvider agentId={AGENT_ID}>
             <NavigationContainer theme={navTheme}>
-              <RootNavigator />
+              <ActiveSessionProvider>
+                <RootStack />
+              </ActiveSessionProvider>
             </NavigationContainer>
           </ConversationProvider>
         )}

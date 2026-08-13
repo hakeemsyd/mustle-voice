@@ -94,6 +94,12 @@ async function writeNutritionTargets(supabase: any, userId: string, goal: GoalOb
   if (weightError) throw new Error(`weight_log fetch: ${weightError.message}`);
   if (!weightRow) throw new Error('No weight on file yet — ask for it before setting nutrition targets.');
 
+  const { data: priorGoal } = await supabase
+    .from('goal')
+    .select('objective')
+    .eq('user_id', userId)
+    .maybeSingle();
+
   const targets = computeNutritionTargets(weightRow.weight_kg, goal);
 
   const { error: targetError } = await supabase.from('nutrition_target').upsert({
@@ -103,8 +109,28 @@ async function writeNutritionTargets(supabase: any, userId: string, goal: GoalOb
   });
   if (targetError) throw new Error(`nutrition_target upsert: ${targetError.message}`);
 
-  await supabase.from('goal').upsert({ user_id: userId, objective: goal });
-  await supabase.from('goal_history').insert({ user_id: userId, objective: goal });
+  const { error: goalError } = await supabase.from('goal').upsert({ user_id: userId, objective: goal });
+  if (goalError) console.error('[brain] goal upsert:', goalError.message);
+  const { error: historyError } = await supabase
+    .from('goal_history')
+    .insert({ user_id: userId, objective: goal });
+  if (historyError) console.error('[brain] goal_history insert:', historyError.message);
+
+  // Change the goal and both plans move (docs/coaching-brain.md). Stating that in the system
+  // prompt alone was not enough — the model set new targets and left the training plan alone —
+  // so the requirement is returned with the result, the same way record_injury drives its
+  // follow-up call after the validator rejects a plan.
+  const previous = priorGoal?.objective;
+  if (previous && previous !== goal) {
+    return {
+      status: 'persisted',
+      ...targets,
+      goal_changed: { from: previous, to: goal },
+      instruction:
+        `The goal changed from ${previous} to ${goal}. Training and nutrition move together — ` +
+        'call update_training_plan now with a plan that suits the new goal, before replying.',
+    };
+  }
 
   return { status: 'persisted', ...targets };
 }
@@ -136,6 +162,16 @@ export function createHandlers(supabase: any, userId: string): ToolHandlers {
       }
       if (scope.includes('injuries')) {
         out.injuries = await fetchActiveInjuries(supabase, userId);
+      }
+      if (scope.includes('recent_messages')) {
+        out.recent_messages = (
+          await supabase
+            .from('message')
+            .select('role,content,at')
+            .eq('user_id', userId)
+            .order('at', { ascending: false })
+            .limit(10)
+        ).data;
       }
       if (scope.includes('recent_logs')) {
         out.recent_food = (
@@ -175,10 +211,14 @@ export function createHandlers(supabase: any, userId: string): ToolHandlers {
         .maybeSingle();
       if (!activePlan) return { status: 'recorded', plan_check: 'no_active_plan' };
 
+      // Scoped to the active plan on purpose: archiving a plan leaves its plan_session and
+      // plan_exercise rows in place, so a user_id-only lookup validates exercises the user no
+      // longer trains and reports a safe plan as unsafe.
       const { data: planExercises } = await supabase
         .from('plan_exercise')
-        .select('exercise:exercise_id(name, contraindicated_for)')
-        .eq('user_id', userId);
+        .select('exercise:exercise_id(name, contraindicated_for), plan_session!inner(plan_id)')
+        .eq('user_id', userId)
+        .eq('plan_session.plan_id', activePlan.id);
       const exercisesForValidator = (planExercises ?? []).map((row: any) => ({
         name: row.exercise.name,
         contraindicatedFor: row.exercise.contraindicated_for ?? [],
@@ -216,6 +256,17 @@ export function createHandlers(supabase: any, userId: string): ToolHandlers {
     log_checkin: async (input) => {
       const { error } = await supabase.from('checkin_log').insert({ user_id: userId, ...input });
       if (error) throw new Error(`checkin_log insert: ${error.message}`);
+
+      // A reported weight also belongs in the weight_log series: that is what the trend reads and
+      // what writeNutritionTargets recomputes from. Without this every future target derives from
+      // the onboarding weight no matter how many times the user weighs in.
+      if (typeof input.weight_kg === 'number') {
+        const { error: weightError } = await supabase
+          .from('weight_log')
+          .insert({ user_id: userId, weight_kg: input.weight_kg });
+        if (weightError) console.error('[brain] weight_log insert:', weightError.message);
+      }
+
       return { status: 'logged' };
     },
   };

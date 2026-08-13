@@ -13,6 +13,15 @@ let ttsFileCounter = 0;
 // to TTS, not the on-screen coach message.
 const sanitizeForSpeech = (text: string): string => text.replace(/[—–]/g, ',');
 
+// scribe_v1 sometimes transcribes background noise as a bracketed non-speech annotation
+// (e.g. "[clicking]", "(background noise)") instead of returning empty — strip those out so
+// they never get used as real answer text, and treat what's left as no answer if nothing
+// alphabetic survives.
+const stripNonSpeechArtifacts = (text: string): string => {
+  const cleaned = text.replace(/[[(][^\])]*[\])]/g, '').replace(/\s+/g, ' ').trim();
+  return /[a-zA-Z]/.test(cleaned) ? cleaned : '';
+};
+
 /**
  * Speaks `text` in the Mustle coach voice via ElevenLabs TTS and writes the
  * returned audio to a local cache file. Returns the file:// uri to play.
@@ -85,5 +94,5 @@ export const transcribeRecording = async (uri: string): Promise<string> => {
   }
 
   const json = await response.json();
-  return (json.text ?? '').trim();
+  return stripNonSpeechArtifacts((json.text ?? '').trim());
 };

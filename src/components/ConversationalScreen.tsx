@@ -87,8 +87,8 @@ export const ConversationalScreen = ({
   const { start: startRecording, stop: stopRecording } = useVoiceRecorder();
   const voiceTapHandledRef = useRef(false);
 
-  const fontSize = useSharedValue(26);
-  const lineHeight = useSharedValue(34);
+  const fontSize = useSharedValue(22);
+  const lineHeight = useSharedValue(31);
   const marginTop = useSharedValue(56);
   const opacity = useSharedValue(1);
   const youSpeakFade = useSharedValue(1);
@@ -130,7 +130,7 @@ export const ConversationalScreen = ({
       fontSize.value = withTiming(14, { duration: 350 });
       lineHeight.value = withTiming(20, { duration: 350 });
       marginTop.value = withTiming(12, { duration: 350 });
-      opacity.value = withTiming(0.6, { duration: 350 });
+      opacity.value = withTiming(0.55, { duration: 350 });
 
       const timer = setTimeout(() => setPhase("shrank"), PAUSE_AFTER_COACH);
       return () => clearTimeout(timer);
@@ -227,6 +227,7 @@ export const ConversationalScreen = ({
       setPhase("filling");
     } catch (err) {
       console.error("[onboarding voice] transcription failed:", err);
+      setPhase("listening");
       setTypeMode(true);
     }
   };
@@ -239,7 +240,7 @@ export const ConversationalScreen = ({
   };
 
   return (
-    <SafeAreaView style={styles.container} edges={["top"]}>
+    <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
       <View style={styles.topBar}>
         {showBack ? (
           <TouchableOpacity activeOpacity={0.7} onPress={onBack}>
@@ -265,10 +266,16 @@ export const ConversationalScreen = ({
             exiting={FadeOut.duration(250)}
           >
             <View style={styles.orbContainer}>
-              <Orb state={orbState} size={190} />
+              <Orb state={orbState} size={140} />
             </View>
 
-            <Animated.Text style={[styles.message, animatedMessageStyle]}>
+            <Animated.Text
+              style={[
+                styles.message,
+                { fontFamily: phase === "speaking" ? fonts.bodyExtraBold : fonts.bodyMedium },
+                animatedMessageStyle,
+              ]}
+            >
               {phase === "speaking"
                 ? coachWords.slice(0, coachCount).join(" ")
                 : coachMessage}

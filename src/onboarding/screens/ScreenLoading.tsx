@@ -21,6 +21,10 @@ const ORB_CANVAS = 220;
 
 interface ScreenLoadingProps {
   onComplete: () => void;
+  /** Resolves once plan generation has actually settled (success or handled failure) — waited
+   *  on so this screen never hands off to Home before the plan exists. Absent readyPromise
+   *  falls back to the minimum display time alone. */
+  readyPromise?: Promise<void> | null;
 }
 
 const STEPS = [
@@ -30,7 +34,11 @@ const STEPS = [
 ] as const;
 
 const STEP_DELAYS = [200, 1300, 2400];
-const COMPLETE_DELAY = 5800;
+// Long enough that the animation always gets to play even when the plan lands instantly.
+const MIN_DISPLAY_MS = 3000;
+// Plan generation measured ~15s in practice — this is a backstop, not the expected path, so
+// onboarding can never hang forever on a stuck or slow call.
+const SAFETY_TIMEOUT_MS = 30000;
 
 const BarbellIcon = () => (
   <Svg width={22} height={22} viewBox="0 0 22 22" fill="none">
@@ -116,7 +124,7 @@ const Step = ({
   );
 };
 
-export const ScreenLoading = ({ onComplete }: ScreenLoadingProps) => {
+export const ScreenLoading = ({ onComplete, readyPromise }: ScreenLoadingProps) => {
   const [visible, setVisible] = React.useState<boolean[]>([false, false, false]);
 
   const orbBreath = useSharedValue(0);
@@ -153,10 +161,27 @@ export const ScreenLoading = ({ onComplete }: ScreenLoadingProps) => {
       );
     });
 
-    timers.push(setTimeout(onComplete, COMPLETE_DELAY));
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      onComplete();
+    };
+
+    const minDisplay = new Promise<void>((resolve) => {
+      timers.push(setTimeout(resolve, MIN_DISPLAY_MS));
+    });
+    // Never reject — a failed plan call still stops blocking; the resulting empty state is
+    // Home's problem to show, not this screen's to hang on.
+    const ready = readyPromise ? readyPromise.then(() => undefined, () => undefined) : Promise.resolve();
+    const safetyTimeout = new Promise<void>((resolve) => {
+      timers.push(setTimeout(resolve, SAFETY_TIMEOUT_MS));
+    });
+
+    Promise.race([Promise.all([minDisplay, ready]), safetyTimeout]).then(finish);
 
     return () => timers.forEach(clearTimeout);
-  }, [onComplete]);
+  }, [onComplete, readyPromise]);
 
   return (
     <View style={styles.screen}>

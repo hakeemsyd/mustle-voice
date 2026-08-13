@@ -1,108 +1,270 @@
-import React, { useState } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import React, { useEffect, useRef, useState } from "react";
+import {
+  Keyboard,
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  StyleSheet,
+  Text,
+  TouchableWithoutFeedback,
+  View,
+} from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import Animated, { FadeIn, FadeOut } from "react-native-reanimated";
+import { useFocusEffect, useNavigation } from "@react-navigation/native";
 
 import { VoiceOrb } from "../components/VoiceOrb";
 import { BottomSheet } from "../components/BottomSheet";
 import { FloatingParticles } from "../components/FloatingParticles";
+import { ChatComposer } from "../components/ChatComposer";
+import { ChatTranscript } from "../components/ChatTranscript";
+import { HeroGlow } from "../components/HeroGlow";
+import { VoiceAmbient } from "../components/VoiceAmbient";
 import { useVoiceSession } from "../hooks/useVoiceSession";
+import { useHomeData } from "../hooks/useHomeData";
+import { useHomeChat } from "../hooks/useHomeChat";
 import { colors, fonts } from "../constants/theme";
-import { CalendarIcon, MenuIcon, SunIcon } from "../icons";
-import {
-  getMomentumLine,
-  MOCK_COACH_MESSAGE,
-  MOCK_MACROS,
-  MOCK_STREAK_DAYS,
-  MOCK_TODAY_SESSION,
-} from "./homeMockData";
+import { AudioLinesIcon, CalendarIcon, MenuIcon, MoonIcon, SunIcon, XIcon } from "../icons";
+import { getMomentumLine } from "./homeFormat";
+import type { OrbState } from "../components/VoiceOrb";
 
-function getGreeting(): string {
-  const hour = new Date().getHours();
-  if (hour < 12) return "Morning.";
-  if (hour < 18) return "Afternoon.";
-  return "Evening.";
+type TimeBand = "Morning" | "Afternoon" | "Evening" | "Night";
+
+function getTimeBand(hour: number): TimeBand {
+  if (hour < 5) return "Night";
+  if (hour < 12) return "Morning";
+  if (hour < 18) return "Afternoon";
+  if (hour < 22) return "Evening";
+  return "Night";
 }
+
+function getGreeting(band: TimeBand, name: string | null): string {
+  return name ? `${band}, ${name}.` : `${band}.`;
+}
+
+
+// "breathing"/"idle" is the gap between turns — connected but neither side is
+// talking — so it reads as the cue for the user to speak, same as the design's
+// own fallback copy for that state.
+const VOICE_PHASE_LABEL: Record<OrbState, string> = {
+  idle: "You speak",
+  breathing: "You speak",
+  listening: "Listening",
+  processing: "Thinking",
+  speaking: "Speaking",
+};
 
 export function HomeScreen() {
   const [nutritionOpen, setNutritionOpen] = useState(false);
-  const { orbState, isActive, toggle } = useVoiceSession();
+  const [draftText, setDraftText] = useState("");
+  const [composerFocused, setComposerFocused] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
+  const navigation = useNavigation();
+  const timeBand = getTimeBand(new Date().getHours());
+  const { loading, userId, userName, macros, todaySession, coachMessage, streakDays, loadError, refetch } = useHomeData();
+  const { transcript, coachTyping, sendMessage, appendLocal } = useHomeChat(userId);
+  // The ElevenLabs SDK hands us the real spoken transcript as the call happens (its own
+  // STT/TTS text, independent of our brain) — fold it into the same feed as typed
+  // messages so a conversation reads as one thread whether it was spoken or typed.
+  const { orbState, isActive, toggle } = useVoiceSession(
+    ({ role, text }) => appendLocal(role === "user" ? "user" : "assistant", text),
+    { userId, dynamicVariables: { user_name: userName ?? "there" } },
+  );
 
-  const protein = MOCK_MACROS[0];
+  const protein = macros?.find((m) => m.key === "protein") ?? null;
+
+  // The ElevenLabs voice agent writes plan/target changes server-side (its own tool
+  // calls to the brain function) — Home never sees them mid-call, so pick them up
+  // once the session ends rather than leaving the chip/hero stale until next launch.
+  const wasVoiceActive = useRef(false);
+  useEffect(() => {
+    if (wasVoiceActive.current && !isActive) refetch();
+    wasVoiceActive.current = isActive;
+  }, [isActive, refetch]);
+
+  // The design hides AppNav entirely while the conversation is open — the overlay
+  // owns the full screen below the status bar, tab bar included.
+  useEffect(() => {
+    navigation.setOptions({ tabBarStyle: chatOpen ? { display: "none" } : undefined });
+  }, [chatOpen, navigation]);
+
+  // Picks up whatever changed off-screen — e.g. a workout just logged in Active Session —
+  // whenever Home regains focus, not just after a voice session ends.
+  useFocusEffect(
+    React.useCallback(() => {
+      refetch();
+    }, [refetch]),
+  );
+
+  const handleSend = () => {
+    const text = draftText;
+    setDraftText("");
+    setChatOpen(true);
+    sendMessage(text).then(refetch);
+  };
+
+  const handleTalk = () => {
+    setChatOpen(true);
+    toggle();
+  };
+
+  const closeConversation = () => {
+    Keyboard.dismiss();
+    if (isActive) toggle();
+    setChatOpen(false);
+  };
 
   return (
     <SafeAreaView style={styles.screen} edges={["top"]}>
-      <View style={styles.header}>
-        <View style={styles.brandGroup}>
-          <Pressable style={styles.menuBtn} hitSlop={10}>
-            <MenuIcon size={18} color={colors.muted} />
-          </Pressable>
-          <Text style={styles.brand}>MUSTLE</Text>
-        </View>
+      {!chatOpen && (
+        <>
+          <View style={styles.header}>
+            <View style={styles.brandGroup}>
+              <Pressable style={styles.menuBtn} hitSlop={10}>
+                <MenuIcon size={18} color={colors.muted} />
+              </Pressable>
+              <Text style={styles.brand}>MUSTLE</Text>
+            </View>
 
-        <Pressable
-          style={styles.macroChip}
-          onPress={() => setNutritionOpen(true)}
-        >
-          <Text style={styles.macroChipValue}>{protein.current}</Text>
-          <Text style={styles.macroChipSep}>/</Text>
-          <Text style={styles.macroChipGoal}>{protein.goal}g</Text>
-          <Text style={styles.macroChipLabel}>Protein</Text>
-          <Text style={styles.macroChipArrow}>▾</Text>
-        </Pressable>
-      </View>
-
-      <View style={styles.rule} />
-
-      <View style={styles.hero}>
-        <FloatingParticles />
-
-        <View style={styles.heroTop}>
-          <View style={styles.captionIconRow}>
-            <SunIcon size={18} color="rgba(251,180,60,0.85)" />
+            <Pressable
+              style={styles.macroChip}
+              onPress={() => setNutritionOpen(true)}
+            >
+              {loading ? null : protein ? (
+                <>
+                  <Text style={styles.macroChipValue}>{protein.current}</Text>
+                  <Text style={styles.macroChipSep}>/</Text>
+                  <Text style={styles.macroChipGoal}>{protein.goal}g</Text>
+                  <Text style={styles.macroChipLabel}>Protein</Text>
+                </>
+              ) : (
+                <Text style={styles.macroChipLabel}>No targets yet</Text>
+              )}
+              <Text style={styles.macroChipArrow}>▾</Text>
+            </Pressable>
           </View>
-          <Text style={styles.captionGreeting}>{getGreeting()}</Text>
-          <Text style={styles.captionMain}>{MOCK_COACH_MESSAGE}</Text>
-          <Text style={styles.captionSub}>
-            {getMomentumLine(MOCK_STREAK_DAYS)}
-          </Text>
 
-          <View style={styles.metaRow}>
-            {MOCK_TODAY_SESSION.hasSession ? (
-              <View style={styles.slimSession}>
-                <View style={styles.slimSessionDot} />
-                <Text style={styles.slimSessionName}>
-                  {MOCK_TODAY_SESSION.name}
-                </Text>
-                <Text style={styles.slimSessionTime}>
-                  {MOCK_TODAY_SESSION.startsInLabel}
-                </Text>
-                <Text style={styles.slimSessionArrow}>→</Text>
-              </View>
-            ) : (
-              <View style={styles.restLine}>
-                <View style={styles.restLineDot} />
-                <Text style={styles.restLineText}>
-                  Rest day — focus on recovery
+          <View style={styles.rule} />
+        </>
+      )}
+
+      <KeyboardAvoidingView
+        style={styles.flex}
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+      >
+        {chatOpen ? (
+          <Animated.View style={styles.flex} entering={FadeIn.duration(220)} exiting={FadeOut.duration(150)}>
+            <View style={styles.chatHeader}>
+              <View style={styles.chatHeaderState}>
+                {isActive && <AudioLinesIcon size={13} color={colors.accent} />}
+                <Text style={styles.chatHeaderLabel}>
+                  {isActive ? VOICE_PHASE_LABEL[orbState] : "Coach"}
                 </Text>
               </View>
-            )}
+              {!isActive && (
+                <Pressable style={styles.chatCloseBtn} onPress={closeConversation} hitSlop={8}>
+                  <XIcon size={16} color="rgba(255,255,255,0.5)" />
+                </Pressable>
+              )}
+            </View>
+            <View style={styles.flex}>
+              <VoiceAmbient state={orbState} active={isActive} />
+              <ChatTranscript messages={transcript} coachTyping={coachTyping} voiceActive={isActive} />
+            </View>
+          </Animated.View>
+        ) : (
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+          <View style={styles.hero}>
+            <FloatingParticles />
+            <HeroGlow />
 
-            <View style={styles.planPill}>
-              <CalendarIcon size={12} color={colors.accent} />
-              <Text style={styles.planPillText}>This week's plan</Text>
+            <View style={styles.heroTop}>
+              <View style={styles.captionIconRow}>
+                {timeBand === "Night" ? (
+                  <MoonIcon size={18} color="rgba(180,190,255,0.85)" />
+                ) : (
+                  <SunIcon size={18} color="rgba(251,180,60,0.85)" />
+                )}
+              </View>
+              <Text style={styles.captionGreeting}>{getGreeting(timeBand, userName)}</Text>
+              <Text style={styles.captionMain}>{loading ? "" : coachMessage}</Text>
+              <Text style={styles.captionSub}>{loading ? "" : getMomentumLine(streakDays)}</Text>
+
+              {!loading && (
+                <View style={styles.metaRow}>
+                  {loadError ? (
+                    <Pressable style={styles.restLine} onPress={refetch}>
+                      <View style={styles.restLineDot} />
+                      <Text style={styles.restLineText}>{loadError} Tap to retry</Text>
+                    </Pressable>
+                  ) : todaySession === null ? (
+                    <View style={styles.restLine}>
+                      <View style={styles.restLineDot} />
+                      <Text style={styles.restLineText}>
+                        No plan yet — talk to your coach to set one up
+                      </Text>
+                    </View>
+                  ) : todaySession.hasSession ? (
+                    <Pressable
+                      style={styles.slimSession}
+                      onPress={() =>
+                        navigation.navigate("PreWorkoutPreview", {
+                          planSessionId: todaySession.planSessionId!,
+                        })
+                      }
+                    >
+                      <View style={styles.slimSessionDot} />
+                      <Text style={styles.slimSessionName}>{todaySession.name}</Text>
+                      <Text style={styles.slimSessionTime}>
+                        {todaySession.exerciseCountLabel}
+                      </Text>
+                      <Text style={styles.slimSessionArrow}>→</Text>
+                    </Pressable>
+                  ) : (
+                    <View style={styles.restLine}>
+                      <View style={styles.restLineDot} />
+                      <Text style={styles.restLineText}>
+                        Rest day — focus on recovery
+                      </Text>
+                    </View>
+                  )}
+
+                  {/* Not yet wired to anything — Calendar screen isn't built. Deliberately
+                      styled inert (muted icon, no Pressable) rather than left looking tappable
+                      with no action behind it. */}
+                  <View style={styles.planPill}>
+                    <CalendarIcon size={12} color={colors.muted} />
+                    <Text style={styles.planPillText}>Today's Plan</Text>
+                  </View>
+                </View>
+              )}
+            </View>
+
+            <View style={styles.orbWrap}>
+              <Pressable style={styles.orbBtn} onPress={handleTalk} hitSlop={16}>
+                <VoiceOrb state={orbState} size={104} />
+              </Pressable>
+              <Text style={styles.orbHint}>
+                {isActive ? "tap to stop" : "tap to talk"}
+              </Text>
             </View>
           </View>
-        </View>
+          </TouchableWithoutFeedback>
+        )}
 
-        <View style={styles.orbWrap}>
-          <Pressable style={styles.orbBtn} onPress={toggle} hitSlop={16}>
-            <VoiceOrb state={orbState} size={115} />
-          </Pressable>
-          <Text style={styles.orbHint}>
-            {isActive ? "tap to stop" : "tap to talk"}
-          </Text>
-        </View>
-      </View>
+        <ChatComposer
+          value={draftText}
+          onChangeText={setDraftText}
+          onSend={handleSend}
+          onFocus={() => setChatOpen(true)}
+          focused={composerFocused}
+          onFocusChange={setComposerFocused}
+          onTalkTap={handleTalk}
+          talkActive={isActive && chatOpen}
+          onExitVoiceToKeyboard={toggle}
+          onCloseConversation={closeConversation}
+        />
+      </KeyboardAvoidingView>
 
       <BottomSheet
         visible={nutritionOpen}
@@ -110,42 +272,49 @@ export function HomeScreen() {
       >
         <View style={styles.macroSheetBody}>
           <Text style={styles.macroPanelTitle}>TODAY'S NUTRITION</Text>
-          {MOCK_MACROS.map((m) => {
-            const pct = Math.min(Math.round((m.current / m.goal) * 100), 100);
-            const remaining = m.goal - m.current;
-            return (
-              <View key={m.key} style={styles.macroRow}>
-                <View style={styles.macroRowTop}>
-                  <View
-                    style={[styles.macroRowDot, { backgroundColor: m.color }]}
-                  />
-                  <Text style={styles.macroRowLabel}>{m.label}</Text>
-                  <View style={styles.macroRowValues}>
-                    <Text style={[styles.macroRowCurrent, { color: m.color }]}>
-                      {m.current}
-                    </Text>
-                    <Text style={styles.macroRowSep}>/</Text>
-                    <Text style={styles.macroRowGoal}>
-                      {m.goal}
-                      {m.unit}
-                    </Text>
+          {!macros ? (
+            <Text style={styles.restLineText}>
+              No nutrition targets yet — tell your coach your goal to get
+              started.
+            </Text>
+          ) : (
+            macros.map((m) => {
+              const pct = m.goal > 0 ? Math.min(Math.round((m.current / m.goal) * 100), 100) : 0;
+              const remaining = m.goal - m.current;
+              return (
+                <View key={m.key} style={styles.macroRow}>
+                  <View style={styles.macroRowTop}>
+                    <View
+                      style={[styles.macroRowDot, { backgroundColor: m.color }]}
+                    />
+                    <Text style={styles.macroRowLabel}>{m.label}</Text>
+                    <View style={styles.macroRowValues}>
+                      <Text style={[styles.macroRowCurrent, { color: m.color }]}>
+                        {m.current}
+                      </Text>
+                      <Text style={styles.macroRowSep}>/</Text>
+                      <Text style={styles.macroRowGoal}>
+                        {m.goal}
+                        {m.unit}
+                      </Text>
+                    </View>
                   </View>
+                  <View style={styles.macroRowBar}>
+                    <View
+                      style={[
+                        styles.macroRowFill,
+                        { width: `${pct}%`, backgroundColor: m.color },
+                      ]}
+                    />
+                  </View>
+                  <Text style={styles.macroRowRemaining}>
+                    {remaining}
+                    {m.unit} remaining
+                  </Text>
                 </View>
-                <View style={styles.macroRowBar}>
-                  <View
-                    style={[
-                      styles.macroRowFill,
-                      { width: `${pct}%`, backgroundColor: m.color },
-                    ]}
-                  />
-                </View>
-                <Text style={styles.macroRowRemaining}>
-                  {remaining}
-                  {m.unit} remaining
-                </Text>
-              </View>
-            );
-          })}
+              );
+            })
+          )}
         </View>
       </BottomSheet>
     </SafeAreaView>
@@ -156,6 +325,39 @@ const styles = StyleSheet.create({
   screen: {
     flex: 1,
     backgroundColor: colors.bg,
+  },
+
+  flex: {
+    flex: 1,
+  },
+
+  chatHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    height: 48,
+  },
+  chatHeaderState: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  chatHeaderLabel: {
+    fontFamily: fonts.bodyMedium,
+    fontSize: 12,
+    letterSpacing: 0.36,
+    color: "rgba(255,255,255,0.55)",
+  },
+  chatCloseBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
   },
 
   header: {
@@ -237,6 +439,7 @@ const styles = StyleSheet.create({
     justifyContent: "flex-start",
     paddingTop: 22,
     paddingBottom: 12,
+    overflow: "hidden",
   },
 
   heroTop: {

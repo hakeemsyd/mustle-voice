@@ -1,6 +1,6 @@
 import React from 'react';
 import { Modal, Pressable, StyleSheet, View } from 'react-native';
-import { colors, radius } from '../constants/theme';
+import { colors } from '../constants/theme';
 
 interface BottomSheetProps {
   visible: boolean;
@@ -23,15 +23,15 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     justifyContent: 'flex-end',
-    backgroundColor: 'rgba(0,0,0,0.6)',
+    backgroundColor: 'rgba(0,0,0,0.55)',
   },
   sheet: {
     maxHeight: '55%',
-    backgroundColor: colors.surface,
-    borderTopLeftRadius: radius['3xl'],
-    borderTopRightRadius: radius['3xl'],
-    borderWidth: 1,
-    borderColor: colors.border,
+    backgroundColor: colors.bg,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
     paddingTop: 12,
     paddingBottom: 32,
   },
