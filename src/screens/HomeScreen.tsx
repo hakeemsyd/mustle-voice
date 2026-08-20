@@ -14,6 +14,7 @@ import Animated, { FadeIn, FadeOut } from "react-native-reanimated";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 
 import { VoiceOrb } from "../components/VoiceOrb";
+import { AppDrawer } from "../components/AppDrawer";
 import { BottomSheet } from "../components/BottomSheet";
 import { FloatingParticles } from "../components/FloatingParticles";
 import { ChatComposer } from "../components/ChatComposer";
@@ -56,6 +57,7 @@ const VOICE_PHASE_LABEL: Record<OrbState, string> = {
 
 export function HomeScreen() {
   const [nutritionOpen, setNutritionOpen] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [draftText, setDraftText] = useState("");
   const [composerFocused, setComposerFocused] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
@@ -68,7 +70,7 @@ export function HomeScreen() {
   // messages so a conversation reads as one thread whether it was spoken or typed.
   const { orbState, isActive, toggle } = useVoiceSession(
     ({ role, text }) => appendLocal(role === "user" ? "user" : "assistant", text),
-    { userId, dynamicVariables: { user_name: userName ?? "there" } },
+    { userId, dynamicVariables: { user_name: userName ?? "there", user_id: userId ?? "" } },
   );
 
   const protein = macros?.find((m) => m.key === "protein") ?? null;
@@ -99,6 +101,7 @@ export function HomeScreen() {
   const handleSend = () => {
     const text = draftText;
     setDraftText("");
+    Keyboard.dismiss();
     setChatOpen(true);
     sendMessage(text).then(refetch);
   };
@@ -120,7 +123,7 @@ export function HomeScreen() {
         <>
           <View style={styles.header}>
             <View style={styles.brandGroup}>
-              <Pressable style={styles.menuBtn} hitSlop={10}>
+              <Pressable style={styles.menuBtn} onPress={() => setDrawerOpen(true)} hitSlop={10}>
                 <MenuIcon size={18} color={colors.muted} />
               </Pressable>
               <Text style={styles.brand}>MUSTLE</Text>
@@ -169,7 +172,13 @@ export function HomeScreen() {
             </View>
             <View style={styles.flex}>
               <VoiceAmbient state={orbState} active={isActive} />
-              <ChatTranscript messages={transcript} coachTyping={coachTyping} voiceActive={isActive} />
+              <ChatTranscript
+                messages={transcript}
+                coachTyping={coachTyping}
+                voiceActive={isActive}
+                onStartDay={(planSessionId) => navigation.navigate("PreWorkoutPreview", { planSessionId })}
+                onModifyPlan={() => setDraftText("I'd like to change ")}
+              />
             </View>
           </Animated.View>
         ) : (
@@ -187,7 +196,7 @@ export function HomeScreen() {
                 )}
               </View>
               <Text style={styles.captionGreeting}>{getGreeting(timeBand, userName)}</Text>
-              <Text style={styles.captionMain}>{loading ? "" : coachMessage}</Text>
+              <Text style={styles.captionMain}>{loading ? "Loading your plan…" : coachMessage}</Text>
               <Text style={styles.captionSub}>{loading ? "" : getMomentumLine(streakDays)}</Text>
 
               {!loading && (
@@ -229,13 +238,13 @@ export function HomeScreen() {
                     </View>
                   )}
 
-                  {/* Not yet wired to anything — Calendar screen isn't built. Deliberately
-                      styled inert (muted icon, no Pressable) rather than left looking tappable
-                      with no action behind it. */}
-                  <View style={styles.planPill}>
-                    <CalendarIcon size={12} color={colors.muted} />
+                  <Pressable
+                    style={styles.planPill}
+                    onPress={() => navigation.navigate("Calendar", { initialScope: "today" })}
+                  >
+                    <CalendarIcon size={12} color={colors.accent} />
                     <Text style={styles.planPillText}>Today's Plan</Text>
-                  </View>
+                  </Pressable>
                 </View>
               )}
             </View>
@@ -317,6 +326,14 @@ export function HomeScreen() {
           )}
         </View>
       </BottomSheet>
+
+      <AppDrawer
+        visible={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        onOpenSettings={() => navigation.navigate("Settings")}
+        onOpenCalendar={() => navigation.navigate("Calendar", { initialScope: "month" })}
+        userId={userId}
+      />
     </SafeAreaView>
   );
 }

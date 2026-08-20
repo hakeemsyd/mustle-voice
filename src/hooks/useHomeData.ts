@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { callBrain } from '../lib/brain';
 import { resolveTodaySession } from '../lib/resolveTodaySession';
+import { setCachedDisplayName } from '../lib/profileStore';
 import { MACRO_META, type MacroTarget } from '../screens/homeFormat';
 
 export interface TodaySession {
@@ -83,7 +84,7 @@ const DEFAULT_COACH_MESSAGE_HAS_PLAN = 'Tap the orb any time to check in.';
 // becomes today's Home headline instead of whatever the coach last said in some unrelated
 // conversation, possibly days ago.
 const DAILY_GREETING_PROMPT =
-  "Write today's Home screen greeting for me — the first thing I'll see today, not a reply to a question. Ground it in my actual plan and progress.";
+  "Say hello for the first time today — not a reply to a question, and not generic small talk. One short, motivating line that references what's actually on my plan today (today's workout, or progress toward my goal) — give me a real reason to open the app, not a pleasantry.";
 
 const CAPTION_MAX_CHARS = 140;
 
@@ -186,6 +187,7 @@ export function useHomeData(): HomeData {
             .select('content, at')
             .eq('user_id', userId)
             .eq('role', 'assistant')
+            .eq('hidden', true)
             .order('at', { ascending: false })
             .limit(1)
             .maybeSingle(),
@@ -240,19 +242,26 @@ export function useHomeData(): HomeData {
           })
         : null;
 
-      const lastMessage = messageRes.data as { content: string; at: string } | null;
-      const isFreshToday = lastMessage ? dateKey(new Date(lastMessage.at)) === dateKey(new Date()) : false;
-      const staleFallback = lastMessage?.content
-        ? sanitizeCoachMessage(lastMessage.content)
-        : hasPlan
-          ? DEFAULT_COACH_MESSAGE_HAS_PLAN
-          : DEFAULT_COACH_MESSAGE_NO_PLAN;
+      const lastGreeting = messageRes.data as { content: string; at: string } | null;
+      // Same-day isn't enough on its own — completing a session mid-day rotates a flexible
+      // plan to the next one (or clears today's session on a pinned plan), and a greeting
+      // generated before that still describes the workout that's no longer queued up.
+      const mostRecentWorkoutAt = ((workoutRes.data ?? []) as any[]).reduce(
+        (latest: string | null, row: any) => (!latest || new Date(row.at) > new Date(latest) ? row.at : latest),
+        null as string | null,
+      );
+      const greetingIsFreshToday = lastGreeting
+        ? dateKey(new Date(lastGreeting.at)) === dateKey(new Date()) &&
+          (!mostRecentWorkoutAt || new Date(mostRecentWorkoutAt) <= new Date(lastGreeting.at))
+        : false;
 
       let coachMessage: string;
-      if (isFreshToday && lastMessage?.content) {
-        coachMessage = sanitizeCoachMessage(lastMessage.content);
-      } else if (!hasPlan || greetingInFlightRef.current) {
-        coachMessage = staleFallback;
+      if (greetingIsFreshToday && lastGreeting?.content) {
+        coachMessage = sanitizeCoachMessage(lastGreeting.content);
+      } else if (!hasPlan) {
+        coachMessage = DEFAULT_COACH_MESSAGE_NO_PLAN;
+      } else if (greetingInFlightRef.current) {
+        coachMessage = DEFAULT_COACH_MESSAGE_HAS_PLAN;
       } else {
         greetingInFlightRef.current = true;
         try {
@@ -260,7 +269,7 @@ export function useHomeData(): HomeData {
           coachMessage = sanitizeCoachMessage(generated.reply);
         } catch (err) {
           console.warn('[home] daily greeting generation failed:', err);
-          coachMessage = staleFallback;
+          coachMessage = DEFAULT_COACH_MESSAGE_HAS_PLAN;
         } finally {
           greetingInFlightRef.current = false;
         }
@@ -270,6 +279,7 @@ export function useHomeData(): HomeData {
 
       const streakDays = computeStreak((workoutRes.data ?? []).map((row: any) => row.at));
       const userName = profileRes.data?.display_name ?? null;
+      if (!profileRes.error) setCachedDisplayName(userId, userName);
       const loadError = planRes.error ? "Couldn't load your plan." : null;
 
       setState({ loading: false, userId, userName, macros, todaySession, coachMessage, streakDays, loadError });

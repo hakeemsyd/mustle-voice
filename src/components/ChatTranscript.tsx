@@ -3,6 +3,7 @@ import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { colors, fonts } from "../constants/theme";
 import type { ChatMessage } from "../hooks/useHomeChat";
 import { ThumbsDownIcon, ThumbsUpIcon } from "../icons";
+import { PlanBreakdownCard } from "./PlanBreakdownCard";
 
 interface ChatTranscriptProps {
   messages: ChatMessage[];
@@ -10,9 +11,17 @@ interface ChatTranscriptProps {
   /** Softens the user bubble's neon tint while a voice call is live — the
    *  accent-dim reads too intense against the ambient wash behind it. */
   voiceActive?: boolean;
+  onStartDay?: (planSessionId: string) => void;
+  onModifyPlan?: () => void;
 }
 
-export const ChatTranscript = ({ messages, coachTyping, voiceActive = false }: ChatTranscriptProps) => {
+export const ChatTranscript = ({
+  messages,
+  coachTyping,
+  voiceActive = false,
+  onStartDay,
+  onModifyPlan,
+}: ChatTranscriptProps) => {
   const scrollRef = useRef<ScrollView>(null);
 
   useEffect(() => {
@@ -36,6 +45,9 @@ export const ChatTranscript = ({ messages, coachTyping, voiceActive = false }: C
         ) : (
           <View key={m.id} style={styles.coachMsg}>
             <Text style={styles.coachMsgText}>{m.text}</Text>
+            {m.card && onStartDay && onModifyPlan && (
+              <PlanBreakdownCard card={m.card} onStartDay={onStartDay} onModify={onModifyPlan} />
+            )}
             {/* No feedback handler exists yet — disabled rather than merely unwired, so a
                 press gives no ripple/highlight instead of silently doing nothing. */}
             <View style={styles.coachMsgFeedback}>

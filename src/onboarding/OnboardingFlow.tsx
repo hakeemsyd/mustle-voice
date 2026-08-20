@@ -17,6 +17,8 @@ import { ScreenSummary } from "./screens/ScreenSummary";
 import { ScreenLoading } from "./screens/ScreenLoading";
 import { syncOnboarding } from "../lib/onboardingSync";
 import { callBrain } from "../lib/brain";
+import { prefetchSpeech } from "../lib/elevenLabsVoice";
+import { STATIC_ONBOARDING_PROMPTS, historyPrompt } from "./prompts";
 
 interface OnboardingFlowProps {
   userId: string | null;
@@ -40,6 +42,15 @@ export const OnboardingFlow = ({ userId, onComplete }: OnboardingFlowProps) => {
       onComplete();
     }
   }, [screenIndex, onComplete, clearDraft]);
+
+  // Every voice screen's TTS otherwise only starts fetching once that screen mounts, stacking
+  // a 1-3s network round trip on top of the STT round trip that already happened for the
+  // previous answer — real dead air between turns. These prompts are fixed strings known
+  // before the flow even reaches them, so warm the cache as early as possible (the user still
+  // has the mic-permission/gender screens ahead of them, no coach speech yet, to absorb it).
+  useEffect(() => {
+    STATIC_ONBOARDING_PROMPTS.forEach(prefetchSpeech);
+  }, []);
 
   if (!ready) {
     return (
@@ -78,6 +89,11 @@ export const OnboardingFlow = ({ userId, onComplete }: OnboardingFlowProps) => {
         <ScreenName
           onNext={(name) => {
             update({ userName: name });
+            // Only prompt whose text depends on a just-given answer — can't prefetch it
+            // upfront like the static ones, but the name is known well before ScreenHistory
+            // actually mounts (the transcribing/filling/processing phases of this screen,
+            // plus a full screen transition, all still have to happen first).
+            prefetchSpeech(historyPrompt(name));
             goNext();
           }}
           onBack={goBack}
@@ -186,6 +202,9 @@ export const OnboardingFlow = ({ userId, onComplete }: OnboardingFlowProps) => {
                   callBrain(
                     userId,
                     "I just finished onboarding — please set up my training plan and nutrition targets from what you know about me.",
+                    'text',
+                    false,
+                    45000,
                   ),
                 )
                 .then(

@@ -11,11 +11,12 @@ import Animated, {
 import { Orb, type OrbState } from "../Orb";
 import { ProgressDots } from "../ProgressDots";
 import { useSpeakOnMount } from "../useSpeakOnMount";
+import { PUSH_PROMPT } from "../prompts";
 
 import { colors, fonts } from "../../constants/theme";
 import { useWordTyping } from "../../hooks/useWordTyping";
 
-const COACH_MSG = "I'll check in with you on rest days and keep you on track — cool?";
+const COACH_MSG = PUSH_PROMPT;
 
 type Phase = "typing" | "shrinking" | "ready";
 

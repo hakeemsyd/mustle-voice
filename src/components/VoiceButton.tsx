@@ -39,13 +39,16 @@ const AnimatedDot = ({ delay }: { delay: number }) => {
 export const VoiceButton = ({ onPress }: VoiceButtonProps) => {
   return (
     <Pressable style={styles.container} onPress={onPress}>
-      <Text style={styles.title}>YOU SPEAK</Text>
+      <View style={styles.titleRow}>
+        <Text style={styles.title}>YOU SPEAK</Text>
 
-      <View style={styles.dotsContainer}>
-        <AnimatedDot delay={0} />
-        <AnimatedDot delay={180} />
-        <AnimatedDot delay={360} />
+        <View style={styles.dotsContainer}>
+          <AnimatedDot delay={0} />
+          <AnimatedDot delay={180} />
+          <AnimatedDot delay={360} />
+        </View>
       </View>
+      <Text style={styles.hint}>Tap when you're done</Text>
     </Pressable>
   );
 };
@@ -57,9 +60,14 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "rgba(200,241,53,0.35)",
     backgroundColor: "rgba(200,241,53,0.08)",
-    flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
+    gap: 4,
+  },
+
+  titleRow: {
+    flexDirection: "row",
+    alignItems: "center",
     gap: 12,
   },
 
@@ -68,6 +76,12 @@ const styles = StyleSheet.create({
     fontSize: 13,
     letterSpacing: 1.5,
     color: colors.accent,
+  },
+
+  hint: {
+    fontFamily: fonts.body,
+    fontSize: 10.5,
+    color: "rgba(255,255,255,0.35)",
   },
 
   dotsContainer: {

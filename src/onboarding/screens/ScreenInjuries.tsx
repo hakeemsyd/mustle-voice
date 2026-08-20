@@ -2,6 +2,7 @@ import React, { useCallback, useState } from "react";
 
 import { ConversationalScreen } from "../../components/ConversationalScreen";
 import { BodyDiagram } from "./BodyDiagram";
+import { INJURIES_PROMPT } from "../prompts";
 
 interface ScreenInjuriesProps {
   onNext: (injuries: string[], description?: string) => void;
@@ -36,7 +37,7 @@ export const ScreenInjuries = ({
 
   return (
     <ConversationalScreen
-      coachMessage="Any injuries or areas I should avoid?"
+      coachMessage={INJURIES_PROMPT}
       typeSlot={typeSlot}
       typeValid={true}
       dotIndex={8}

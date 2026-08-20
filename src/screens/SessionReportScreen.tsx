@@ -17,7 +17,9 @@ export function SessionReportScreen({ route, navigation }: Props) {
   const { loading, error, report } = useSessionReport(route.params.workoutLogId);
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
 
-  const done = () => navigation.navigate("Tabs");
+  // navigate("Tabs") can push a fresh Tabs instance on top of this modal instead of popping
+  // back to the existing one — popToTop unwinds the whole stack unambiguously.
+  const done = () => navigation.popToTop();
 
   const handleShare = async () => {
     if (!report) return;

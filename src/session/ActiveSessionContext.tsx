@@ -8,8 +8,9 @@ import React, {
   useState,
 } from "react";
 import { supabase } from "../lib/supabase";
-import { callBrain } from "../lib/brain";
+import { callBrain, COACH_UNREACHABLE_MESSAGE } from "../lib/brain";
 import { DEFAULT_REST_SEC, suggestRestSeconds } from "../lib/restSuggestion";
+import { useProfileName } from "../hooks/useProfileName";
 
 const EXTEND_REST_SEC = 10;
 
@@ -96,11 +97,15 @@ interface ActiveSessionValue {
   minimize: () => void;
   restore: () => void;
   logSet: (weight: number | null, reps: number) => void;
+  skipExercise: () => void;
+  removeQueuedExercise: (exerciseRowId: string) => void;
+  swapQueuedExercise: (exerciseRowId: string, replacement: { id: string; name: string }) => void;
   finishRest: () => void;
   endSession: (status: SessionStatus) => Promise<void>;
   submitFeedback: (note: string, tags: string[]) => Promise<void>;
   askCoach: (text: string) => Promise<void>;
   noteSetLogged: (summary: string) => void;
+  announce: (text: string) => void;
   setPaused: (paused: boolean) => void;
   clear: () => void;
 }
@@ -145,7 +150,7 @@ export function ActiveSessionProvider({
   const [paused, setPaused] = useState(false);
   const [minimized, setMinimized] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
-  const [userName, setUserName] = useState<string | null>(null);
+  const userName = useProfileName(userId);
 
   const userIdRef = useRef<string | null>(null);
   const logIdRef = useRef<string | null>(null);
@@ -176,7 +181,8 @@ export function ActiveSessionProvider({
   const restore = useCallback(() => setMinimized(false), []);
 
   // Resolved once, independent of any running session: the voice agent needs the user's id
-  // to attribute the conversation and their name to fill the agent's prompt template.
+  // to attribute the conversation, and useProfileName (shared with Home) fills their name for
+  // the agent's prompt template without a second independent fetch.
   useEffect(() => {
     let cancelled = false;
 
@@ -189,14 +195,6 @@ export function ActiveSessionProvider({
 
       userIdRef.current = id;
       setUserId(id);
-      if (!id) return;
-
-      const { data } = await supabase
-        .from("profile")
-        .select("display_name")
-        .eq("user_id", id)
-        .maybeSingle();
-      if (!cancelled) setUserName(data?.display_name ?? null);
     })();
 
     return () => {
@@ -374,6 +372,42 @@ export function ActiveSessionProvider({
     [currentExerciseIndex, exercises, loggedSets, writeWorkoutLog],
   );
 
+  const skipExercise = useCallback(() => {
+    setResting(false);
+    setRestEndAt(null);
+    setRestPausedRemainingSec(null);
+
+    if (currentExerciseIndex === exercises.length - 1) {
+      const status: SessionStatus = loggedSets.some((sets) => sets.length > 0) ? "completed" : "partial";
+      setEnded(true);
+      setEndedStatus(status);
+      void writeWorkoutLog(loggedSets, status);
+    } else {
+      setCurrentExerciseIndex((i) => i + 1);
+    }
+  }, [currentExerciseIndex, exercises.length, loggedSets, writeWorkoutLog]);
+
+  const removeQueuedExercise = useCallback(
+    (exerciseRowId: string) => {
+      const index = exercises.findIndex((e) => e.id === exerciseRowId);
+      if (index === -1 || index <= currentExerciseIndex) return;
+      setExercises((prev) => prev.filter((e) => e.id !== exerciseRowId));
+      setLoggedSets((prev) => prev.filter((_, i) => i !== index));
+    },
+    [exercises, currentExerciseIndex],
+  );
+
+  const swapQueuedExercise = useCallback(
+    (exerciseRowId: string, replacement: { id: string; name: string }) => {
+      const index = exercises.findIndex((e) => e.id === exerciseRowId);
+      if (index === -1 || index <= currentExerciseIndex) return;
+      setExercises((prev) =>
+        prev.map((e) => (e.id === exerciseRowId ? { ...e, exerciseId: replacement.id, name: replacement.name } : e)),
+      );
+    },
+    [exercises, currentExerciseIndex],
+  );
+
   const finishRest = useCallback(() => {
     setResting(false);
     setRestEndAt(null);
@@ -433,13 +467,16 @@ export function ActiveSessionProvider({
   // Coach Q&A mid-session — same real brain the Home chat uses. The reply is also filed
   // against the current exercise so the Guide sheet's notes are real conversation
   // history rather than authored content.
+  const latestAskRef = useRef(0);
   const askCoach = useCallback(
     async (text: string) => {
       const userId = userIdRef.current;
       if (!userId || !text.trim()) return;
+      const requestId = ++latestAskRef.current;
       setCoachThinking(true);
       try {
         const result = await callBrain(userId, text.trim());
+        if (latestAskRef.current !== requestId) return;
         setCoachMessage(result.reply);
 
         const exercise = exercises[currentExerciseIndex];
@@ -459,17 +496,25 @@ export function ActiveSessionProvider({
         }
       } catch (err) {
         console.error("[active session] coach call failed:", err);
-        setCoachMessage("Couldn't reach your coach — try again in a moment.");
+        if (latestAskRef.current !== requestId) return;
+        setCoachMessage(COACH_UNREACHABLE_MESSAGE);
       } finally {
-        setCoachThinking(false);
+        if (latestAskRef.current === requestId) setCoachThinking(false);
       }
     },
     [currentExerciseIndex, exercises],
   );
 
-  const noteSetLogged = useCallback((summary: string) => {
-    setCoachMessage(`Logged — ${summary}.`);
+  const announce = useCallback((text: string) => {
+    setCoachMessage(text);
   }, []);
+
+  const noteSetLogged = useCallback(
+    (summary: string) => {
+      announce(`Logged — ${summary}.`);
+    },
+    [announce],
+  );
 
   const value = useMemo<ActiveSessionValue>(
     () => ({
@@ -503,11 +548,15 @@ export function ActiveSessionProvider({
       minimize,
       restore,
       logSet,
+      skipExercise,
+      removeQueuedExercise,
+      swapQueuedExercise,
       finishRest,
       endSession,
       submitFeedback,
       askCoach,
       noteSetLogged,
+      announce,
       setPaused,
       clear,
       toggleRestPause,
@@ -541,11 +590,15 @@ export function ActiveSessionProvider({
       minimize,
       restore,
       logSet,
+      skipExercise,
+      removeQueuedExercise,
+      swapQueuedExercise,
       finishRest,
       endSession,
       submitFeedback,
       askCoach,
       noteSetLogged,
+      announce,
       clear,
       toggleRestPause,
       extendRest,

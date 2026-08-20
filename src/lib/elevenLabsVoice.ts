@@ -22,11 +22,7 @@ const stripNonSpeechArtifacts = (text: string): string => {
   return /[a-zA-Z]/.test(cleaned) ? cleaned : '';
 };
 
-/**
- * Speaks `text` in the Mustle coach voice via ElevenLabs TTS and writes the
- * returned audio to a local cache file. Returns the file:// uri to play.
- */
-export const synthesizeSpeech = async (text: string): Promise<string> => {
+const fetchSpeechAudio = async (text: string): Promise<string> => {
   if (!API_KEY || !VOICE_ID) {
     throw new Error(
       'Missing EXPO_PUBLIC_ELEVENLABS_API_KEY / EXPO_PUBLIC_ELEVENLABS_VOICE_ID — add them to .env',
@@ -58,6 +54,35 @@ export const synthesizeSpeech = async (text: string): Promise<string> => {
   file.write(bytes);
 
   return file.uri;
+};
+
+// Onboarding's coach prompts are known well before the screen that speaks them actually
+// mounts (most are static strings; the one that isn't is knowable the moment the answer it
+// depends on is captured) — caching by exact text lets a prefetch started early and the real
+// call at mount time share one in-flight request instead of both hitting the network.
+const ttsCache = new Map<string, Promise<string>>();
+
+/**
+ * Speaks `text` in the Mustle coach voice via ElevenLabs TTS and writes the
+ * returned audio to a local cache file. Returns the file:// uri to play.
+ * Reuses an in-flight or already-resolved request for the exact same text.
+ */
+export const synthesizeSpeech = (text: string): Promise<string> => {
+  const cached = ttsCache.get(text);
+  if (cached) return cached;
+
+  const request = fetchSpeechAudio(text).catch((err) => {
+    // A failed prefetch shouldn't poison the real call later — let it retry fresh.
+    ttsCache.delete(text);
+    throw err;
+  });
+  ttsCache.set(text, request);
+  return request;
+};
+
+/** Fire-and-forget: warms the cache for a prompt that hasn't been spoken yet. */
+export const prefetchSpeech = (text: string): void => {
+  synthesizeSpeech(text).catch(() => {});
 };
 
 /**

@@ -24,6 +24,7 @@ import { SessionControlBar } from "../components/SessionControlBar";
 import { ConfirmSheet } from "../components/ConfirmSheet";
 import { GuideSheet } from "../components/GuideSheet";
 import { SwitchWorkoutSheet } from "../components/SwitchWorkoutSheet";
+import { ManageSessionSheet } from "../components/ManageSessionSheet";
 import { PostWorkoutFeedback } from "../components/PostWorkoutFeedback";
 import { formatClock } from "../components/MiniSessionBar";
 import { useScreenInsets } from "../hooks/useScreenInsets";
@@ -44,12 +45,14 @@ export function ActiveSessionScreen({ navigation }: Props) {
   const [endConfirmOpen, setEndConfirmOpen] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
   const [switchOpen, setSwitchOpen] = useState(false);
+  const [manageOpen, setManageOpen] = useState(false);
 
   const {
     target, loading, error, focus, exercises, currentExercise, currentExerciseIndex,
     loggedSets, resting, restKey, restTargetSec, restEndAt, restPausedRemainingSec,
     ended, endedStatus, saving, hasLoggedAnySet,
     coachMessage, coachThinking, elapsedSec, paused,
+    removeQueuedExercise, swapQueuedExercise,
   } = session;
 
   const isCardio = target?.type === "cardio";
@@ -65,19 +68,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
   // whatever the latest one is once it exists, instead of only ever seeing the first render's.
   const sendContextRef = useRef<((text: string) => void) | null>(null);
 
-  // Same identity Home passes — without it the agent's prompt template has no
-  // {{user_name}} to fill and ElevenLabs drops the conversation on connect.
-  //
-  // ElevenLabs isn't wired to our tools yet (docs/coaching-brain.md's Custom LLM bridge is a
-  // deliberately separate next step), so its agent has its own real conversation with the user
-  // and no visibility into what the app does. Without the sendContextualUpdate call below, the
-  // agent has no idea a spoken set report was just logged and keeps asking about it — which
-  // exercise, whether it's a first attempt — as if nothing happened, because as far as its own
-  // conversation is concerned, nothing has. Only the user's own turns are checked (never the
-  // agent's replies, or they'd get re-parsed as if the user said them); free-form talk still
-  // plays out purely through ElevenLabs' own conversation — routing it to askCoach too would
-  // produce two independent, disagreeing coaches answering the same thing in different channels.
-  const { orbState, isActive, toggle, sendContextualUpdate } = useVoiceSession(
+  const { orbState, isActive, toggle, sendContextualUpdate, reconnecting, voiceDropped } = useVoiceSession(
     (message) => {
       if (message.role !== "user" || isCardio || resting) return;
       if (!looksLikeSetReport(message.text)) return;
@@ -95,7 +86,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
     },
     {
       userId: session.userId,
-      dynamicVariables: { user_name: session.userName ?? "there" },
+      dynamicVariables: { user_name: session.userName ?? "there", user_id: session.userId ?? "" },
     },
   );
 
@@ -107,6 +98,17 @@ export function ActiveSessionScreen({ navigation }: Props) {
   useEffect(() => {
     session.restore();
   }, []);
+
+  // The LiveKit connection can drop on its own (confirmed live: a ping timeout silently ate a
+  // spoken set report). useVoiceSession auto-retries once; these just make that visible instead
+  // of leaving a dead-looking orb with no explanation for why nothing got logged.
+  useEffect(() => {
+    if (reconnecting) session.announce("Voice connection dropped — reconnecting…");
+  }, [reconnecting]);
+
+  useEffect(() => {
+    if (voiceDropped) session.announce("Voice disconnected. Tap to talk and repeat your last set.");
+  }, [voiceDropped]);
 
   const currentSetCount = loggedSets[currentExerciseIndex]?.length ?? 0;
   const parsedDraft = parseSetReport(draft);
@@ -367,7 +369,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
             onDoneTap={handleDoneSet}
             doneEnabled={!resting && !isCardio}
             onEndTap={() => setEndConfirmOpen(true)}
-            onManageTap={() => setSwitchOpen(true)}
+            onManageTap={() => setManageOpen(true)}
           />
         </>
       )}
@@ -396,6 +398,21 @@ export function ActiveSessionScreen({ navigation }: Props) {
         exerciseName={currentExercise?.name ?? null}
         repScheme={currentExercise?.repScheme}
         loadScheme={currentExercise?.loadScheme ?? undefined}
+      />
+
+      <ManageSessionSheet
+        open={manageOpen}
+        onClose={() => setManageOpen(false)}
+        userId={session.userId}
+        isCardio={isCardio}
+        exercises={exercises}
+        currentExerciseIndex={currentExerciseIndex}
+        onRemove={removeQueuedExercise}
+        onSwap={swapQueuedExercise}
+        onSwitchWorkout={() => {
+          setManageOpen(false);
+          setSwitchOpen(true);
+        }}
       />
 
       <SwitchWorkoutSheet

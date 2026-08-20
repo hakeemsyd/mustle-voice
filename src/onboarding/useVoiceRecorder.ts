@@ -8,9 +8,15 @@ import {
 } from 'expo-audio';
 
 const METERING_POLL_MS = 100;
-const WARMUP_MS = 600;
+const WARMUP_MS = 150;
 const SMOOTHING_WINDOW = 4;
 const PEAK_DECAY_DB_PER_SEC = 6;
+// Slow enough that a genuinely loud, constant room floor (a fan, gym noise) can't converge
+// `quietest` with `peak` inside a single ~14s take — a real device log in exactly that
+// environment showed `range` collapsing to 0 by ~5s in, after which nothing ever reads as
+// "quiet" again and every recording runs to the hard cutoff. Still recovers from a single
+// anomalous dip (a breath, a mic dropout), just over a longer window than 4dB/sec allowed.
+const QUIETEST_RECOVERY_DB_PER_SEC = 1;
 const SILENCE_DROP_DB = 8;
 const RESUME_MARGIN_DB = 5;
 const SILENCE_DURATION_MS = 1300;
@@ -109,7 +115,14 @@ export const useVoiceRecorder = () => {
     if (session.recentSamples.length > SMOOTHING_WINDOW) session.recentSamples.shift();
     const smoothed = average(session.recentSamples);
 
-    session.quietest = session.quietest === null ? smoothed : Math.min(session.quietest, smoothed);
+    // `quietest` tracks new lows instantly but also drifts back up toward the current level —
+    // otherwise one anomalously quiet moment (a breath, a brief mic dropout) permanently pins
+    // the floor too low for the rest of the take, making ordinary ambient noise later on look
+    // like sustained content.
+    session.quietest =
+      session.quietest === null
+        ? smoothed
+        : Math.min(smoothed, session.quietest + QUIETEST_RECOVERY_DB_PER_SEC * dt);
 
     if (session.peak === null) {
       session.peak = smoothed;

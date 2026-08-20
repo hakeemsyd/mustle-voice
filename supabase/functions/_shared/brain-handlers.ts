@@ -4,9 +4,15 @@
 // 2026-07-23); the orchestration loop itself is unit-tested with fakes in
 // ../_shared/brain-orchestrator.test.ts.
 
-import { validatePlan, explainViolations, type Injury } from '../_shared/injury-validator.ts';
-import { computeNutritionTargets, type GoalObjective } from '../_shared/nutrition.ts';
-import type { ToolHandlers } from '../_shared/brain-orchestrator.ts';
+import { validatePlan, explainViolations, forbiddenTags, type Injury } from './injury-validator.ts';
+import { computeNutritionTargets, type GoalObjective } from './nutrition.ts';
+import { resolveTodaySession, nowInTimezone, logsInTimezone } from './brain-context.ts';
+import type { ToolHandlers } from './brain-orchestrator.ts';
+
+async function writeAppAction(supabase: any, userId: string, type: string, payload: Record<string, unknown>) {
+  const { error } = await supabase.from('app_action').insert({ user_id: userId, type, payload });
+  if (error) throw new Error(`app_action insert: ${error.message}`);
+}
 
 async function fetchActiveInjuries(supabase: any, userId: string): Promise<Injury[]> {
   const { data, error } = await supabase
@@ -154,6 +160,41 @@ export function createHandlers(supabase: any, userId: string): ToolHandlers {
             .eq('status', 'active')
             .maybeSingle()
         ).data;
+
+        // The raw plan_session list has no notion of "current position in a flexible
+        // rotation" — without this, the model has been observed picking day_order 1 (the
+        // first session listed) and describing it as "today's"/"queued up" regardless of
+        // how far into the rotation the user actually is, even right after completing it.
+        const sessions = out.plan?.plan_session ?? [];
+        if (sessions.length > 0) {
+          const [{ data: profile }, { data: recentLogs }] = await Promise.all([
+            supabase.from('profile').select('timezone').eq('user_id', userId).maybeSingle(),
+            supabase
+              .from('workout_log')
+              .select('at, plan_session_id, status')
+              .eq('user_id', userId)
+              .order('at', { ascending: false })
+              .limit(10),
+          ]);
+          const nextSession = resolveTodaySession(
+            sessions,
+            logsInTimezone(recentLogs ?? [], profile?.timezone),
+            nowInTimezone(profile?.timezone),
+          );
+          out.next_session_to_train = nextSession
+            ? {
+                plan_session_id: nextSession.id,
+                focus: nextSession.focus,
+                instruction:
+                  'This is the only session that is due — never describe a different plan_session as "today\'s", "queued up", or "next" instead of this one.',
+              }
+            : {
+                plan_session_id: null,
+                focus: null,
+                instruction:
+                  'Nothing is due right now (already trained today, or today is a rest day) — do not name any specific plan_session as due.',
+              };
+        }
       }
       if (scope.includes('nutrition')) {
         out.nutrition_target = (
@@ -268,6 +309,132 @@ export function createHandlers(supabase: any, userId: string): ToolHandlers {
       }
 
       return { status: 'logged' };
+    },
+
+    open_screen: async (input) => {
+      await writeAppAction(supabase, userId, 'navigate', { screen: input.screen });
+      return { status: 'opened', screen: input.screen };
+    },
+
+    open_todays_workout: async () => {
+      const { data: activePlan } = await supabase
+        .from('training_plan')
+        .select('plan_session(id, day_order, weekday, focus)')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .maybeSingle();
+
+      const sessions = activePlan?.plan_session ?? [];
+      if (sessions.length === 0) return { status: 'no_session', reason: 'no_active_plan' };
+
+      const [{ data: profile }, { data: recentLogs }] = await Promise.all([
+        supabase.from('profile').select('timezone').eq('user_id', userId).maybeSingle(),
+        supabase
+          .from('workout_log')
+          .select('at, plan_session_id, status')
+          .eq('user_id', userId)
+          .order('at', { ascending: false })
+          .limit(10),
+      ]);
+
+      const today = resolveTodaySession(
+        sessions,
+        logsInTimezone(recentLogs ?? [], profile?.timezone),
+        nowInTimezone(profile?.timezone),
+      );
+      if (!today) return { status: 'no_session', reason: 'rest_day' };
+
+      await writeAppAction(supabase, userId, 'navigate', {
+        screen: 'PreWorkoutPreview',
+        params: { planSessionId: today.id },
+      });
+      return { status: 'opened', plan_session_id: today.id, focus: today.focus };
+    },
+
+    show_plan_breakdown: async () => {
+      const { data: plan, error } = await supabase
+        .from('training_plan')
+        .select(
+          'id, split, days_per_week, plan_session(id, day_order, weekday, focus, plan_exercise(ord, exercise(name)))',
+        )
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .maybeSingle();
+      if (error) throw new Error(`training_plan fetch: ${error.message}`);
+      if (!plan) return { status: 'no_plan' };
+
+      const days = (plan.plan_session ?? [])
+        .slice()
+        .sort((a: any, b: any) => a.day_order - b.day_order)
+        .map((session: any) => ({
+          plan_session_id: session.id,
+          day_order: session.day_order,
+          focus: session.focus,
+          exercises: (session.plan_exercise ?? [])
+            .slice()
+            .sort((a: any, b: any) => a.ord - b.ord)
+            .map((e: any) => e.exercise?.name)
+            .filter(Boolean),
+        }));
+
+      return {
+        status: 'shown',
+        card: {
+          type: 'plan_breakdown',
+          split: plan.split,
+          days_per_week: plan.days_per_week,
+          days,
+        },
+      };
+    },
+
+    swap_exercise: async (input) => {
+      const { data: current } = await supabase
+        .from('exercise')
+        .select('id, movement_pattern')
+        .ilike('name', input.current_exercise_name)
+        .maybeSingle();
+      if (!current?.movement_pattern) return { status: 'not_found' };
+
+      const injuries = await fetchActiveInjuries(supabase, userId);
+      const forbidden = forbiddenTags(injuries);
+
+      const { data: candidates } = await supabase
+        .from('exercise')
+        .select('id, name, contraindicated_for')
+        .eq('movement_pattern', current.movement_pattern)
+        .neq('id', current.id);
+
+      const safe = (candidates ?? []).find(
+        (c: any) => !(c.contraindicated_for ?? []).some((tag: string) => forbidden.has(tag)),
+      );
+      if (!safe) return { status: 'no_safe_alternative' };
+
+      await writeAppAction(supabase, userId, 'swap_exercise', {
+        from_name: input.current_exercise_name,
+        to_exercise_id: safe.id,
+        to_name: safe.name,
+      });
+      return { status: 'requested', replacement: safe.name };
+    },
+
+    skip_exercise: async () => {
+      await writeAppAction(supabase, userId, 'skip_exercise', {});
+      return { status: 'requested' };
+    },
+
+    end_workout: async (input) => {
+      await writeAppAction(supabase, userId, 'end_workout', { status: input.completed ? 'completed' : 'partial' });
+      return { status: 'requested' };
+    },
+
+    update_profile: async (input) => {
+      const { error } = await supabase
+        .from('profile')
+        .update({ display_name: input.display_name })
+        .eq('user_id', userId);
+      if (error) throw new Error(`profile update: ${error.message}`);
+      return { status: 'updated', display_name: input.display_name };
     },
   };
 }

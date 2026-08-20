@@ -5,6 +5,7 @@ import { ConversationalScreen } from "../../components/ConversationalScreen";
 import { ConversationAnswerCard } from "../../components/ConversationAnswerCard";
 import { fonts } from "../../constants/theme";
 import { formatBiometricsAnswer, parseFormattedBiometrics } from "../formatBiometricsAnswer";
+import { BIOMETRICS_PROMPT } from "../prompts";
 
 type Units = "metric" | "imperial";
 
@@ -82,7 +83,7 @@ export const ScreenBiometrics = ({
 
   return (
     <ConversationalScreen
-      coachMessage="What's your height and weight? Rough numbers are fine."
+      coachMessage={BIOMETRICS_PROMPT}
       typeSlot={typeSlot}
       typeValid={typeValid}
       dotIndex={7}

@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, View } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { StatusBar } from 'expo-status-bar';
 import { NavigationContainer, DarkTheme, type Theme } from '@react-navigation/native';
@@ -8,12 +7,13 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { ConversationProvider } from '@elevenlabs/react-native';
 import { useAppFonts } from './src/theme/useAppFonts';
 import { RootStack } from './src/navigation/RootStack';
+import { navigationRef } from './src/navigation/navigationRef';
 import { ActiveSessionProvider } from './src/session/ActiveSessionContext';
+import { AppActionBridge } from './src/session/AppActionBridge';
 import { OnboardingFlow } from './src/onboarding/OnboardingFlow';
 import { colors } from './src/constants/theme';
 import { useEnsureSession } from './src/hooks/useEnsureSession';
-
-const ONBOARDING_COMPLETE_KEY = 'onboarding_complete_v1';
+import { supabase } from './src/lib/supabase';
 
 const AGENT_ID = process.env.EXPO_PUBLIC_AGENT_ID;
 if (!AGENT_ID) {
@@ -38,18 +38,30 @@ const App = () => {
   const [onboarded, setOnboarded] = useState<boolean | null>(null);
 
   useEffect(() => {
-    AsyncStorage.getItem(ONBOARDING_COMPLETE_KEY)
-      .then((value) => setOnboarded(value === 'true'))
-      .catch((err) => {
-        console.error('[App] failed to read onboarding completion flag:', err);
-        setOnboarded(false);
+    if (!sessionReady) return;
+    if (!userId) {
+      setOnboarded(false);
+      return;
+    }
+
+    let cancelled = false;
+    supabase
+      .from('profile')
+      .select('user_id')
+      .eq('user_id', userId)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) console.error('[App] failed to check onboarding status:', error.message);
+        setOnboarded(!!data);
       });
-  }, []);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionReady, userId]);
 
   const handleOnboardingComplete = useCallback(() => {
-    AsyncStorage.setItem(ONBOARDING_COMPLETE_KEY, 'true').catch((err) =>
-      console.error('[App] failed to persist onboarding completion flag:', err),
-    );
     setOnboarded(true);
   }, []);
 
@@ -65,8 +77,9 @@ const App = () => {
           <OnboardingFlow userId={userId} onComplete={handleOnboardingComplete} />
         ) : (
           <ConversationProvider agentId={AGENT_ID}>
-            <NavigationContainer theme={navTheme}>
+            <NavigationContainer ref={navigationRef} theme={navTheme}>
               <ActiveSessionProvider>
+                <AppActionBridge userId={userId} />
                 <RootStack />
               </ActiveSessionProvider>
             </NavigationContainer>

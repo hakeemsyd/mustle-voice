@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { callBrain } from '../lib/brain';
+import { callBrain, COACH_UNREACHABLE_MESSAGE, type PlanBreakdownCard } from '../lib/brain';
 
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   text: string;
+  card?: PlanBreakdownCard | null;
 }
 
 export function useHomeChat(userId: string | null) {
@@ -20,7 +21,7 @@ export function useHomeChat(userId: string | null) {
     (async () => {
       const { data, error } = await supabase
         .from('message')
-        .select('id,role,content')
+        .select('id,role,content,card')
         .eq('user_id', userId)
         .eq('hidden', false)
         .order('at', { ascending: true })
@@ -34,6 +35,7 @@ export function useHomeChat(userId: string | null) {
             id: row.id,
             role: row.role === 'assistant' ? 'assistant' : 'user',
             text: row.content,
+            card: row.card,
           })),
         );
       }
@@ -52,25 +54,33 @@ export function useHomeChat(userId: string | null) {
     setTranscript((prev) => [...prev, { id: `local-${Date.now()}-${role}`, role, text }]);
   }, []);
 
+  const latestRequestRef = useRef(0);
+
   const sendMessage = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
       if (!trimmed || !userId) return;
 
+      const requestId = ++latestRequestRef.current;
       setTranscript((prev) => [...prev, { id: `local-${Date.now()}`, role: 'user', text: trimmed }]);
       setCoachTyping(true);
 
       try {
         const result = await callBrain(userId, trimmed);
-        setTranscript((prev) => [...prev, { id: `local-${Date.now()}-r`, role: 'assistant', text: result.reply }]);
-      } catch (err) {
-        console.error('[useHomeChat] brain call failed:', err);
+        if (latestRequestRef.current !== requestId) return;
         setTranscript((prev) => [
           ...prev,
-          { id: `local-${Date.now()}-e`, role: 'assistant', text: "Couldn't reach the coach — try again in a moment." },
+          { id: `local-${Date.now()}-r`, role: 'assistant', text: result.reply, card: result.card },
+        ]);
+      } catch (err) {
+        console.error('[useHomeChat] brain call failed:', err);
+        if (latestRequestRef.current !== requestId) return;
+        setTranscript((prev) => [
+          ...prev,
+          { id: `local-${Date.now()}-e`, role: 'assistant', text: COACH_UNREACHABLE_MESSAGE },
         ]);
       } finally {
-        setCoachTyping(false);
+        if (latestRequestRef.current === requestId) setCoachTyping(false);
       }
     },
     [userId],

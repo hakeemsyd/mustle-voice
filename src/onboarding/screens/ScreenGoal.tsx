@@ -1,6 +1,7 @@
 import React from "react";
 
 import { ConversationalScreen } from "../../components/ConversationalScreen";
+import { GOAL_PROMPT } from "../prompts";
 
 interface ScreenGoalProps {
   onNext: (goal: string) => void;
@@ -11,7 +12,7 @@ interface ScreenGoalProps {
 export const ScreenGoal = ({ onNext, onBack, forceTypeMode }: ScreenGoalProps) => {
   return (
     <ConversationalScreen
-      coachMessage="What are you actually trying to get out of this? Be honest."
+      coachMessage={GOAL_PROMPT}
       dotIndex={5}
       showBack
       onBack={onBack}

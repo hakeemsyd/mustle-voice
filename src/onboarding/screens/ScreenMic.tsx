@@ -16,11 +16,12 @@ import { Orb, type OrbState } from "../Orb";
 import { ProgressDots } from "../ProgressDots";
 import { requestMicPermission } from "../requestMicPermission";
 import { useSpeakOnMount } from "../useSpeakOnMount";
+import { MIC_PROMPT } from "../prompts";
 
 import { colors, fonts } from "../../constants/theme";
 import { useWordTyping } from "../../hooks/useWordTyping";
 
-const COACH_MSG = "Talk to me. That's how we train.";
+const COACH_MSG = MIC_PROMPT;
 
 type MicPhase = "typing" | "shrinking" | "ready";
 type SubScreen = "main" | "nomic";

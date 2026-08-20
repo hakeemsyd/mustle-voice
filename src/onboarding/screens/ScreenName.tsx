@@ -2,6 +2,7 @@ import React from "react";
 
 import { ConversationalScreen } from "../../components/ConversationalScreen";
 import { extractSpokenName } from "../extractSpokenName";
+import { NAME_PROMPT } from "../prompts";
 
 interface ScreenNameProps {
   onNext: (name: string) => void;
@@ -12,7 +13,7 @@ interface ScreenNameProps {
 export const ScreenName = ({ onNext, onBack, forceTypeMode }: ScreenNameProps) => {
   return (
     <ConversationalScreen
-      coachMessage="Hey — what's your name?"
+      coachMessage={NAME_PROMPT}
       typeInputPlaceholder="Your name"
       dotIndex={3}
       showBack

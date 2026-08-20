@@ -57,7 +57,9 @@ export function SessionCoachCard({ state, message }: SessionCoachCardProps) {
         {live && <LiveDot />}
         <Text style={[styles.badge, live && styles.badgeLive]}>{BADGE[state]}</Text>
       </View>
-      <Text style={styles.message}>{message}</Text>
+      <Text style={styles.message} numberOfLines={4} ellipsizeMode="tail">
+        {message}
+      </Text>
     </View>
   );
 }

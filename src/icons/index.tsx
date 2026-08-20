@@ -29,6 +29,24 @@ import { StopIcon } from "./StopIcon";
 import { FlameIcon } from "./FlameIcon";
 import { ShareIcon } from "./ShareIcon";
 import { CopyIcon } from "./CopyIcon";
+import { TrendingDownIcon } from "./TrendingDownIcon";
+import { InfoIcon } from "./InfoIcon";
+import { SearchIcon } from "./SearchIcon";
+import { ChevronRightIcon } from "./ChevronRightIcon";
+import { WatchIcon } from "./WatchIcon";
+import { CloudOffIcon } from "./CloudOffIcon";
+import { RotateCcwIcon } from "./RotateCcwIcon";
+import { UtensilsIcon } from "./UtensilsIcon";
+import { DumbbellIcon } from "./DumbbellIcon";
+import { HeartPulseIcon } from "./HeartPulseIcon";
+import { MessageCircleIcon } from "./MessageCircleIcon";
+import { TargetIcon } from "./TargetIcon";
+import { SparklesIcon } from "./SparklesIcon";
+import { MessageCircleDashedIcon } from "./MessageCircleDashedIcon";
+import { BedDoubleIcon } from "./BedDoubleIcon";
+import { TimerIcon } from "./TimerIcon";
+import { CheckCircleIcon } from "./CheckCircleIcon";
+import { CircleIcon } from "./CircleIcon";
 
 export {
   FemaleIcon,
@@ -62,4 +80,22 @@ export {
   FlameIcon,
   ShareIcon,
   CopyIcon,
+  TrendingDownIcon,
+  InfoIcon,
+  SearchIcon,
+  ChevronRightIcon,
+  WatchIcon,
+  CloudOffIcon,
+  RotateCcwIcon,
+  UtensilsIcon,
+  DumbbellIcon,
+  HeartPulseIcon,
+  MessageCircleIcon,
+  TargetIcon,
+  SparklesIcon,
+  MessageCircleDashedIcon,
+  BedDoubleIcon,
+  TimerIcon,
+  CheckCircleIcon,
+  CircleIcon,
 };

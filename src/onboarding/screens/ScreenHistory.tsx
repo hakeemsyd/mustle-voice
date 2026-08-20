@@ -1,6 +1,7 @@
 import React from "react";
 
 import { ConversationalScreen } from "../../components/ConversationalScreen";
+import { historyPrompt } from "../prompts";
 
 interface ScreenHistoryProps {
   userName: string;
@@ -17,7 +18,7 @@ export const ScreenHistory = ({
 }: ScreenHistoryProps) => {
   return (
     <ConversationalScreen
-      coachMessage={`Nice to meet you, ${userName}. How long have you been lifting — if at all?`}
+      coachMessage={historyPrompt(userName)}
       typeInputPlaceholder="e.g. 2"
       typeInputUnit="years"
       dotIndex={4}

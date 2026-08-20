@@ -20,7 +20,11 @@ export interface ModelTurn {
   content: ContentBlock[];
 }
 
-export type CallModel = (messages: any[], system: string) => Promise<ModelTurn>;
+export type CallModel = (
+  messages: any[],
+  system: string,
+  onTextDelta?: (delta: string) => void,
+) => Promise<ModelTurn>;
 
 export type ToolHandlers = Record<string, (input: any) => Promise<any>>;
 
@@ -45,13 +49,14 @@ export async function runBrainTurn(opts: {
   messages: any[];
   handlers: ToolHandlers;
   callModel: CallModel;
+  onTextDelta?: (delta: string) => void;
 }): Promise<BrainTurnResult> {
-  const { systemPrompt, handlers, callModel } = opts;
+  const { systemPrompt, handlers, callModel, onTextDelta } = opts;
   let messages = [...opts.messages];
   const toolCalls: ToolCallRecord[] = [];
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const turn = await callModel(messages, systemPrompt);
+    const turn = await callModel(messages, systemPrompt, onTextDelta);
     messages = [...messages, { role: 'assistant', content: turn.content }];
 
     if (turn.stop_reason !== 'tool_use') {

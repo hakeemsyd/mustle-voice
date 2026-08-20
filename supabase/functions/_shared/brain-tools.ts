@@ -171,6 +171,74 @@ export const BRAIN_TOOLS = [
       },
     },
   },
+  {
+    name: 'open_screen',
+    description:
+      'Navigate the app to one of the main tabs — use when the user asks to see their progress, stats, nutrition, or recovery.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        screen: { type: 'string', enum: ['Home', 'Stats', 'Body', 'Fuel', 'Recovery'] },
+      },
+      required: ['screen'],
+    },
+  },
+  {
+    name: 'open_todays_workout',
+    description:
+      "Open today's scheduled session in the app so the user can review and start it — use for requests like \"take me to my workout\" or \"let's start\". Returns no_session if today is a rest day or there's no active plan; tell the user that instead of navigating.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'show_plan_breakdown',
+    description:
+      "Show the user's active training plan as a structured breakdown card (program title, each day's focus and exercises, and start/modify actions) instead of describing it in a wall of text. Use this whenever they ask for an overview, breakdown, or \"what's my plan\" — pair it with one short natural sentence, not a text description of the plan itself.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'swap_exercise',
+    description:
+      "Swap an upcoming exercise in the user's active in-app session for a same-muscle-group, injury-safe alternative from the catalog (e.g. \"swap out face pulls, my shoulder's bothering me\"). Only works while a session is actually running and the exercise hasn't started yet.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        current_exercise_name: { type: 'string', description: 'Exact catalog name of the exercise to replace.' },
+      },
+      required: ['current_exercise_name'],
+    },
+  },
+  {
+    name: 'skip_exercise',
+    description:
+      "Skip the current exercise in the user's active in-app workout session and move to the next one, without logging a set for it. Only works while a session is actually running in the app.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'end_workout',
+    description:
+      "End the user's currently active in-app workout session and generate its report. Only works while a session is actually running in the app — if you're not sure one is, ask before calling this.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        completed: { type: 'boolean', description: 'true if they finished as planned, false if cutting it short' },
+      },
+      required: ['completed'],
+    },
+  },
+  {
+    name: 'update_profile',
+    description:
+      'Correct the user\'s stored display name (e.g. "my name is spelled Damion, not Damien"). Goal, injury, weight, and schedule corrections go through update_nutrition_targets, record_injury, log_checkin, and update_training_plan instead.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        display_name: { type: 'string' },
+      },
+      required: ['display_name'],
+    },
+  },
 ] as const;
 
 export type BrainToolName = (typeof BRAIN_TOOLS)[number]['name'];
+
+export const VOICE_TOOLS = BRAIN_TOOLS.filter((tool) => tool.name !== 'show_plan_breakdown');
