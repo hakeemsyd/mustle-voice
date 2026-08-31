@@ -127,7 +127,19 @@ export const useVoiceRecorder = () => {
     if (session.peak === null) {
       session.peak = smoothed;
     } else if (session.silenceSince === null) {
-      session.peak = Math.max(smoothed, session.peak - PEAK_DECAY_DB_PER_SEC * dt);
+      // Once real speech has actually been confirmed (hadSustainedContent), the peak must never
+      // erode back down — silence afterward has to be measured against how loud they actually
+      // got. Letting it keep decaying here was the bug: a real device log showed a ~2s answer's
+      // peak decay all the way down to meet the ambient floor within ~2.3s of the user going
+      // quiet (peak -30.7dB → ambient -39dB, at 6dB/sec), which erases the exact gap this
+      // function needs to ever detect "quiet now" — with nothing left to drop below, it never
+      // fires and just runs to MAX_RECORDING_MS every time regardless of how fast someone
+      // actually finished talking. Decaying (rather than freezing) is still correct BEFORE any
+      // content is confirmed, so an early ambient blip doesn't permanently peg the threshold too
+      // high for genuinely quiet speech that follows.
+      session.peak = session.hadSustainedContent
+        ? Math.max(smoothed, session.peak)
+        : Math.max(smoothed, session.peak - PEAK_DECAY_DB_PER_SEC * dt);
     }
 
     const silenceThreshold = session.peak - SILENCE_DROP_DB;

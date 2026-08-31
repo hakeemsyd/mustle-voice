@@ -4,8 +4,10 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import Animated, {
   Easing,
   FadeInUp,
+  interpolate,
   useAnimatedStyle,
   useSharedValue,
+  withDelay,
   withRepeat,
   withSequence,
   withTiming,
@@ -20,10 +22,14 @@ import { MIC_PROMPT } from "../prompts";
 
 import { colors, fonts } from "../../constants/theme";
 import { useWordTyping } from "../../hooks/useWordTyping";
+import { BackIcon } from "../../icons/BackIcon";
 
 const COACH_MSG = MIC_PROMPT;
 
-type MicPhase = "typing" | "shrinking" | "ready";
+// Matches the source's collapsed "speaking" → "ready" model (see mustle-mvp's ScreenMic.tsx
+// header comment) — the message renders at its one, final small size from the first word, no
+// separate shrink-animation phase.
+type MicPhase = "typing" | "ready";
 type SubScreen = "main" | "nomic";
 
 interface ScreenMicProps {
@@ -31,22 +37,10 @@ interface ScreenMicProps {
   onBack?: () => void;
 }
 
-export const ScreenMic = ({ onNext }: ScreenMicProps) => {
+export const ScreenMic = ({ onNext, onBack }: ScreenMicProps) => {
   const [subScreen, setSubScreen] = useState<SubScreen>("main");
   const [phase, setPhase] = useState<MicPhase>("typing");
   const [requesting, setRequesting] = useState(false);
-
-  const fontSize = useSharedValue(22);
-  const lineHeight = useSharedValue(31);
-  const marginTop = useSharedValue(56);
-  const opacity = useSharedValue(1);
-
-  const animatedMessageStyle = useAnimatedStyle(() => ({
-    fontSize: fontSize.value,
-    lineHeight: lineHeight.value,
-    marginTop: marginTop.value,
-    opacity: opacity.value,
-  }));
 
   const handleAllow = async () => {
     if (requesting) return;
@@ -70,40 +64,16 @@ export const ScreenMic = ({ onNext }: ScreenMicProps) => {
   useEffect(() => {
     if (phase === "typing" && isDone && audioDone) {
       const timer = setTimeout(() => {
-        setPhase("shrinking");
+        setPhase("ready");
       }, 300);
 
       return () => clearTimeout(timer);
     }
   }, [phase, isDone, audioDone]);
 
-  useEffect(() => {
-    if (phase === "shrinking") {
-      fontSize.value = withTiming(14, {
-        duration: 350,
-      });
-
-      lineHeight.value = withTiming(20, {
-        duration: 350,
-      });
-
-      marginTop.value = withTiming(12, {
-        duration: 350,
-      });
-
-      opacity.value = withTiming(0.55, {
-        duration: 350,
-      });
-
-      const timer = setTimeout(() => {
-        setPhase("ready");
-      }, 350);
-
-      return () => clearTimeout(timer);
-    }
-  }, [phase]);
-
-  const orbState: OrbState = phase === "typing" ? "speaking" : "breathing";
+  // "typing" (the Mustle mark), not "breathing" — this screen retired the plain pulsing-glow
+  // idle state in favor of the same calm mark the Name screen's orb shows.
+  const orbState: OrbState = phase === "typing" ? "speaking" : "typing";
 
   const ctaVisible = phase === "ready";
 
@@ -120,7 +90,13 @@ export const ScreenMic = ({ onNext }: ScreenMicProps) => {
   return (
     <SafeAreaView style={styles.screen} edges={["top"]}>
       <View style={styles.topBar}>
-        <View style={styles.topBarSpacer} />
+        {onBack ? (
+          <Pressable style={styles.topBarSpacer} onPress={onBack} hitSlop={8}>
+            <BackIcon />
+          </Pressable>
+        ) : (
+          <View style={styles.topBarSpacer} />
+        )}
         <ProgressDots total={11} current={1} />
       </View>
 
@@ -128,15 +104,17 @@ export const ScreenMic = ({ onNext }: ScreenMicProps) => {
         <Orb state={orbState} size={140} />
       </View>
 
-      <Animated.Text
-        style={[
-          styles.message,
-          { fontFamily: phase === "typing" ? fonts.bodyExtraBold : fonts.bodyMedium },
-          animatedMessageStyle,
-        ]}
-      >
-        {phase === "typing" ? words.slice(0, count).join(" ") : COACH_MSG}
-      </Animated.Text>
+      <Text style={styles.message}>
+        {words.map((w, i) => (
+          <RevealWord
+            key={i}
+            text={w}
+            isLast={i === words.length - 1}
+            revealed={phase !== "typing" || i < count}
+            style={styles.message}
+          />
+        ))}
+      </Text>
 
       {ctaVisible && (
         <Animated.View style={styles.actions} entering={FadeInUp.duration(300)}>
@@ -172,6 +150,7 @@ const NomicScreen = ({ onEnable, onSkip, onBack }: NomicScreenProps) => {
   const wave1 = useSharedValue(0.3);
   const wave2 = useSharedValue(0.3);
   const pulse = useSharedValue(0);
+  const pulse2 = useSharedValue(0);
 
   const handleEnable = async () => {
     if (busy) return;
@@ -203,15 +182,13 @@ const NomicScreen = ({ onEnable, onSkip, onBack }: NomicScreenProps) => {
       false,
     );
 
-    pulse.value = withRepeat(
-      withTiming(1, {
-        duration: 2400,
-        easing: Easing.out(Easing.ease),
-      }),
-      -1,
-      false,
-    );
-  }, [wave1, wave2, pulse]);
+    const ring = () =>
+      withTiming(1, { duration: 2400, easing: Easing.out(Easing.ease) });
+    pulse.value = withRepeat(ring(), -1, false);
+    // The source's second ring is the same pulse animation, just delayed 0.6s (its CSS
+    // `::after`) — this was declared but never actually rendered anywhere before.
+    pulse2.value = withDelay(600, withRepeat(ring(), -1, false));
+  }, [wave1, wave2, pulse, pulse2]);
 
   const wave1Style = useAnimatedStyle(() => ({
     opacity: wave1.value,
@@ -219,6 +196,16 @@ const NomicScreen = ({ onEnable, onSkip, onBack }: NomicScreenProps) => {
 
   const wave2Style = useAnimatedStyle(() => ({
     opacity: wave2.value,
+  }));
+
+  const pulseRingStyle = useAnimatedStyle(() => ({
+    opacity: interpolate(pulse.value, [0, 1], [0.6, 0]),
+    transform: [{ scale: interpolate(pulse.value, [0, 1], [0.9, 1.15]) }],
+  }));
+
+  const pulseRing2Style = useAnimatedStyle(() => ({
+    opacity: interpolate(pulse2.value, [0, 1], [0.6, 0]),
+    transform: [{ scale: interpolate(pulse2.value, [0, 1], [0.9, 1.15]) }],
   }));
 
   return (
@@ -233,6 +220,10 @@ const NomicScreen = ({ onEnable, onSkip, onBack }: NomicScreenProps) => {
 
       <View style={styles.nomicContent}>
         <View style={styles.micAnimWrap}>
+          <Animated.View style={[styles.pulseRing, pulseRingStyle]} />
+          <Animated.View
+            style={[styles.pulseRing, styles.pulseRingOuter, pulseRing2Style]}
+          />
           <Svg width={80} height={80} viewBox="0 0 80 80">
             <Rect
               x={28}
@@ -326,6 +317,39 @@ const NomicScreen = ({ onEnable, onSkip, onBack }: NomicScreenProps) => {
   );
 };
 
+// Fades in AND rises slightly (matches the source's `wordAppear` keyframe: opacity 0→1,
+// translateY 6px→0, 220ms) — each word its own reveal rather than the text just snapping in.
+function RevealWord({
+  text,
+  revealed,
+  isLast,
+  style,
+}: {
+  text: string;
+  revealed: boolean;
+  isLast: boolean;
+  style: any;
+}) {
+  const progress = useSharedValue(revealed ? 1 : 0);
+  useEffect(() => {
+    if (revealed)
+      progress.value = withTiming(1, {
+        duration: 220,
+        easing: Easing.bezier(0.2, 0, 0.2, 1),
+      });
+  }, [revealed]);
+  const animStyle = useAnimatedStyle(() => ({
+    opacity: progress.value,
+    transform: [{ translateY: (1 - progress.value) * 6 }],
+  }));
+  return (
+    <Animated.Text style={[style, animStyle]}>
+      {text}
+      {isLast ? "" : " "}
+    </Animated.Text>
+  );
+}
+
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
@@ -350,12 +374,17 @@ const styles = StyleSheet.create({
 
   orbArea: {
     alignItems: "center",
-    paddingTop: 20,
+    paddingTop: 14,
+    paddingBottom: 24,
   },
 
   message: {
     textAlign: "center",
-    fontFamily: fonts.bodyExtraBold,
+    fontFamily: fonts.bodyMedium,
+    fontSize: 14,
+    lineHeight: 20,
+    opacity: 0.65,
+    marginBottom: 4,
     color: colors.text,
     maxWidth: 300,
     alignSelf: "center",
@@ -412,6 +441,24 @@ const styles = StyleSheet.create({
     height: 120,
     alignItems: "center",
     justifyContent: "center",
+  },
+
+  pulseRing: {
+    position: "absolute",
+    width: 120,
+    height: 120,
+    borderRadius: 60,
+    borderWidth: 1,
+    borderColor: "rgba(200,241,53,0.15)",
+  },
+
+  pulseRingOuter: {
+    top: -14,
+    left: -14,
+    width: 148,
+    height: 148,
+    borderRadius: 74,
+    borderColor: "rgba(200,241,53,0.07)",
   },
 
   nomicText: {

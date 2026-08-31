@@ -8,50 +8,35 @@ interface ProgressDotsProps {
 
 const pad = (n: number) => String(n).padStart(2, "0");
 
+// Ported from mustle-mvp's ProgressDots.tsx — its own header comment notes this went through
+// three redesigns (a track+fill bar, then a segmented Stories-style indicator, then a count+
+// label) before landing here: just the step count, centered, no bar at all. Our port was still
+// on the very first of those three ("track+fill bar"), which the source explicitly moved past.
 export const ProgressDots = ({ total, current }: ProgressDotsProps) => {
-  const pct = Math.min(100, Math.max(0, (current / total) * 100));
-
   return (
-    <View style={styles.row}>
-      <View style={styles.track}>
-        <View style={[styles.fill, { width: `${pct}%` }]} />
-      </View>
-
-      <Text style={styles.label}>
+    <View style={styles.wrap}>
+      <Text style={styles.count}>
         {pad(current)}
-        <Text style={styles.labelTotal}>/{pad(total)}</Text>
+        <Text style={styles.countTotal}>/{pad(total)}</Text>
       </Text>
     </View>
   );
 };
 
 const styles = StyleSheet.create({
-  row: {
+  wrap: {
     flex: 1,
-    flexDirection: "row",
     alignItems: "center",
-    gap: 10,
+    justifyContent: "center",
   },
-  track: {
-    flex: 1,
-    height: 2,
-    borderRadius: 2,
-    backgroundColor: "rgba(255,255,255,0.1)",
-    overflow: "hidden",
-  },
-  fill: {
-    height: "100%",
-    borderRadius: 2,
-    backgroundColor: "#C8F135",
-  },
-  label: {
-    fontFamily: fonts.bodyMedium,
-    fontSize: 12,
-    letterSpacing: 0.24,
+  count: {
+    fontFamily: fonts.bodyBold,
+    fontSize: 14,
+    letterSpacing: 0.3,
     color: "#FFFFFF",
   },
-  labelTotal: {
-    fontFamily: fonts.body,
-    color: "#888888",
+  countTotal: {
+    fontFamily: fonts.bodyMedium,
+    color: "#666666",
   },
 });

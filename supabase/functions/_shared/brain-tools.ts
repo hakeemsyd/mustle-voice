@@ -118,18 +118,69 @@ export const BRAIN_TOOLS = [
   },
   {
     name: 'log_food',
-    description: 'Silently record a meal from the conversation.',
+    description:
+      'Silently record a brand NEW meal the user hasn\'t already logged. Never use this to correct ' +
+      'or add to a meal that read_state already shows as logged today — call update_food on that ' +
+      'record instead, or this will create a duplicate.',
     input_schema: {
       type: 'object',
       properties: {
         description: { type: 'string' },
-        calories: { type: 'integer' },
-        protein_g: { type: 'integer' },
-        carbs_g: { type: 'integer' },
-        fat_g: { type: 'integer' },
+        calories: { type: 'number' },
+        protein_g: { type: 'number' },
+        carbs_g: { type: 'number' },
+        fat_g: { type: 'number' },
         modality: { type: 'string', enum: ['voice', 'text', 'image', 'file', 'live_photo'] },
       },
       required: ['description'],
+    },
+  },
+  {
+    name: 'update_food',
+    description:
+      'Correct an existing logged meal in place (wrong quantity, wrong macros, or adding an item to ' +
+      'it) — use the exact id from read_state\'s recent_food. Only include the fields that changed; ' +
+      'anything omitted keeps its current value. Never call log_food for a correction. Call this WITHOUT ' +
+      'confirm first — it returns a preview and saves nothing. Only call it again with confirm:true after ' +
+      'the user has explicitly agreed to that exact preview in their next message.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'The food_log row id from read_state, not a guess.' },
+        description: { type: 'string' },
+        calories: { type: 'number' },
+        protein_g: { type: 'number' },
+        carbs_g: { type: 'number' },
+        fat_g: { type: 'number' },
+        confirm: {
+          type: 'boolean',
+          description:
+            'Leave false/omitted to get a preview of the change with nothing saved. Set true only after ' +
+            'the user explicitly agreed to the previewed values in their most recent message.',
+        },
+      },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'delete_food',
+    description:
+      'Remove an incorrectly logged meal entirely (e.g. it was a duplicate, or never actually eaten) ' +
+      '— use the exact id from read_state\'s recent_food. Call this WITHOUT confirm first — it returns a ' +
+      'preview of what would be removed and deletes nothing. Only call it again with confirm:true after ' +
+      'the user has explicitly agreed in their next message.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'The food_log row id from read_state, not a guess.' },
+        confirm: {
+          type: 'boolean',
+          description:
+            'Leave false/omitted to preview what would be deleted with nothing removed. Set true only ' +
+            'after the user explicitly agreed to remove it in their most recent message.',
+        },
+      },
+      required: ['id'],
     },
   },
   {
@@ -196,6 +247,36 @@ export const BRAIN_TOOLS = [
     input_schema: { type: 'object', properties: {} },
   },
   {
+    name: 'show_daily_workout',
+    description:
+      "Show today's (or the next due) scheduled session as a structured card — session title, estimated duration, and each exercise with its sets/reps/rest — instead of listing it out in text. Use this for \"what's today's workout\", \"what's my next session\", or similar single-day requests (not \"show my whole plan\", which is show_plan_breakdown). Returns no_session if today is a rest day or there's no active plan — tell the user that instead of inventing a workout. Pair the card with one short natural sentence, not a text description of the exercises.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'show_nutrition_summary',
+    description:
+      "Show today's nutrition as a structured card — calories remaining today and each macro target — instead of reciting the numbers in text. Use for \"nutrition summary\", \"how am I doing on food today\", or similar. Returns no_targets if nutrition targets haven't been set yet. Pair with one short natural sentence (e.g. how much room is left on a specific macro), not a restatement of every number.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'show_progress_report',
+    description:
+      "Show a structured weekly performance card — an overall score, how it compares to last week, and a 7-day trend — instead of describing progress in text. Use for \"progress report\", \"how am I trending\", or similar week-level requests (not a single day's workout or a single lift). Pair with one short natural sentence about the trend.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'show_readiness',
+    description:
+      "Show today's training readiness as a structured card — a 0-100 score and a plain-language recommendation (e.g. train normally vs. train with caution) — instead of describing it in text. Use for \"how's my readiness\", \"should I train hard today\", or similar. This is a rest-gap heuristic (days since last session, recent streak), not wearable-derived — never claim it's based on sleep or HRV data the app doesn't have. Pair with one short natural sentence.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'show_top_lifts',
+    description:
+      "Show the user's best working weight per exercise (top 3) as a structured card instead of listing them in text. Use for \"top lifts\", \"what's my best lift\", or similar. The card may be empty if not enough sessions have been logged yet — tell the user that plainly rather than inventing numbers. Pair with one short natural sentence.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
     name: 'swap_exercise',
     description:
       "Swap an upcoming exercise in the user's active in-app session for a same-muscle-group, injury-safe alternative from the catalog (e.g. \"swap out face pulls, my shoulder's bothering me\"). Only works while a session is actually running and the exercise hasn't started yet.",
@@ -214,6 +295,12 @@ export const BRAIN_TOOLS = [
     input_schema: { type: 'object', properties: {} },
   },
   {
+    name: 'add_set',
+    description:
+      "Add one extra set to the current exercise in the user's active in-app workout session (e.g. \"let's do one more set of this\"). Only works while a session is actually running in the app.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
     name: 'end_workout',
     description:
       "End the user's currently active in-app workout session and generate its report. Only works while a session is actually running in the app — if you're not sure one is, ask before calling this.",
@@ -223,6 +310,24 @@ export const BRAIN_TOOLS = [
         completed: { type: 'boolean', description: 'true if they finished as planned, false if cutting it short' },
       },
       required: ['completed'],
+    },
+  },
+  {
+    name: 'adjust_rest_timer',
+    description:
+      "Adjust the rest timer currently running on the user's active in-app workout session — the same " +
+      'timer the screen shows. Only works while a real rest period is actually counting down (the live ' +
+      "session state block tells you the current remaining/target seconds); if it doesn't show one, ask " +
+      "before calling this. This only requests the change — the app applies it, so don't say a new time " +
+      'or that rest was skipped/paused/resumed as settled fact until the next live session state block ' +
+      'confirms it; say what you just asked for, not that it already happened.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['extend', 'skip', 'pause', 'resume'] },
+        seconds: { type: 'integer', description: 'How many seconds to add — only used when action is "extend".' },
+      },
+      required: ['action'],
     },
   },
   {
@@ -241,4 +346,12 @@ export const BRAIN_TOOLS = [
 
 export type BrainToolName = (typeof BRAIN_TOOLS)[number]['name'];
 
-export const VOICE_TOOLS = BRAIN_TOOLS.filter((tool) => tool.name !== 'show_plan_breakdown');
+const CARD_ONLY_TOOLS = new Set([
+  'show_plan_breakdown',
+  'show_daily_workout',
+  'show_nutrition_summary',
+  'show_progress_report',
+  'show_readiness',
+  'show_top_lifts',
+]);
+export const VOICE_TOOLS = BRAIN_TOOLS.filter((tool) => !CARD_ONLY_TOOLS.has(tool.name));

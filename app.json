@@ -3,6 +3,7 @@
     "name": "Mustle",
     "slug": "mustle-voice",
     "version": "1.0.0",
+    "scheme": "mustle",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -16,6 +17,7 @@
       "supportsTablet": false,
       "bundleIdentifier": "com.mustle.voice",
       "buildNumber": "3",
+      "usesAppleSignIn": true,
       "infoPlist": {
         "NSMicrophoneUsageDescription": "Mustle needs microphone access to hear your voice coaching requests.",
         "NSCameraUsageDescription": "Mustle does not use the camera. This permission is required by the voice (WebRTC) library and the camera is never accessed."
@@ -50,7 +52,14 @@
       "./plugins/withSwiftUICoreLinkFix",
       "expo-audio",
       "expo-asset",
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-apple-authentication",
+      [
+        "@react-native-google-signin/google-signin",
+        {
+          "iosUrlScheme": "com.googleusercontent.apps.421703647517-95geinli07j49llb1lts4ms4prc06e4v"
+        }
+      ]
     ]
   }
 }

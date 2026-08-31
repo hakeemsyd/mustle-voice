@@ -35,7 +35,8 @@ const DEFAULT_STATE: OnboardingState = {
   completedAt: null,
 };
 
-const DRAFT_KEY = 'onboarding_draft_v1';
+export const ONBOARDING_DRAFT_KEY = 'onboarding_draft_v1';
+const DRAFT_KEY = ONBOARDING_DRAFT_KEY;
 
 interface OnboardingDraft {
   screenIndex: number;

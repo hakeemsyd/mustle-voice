@@ -21,6 +21,8 @@ export const ScreenName = ({ onNext, onBack, forceTypeMode }: ScreenNameProps) =
       onComplete={onNext}
       formatAnswer={extractSpokenName}
       forceTypeMode={forceTypeMode}
+      unifiedInput
+      orbSize={126}
     />
   );
 };

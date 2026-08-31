@@ -11,6 +11,7 @@ import { supabase } from "../lib/supabase";
 import { callBrain, COACH_UNREACHABLE_MESSAGE } from "../lib/brain";
 import { DEFAULT_REST_SEC, suggestRestSeconds } from "../lib/restSuggestion";
 import { useProfileName } from "../hooks/useProfileName";
+import { buildLiveSessionSnapshot, describeLiveSessionSnapshot } from "./liveSessionState";
 
 const EXTEND_REST_SEC = 10;
 
@@ -30,6 +31,31 @@ export interface SessionExercise {
 export interface LoggedSet {
   weight: number | null;
   reps: number;
+}
+
+/** Same shape workout_log.exercises_done is written in (see writeWorkoutLog below) — passed
+ *  back in to resume a partial session at its actual saved position instead of restarting at
+ *  exercise 0, set 0 (confirmed live: completing two sets, ending early, and starting again
+ *  silently discarded them and restarted from scratch). */
+export interface ResumeExerciseEntry {
+  name: string;
+  sets: number;
+  reps: string;
+  load: string;
+}
+
+function parseResumeSets(entry: ResumeExerciseEntry | undefined): LoggedSet[] {
+  if (!entry) return [];
+  const isBodyweight = entry.load === "bodyweight";
+  const loads = isBodyweight ? [] : entry.load.split(",").map((l) => {
+    const n = parseFloat(l.trim());
+    return Number.isFinite(n) ? n : null;
+  });
+  return entry.reps
+    .split(",")
+    .map((r) => parseInt(r.trim(), 10))
+    .filter((n) => Number.isFinite(n))
+    .map((reps, i) => ({ weight: isBodyweight ? null : loads[i] ?? null, reps }));
 }
 
 export type SessionStatus = "completed" | "partial";
@@ -78,8 +104,10 @@ interface ActiveSessionValue {
   restEndAt: number | null;
   /** Set while paused, to a frozen remaining-seconds value; null while actively ticking. */
   restPausedRemainingSec: number | null;
-  extendRest: () => void;
+  extendRest: (seconds?: number) => void;
   toggleRestPause: () => void;
+  pauseRest: () => void;
+  resumeRest: () => void;
   ended: boolean;
   /** Which kind of run it was, set by whatever ended it. Null until then. */
   endedStatus: SessionStatus | null;
@@ -93,11 +121,12 @@ interface ActiveSessionValue {
   elapsedSec: number;
   paused: boolean;
   minimized: boolean;
-  start: (target: SessionTarget) => void;
+  start: (target: SessionTarget, resumeExercisesDone?: ResumeExerciseEntry[]) => void;
   minimize: () => void;
   restore: () => void;
   logSet: (weight: number | null, reps: number) => void;
   skipExercise: () => void;
+  addSet: () => void;
   removeQueuedExercise: (exerciseRowId: string) => void;
   swapQueuedExercise: (exerciseRowId: string, replacement: { id: string; name: string }) => void;
   finishRest: () => void;
@@ -154,8 +183,10 @@ export function ActiveSessionProvider({
 
   const userIdRef = useRef<string | null>(null);
   const logIdRef = useRef<string | null>(null);
+  const resumeDataRef = useRef<ResumeExerciseEntry[] | null>(null);
 
-  const start = useCallback((next: SessionTarget) => {
+  const start = useCallback((next: SessionTarget, resumeExercisesDone?: ResumeExerciseEntry[]) => {
+    resumeDataRef.current = resumeExercisesDone ?? null;
     setTarget(next);
     setLoading(next.type === "strength");
     setError(null);
@@ -266,7 +297,18 @@ export function ActiveSessionProvider({
 
       setFocus(data.focus ?? null);
       setExercises(detail);
-      setLoggedSets(detail.map(() => []));
+
+      const resume = resumeDataRef.current;
+      resumeDataRef.current = null;
+      if (resume) {
+        const byName = new Map(resume.map((r) => [r.name.toLowerCase(), r]));
+        const resumedSets = detail.map((ex) => parseResumeSets(byName.get(ex.name.toLowerCase())));
+        const firstUnfinished = detail.findIndex((ex, i) => resumedSets[i].length < ex.sets);
+        setLoggedSets(resumedSets);
+        setCurrentExerciseIndex(firstUnfinished === -1 ? Math.max(detail.length - 1, 0) : firstUnfinished);
+      } else {
+        setLoggedSets(detail.map(() => []));
+      }
       setLoading(false);
     })();
 
@@ -304,6 +346,20 @@ export function ActiveSessionProvider({
 
       if (!isCardio && exercisesDone.length === 0) return;
 
+      const vsPlanned = isCardio
+        ? null
+        : {
+            planned_exercises: exercises.length,
+            completed_exercises: exercisesDone.length,
+            planned_sets: exercises.reduce((sum, ex) => sum + ex.sets, 0),
+            completed_sets: exercisesDone.reduce((sum, ex) => sum + ex.sets, 0),
+            exercises: exercises.map((exercise, i) => ({
+              name: exercise.name,
+              planned_sets: exercise.sets,
+              completed_sets: (sets[i] ?? []).length,
+            })),
+          };
+
       setSaving(true);
       const { data, error: insertError } = await supabase
         .from("workout_log")
@@ -316,6 +372,7 @@ export function ActiveSessionProvider({
           cardio_activity: isCardio ? target.activity : null,
           duration_sec: elapsedSec,
           exercises_done: exercisesDone,
+          vs_planned: vsPlanned,
           status,
           note: null,
         })
@@ -387,6 +444,16 @@ export function ActiveSessionProvider({
     }
   }, [currentExerciseIndex, exercises.length, loggedSets, writeWorkoutLog]);
 
+  const addSet = useCallback(() => {
+    setExercises((prev) => {
+      const exercise = prev[currentExerciseIndex];
+      if (!exercise) return prev;
+      const next = prev.slice();
+      next[currentExerciseIndex] = { ...exercise, sets: exercise.sets + 1 };
+      return next;
+    });
+  }, [currentExerciseIndex]);
+
   const removeQueuedExercise = useCallback(
     (exerciseRowId: string) => {
       const index = exercises.findIndex((e) => e.id === exerciseRowId);
@@ -400,12 +467,17 @@ export function ActiveSessionProvider({
   const swapQueuedExercise = useCallback(
     (exerciseRowId: string, replacement: { id: string; name: string }) => {
       const index = exercises.findIndex((e) => e.id === exerciseRowId);
-      if (index === -1 || index <= currentExerciseIndex) return;
+      if (index === -1 || index < currentExerciseIndex) return;
+      // The current exercise can still be swapped as long as it hasn't been started yet —
+      // matches the coach's own tool description ("only works on an exercise that hasn't
+      // started yet"). Only a strictly earlier or already-in-progress exercise is off-limits.
+      const alreadyStarted = index === currentExerciseIndex && (loggedSets[index]?.length ?? 0) > 0;
+      if (alreadyStarted) return;
       setExercises((prev) =>
         prev.map((e) => (e.id === exerciseRowId ? { ...e, exerciseId: replacement.id, name: replacement.name } : e)),
       );
     },
-    [exercises, currentExerciseIndex],
+    [exercises, currentExerciseIndex, loggedSets],
   );
 
   const finishRest = useCallback(() => {
@@ -414,29 +486,39 @@ export function ActiveSessionProvider({
     setRestPausedRemainingSec(null);
   }, []);
 
-  const extendRest = useCallback(() => {
-    setRestTargetSec((sec) => sec + EXTEND_REST_SEC);
-    setRestEndAt((endAt) =>
-      endAt === null ? endAt : endAt + EXTEND_REST_SEC * 1000,
-    );
+  const extendRest = useCallback((seconds?: number) => {
+    const amount = seconds && seconds > 0 ? seconds : EXTEND_REST_SEC;
+    setRestTargetSec((sec) => sec + amount);
+    setRestEndAt((endAt) => (endAt === null ? endAt : endAt + amount * 1000));
     setRestPausedRemainingSec((remaining) =>
-      remaining === null ? remaining : remaining + EXTEND_REST_SEC,
+      remaining === null ? remaining : remaining + amount,
     );
   }, []);
 
-  const toggleRestPause = useCallback(() => {
-    if (restPausedRemainingSec !== null) {
-      // Resuming: hand the frozen remainder back to the live wall-clock timer.
-      setRestEndAt(Date.now() + restPausedRemainingSec * 1000);
-      setRestPausedRemainingSec(null);
-      return;
-    }
+  // Split into explicit pause/resume (not just a toggle) so a voice command like "pause the
+  // timer" can act on the timer's actual current state rather than blindly flipping whatever
+  // it happens to be — the coach receives that current state via the live session snapshot.
+  const pauseRest = useCallback(() => {
     if (restEndAt === null) return; // not actively resting — nothing to pause
     setRestPausedRemainingSec(
       Math.max(0, Math.round((restEndAt - Date.now()) / 1000)),
     );
     setRestEndAt(null);
-  }, [restEndAt, restPausedRemainingSec]);
+  }, [restEndAt]);
+
+  const resumeRest = useCallback(() => {
+    if (restPausedRemainingSec === null) return;
+    setRestEndAt(Date.now() + restPausedRemainingSec * 1000);
+    setRestPausedRemainingSec(null);
+  }, [restPausedRemainingSec]);
+
+  const toggleRestPause = useCallback(() => {
+    if (restPausedRemainingSec !== null) {
+      resumeRest();
+      return;
+    }
+    pauseRest();
+  }, [restPausedRemainingSec, pauseRest, resumeRest]);
 
   const endSession = useCallback(
     async (status: SessionStatus) => {
@@ -475,7 +557,22 @@ export function ActiveSessionProvider({
       const requestId = ++latestAskRef.current;
       setCoachThinking(true);
       try {
-        const result = await callBrain(userId, text.trim());
+        const snapshot = buildLiveSessionSnapshot({
+          target,
+          focus,
+          exercises,
+          currentExerciseIndex,
+          loggedSets,
+          resting,
+          restTargetSec,
+          restEndAt,
+          restPausedRemainingSec,
+          ended,
+          paused,
+          elapsedSec,
+        });
+        const liveSessionState = snapshot ? describeLiveSessionSnapshot(snapshot) : undefined;
+        const result = await callBrain(userId, text.trim(), "text", false, undefined, liveSessionState);
         if (latestAskRef.current !== requestId) return;
         setCoachMessage(result.reply);
 
@@ -502,7 +599,20 @@ export function ActiveSessionProvider({
         if (latestAskRef.current === requestId) setCoachThinking(false);
       }
     },
-    [currentExerciseIndex, exercises],
+    [
+      currentExerciseIndex,
+      exercises,
+      target,
+      focus,
+      loggedSets,
+      resting,
+      restTargetSec,
+      restEndAt,
+      restPausedRemainingSec,
+      ended,
+      paused,
+      elapsedSec,
+    ],
   );
 
   const announce = useCallback((text: string) => {
@@ -549,6 +659,7 @@ export function ActiveSessionProvider({
       restore,
       logSet,
       skipExercise,
+      addSet,
       removeQueuedExercise,
       swapQueuedExercise,
       finishRest,
@@ -561,6 +672,8 @@ export function ActiveSessionProvider({
       clear,
       toggleRestPause,
       extendRest,
+      pauseRest,
+      resumeRest,
     }),
     [
       userId,
@@ -591,6 +704,7 @@ export function ActiveSessionProvider({
       restore,
       logSet,
       skipExercise,
+      addSet,
       removeQueuedExercise,
       swapQueuedExercise,
       finishRest,
@@ -602,6 +716,8 @@ export function ActiveSessionProvider({
       clear,
       toggleRestPause,
       extendRest,
+      pauseRest,
+      resumeRest,
     ],
   );
 

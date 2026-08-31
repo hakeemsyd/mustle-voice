@@ -283,7 +283,7 @@ export function useStatsData(): StatsData {
       if (streakDays >= 4) readinessScore -= 10;
       readinessScore = Math.max(0, Math.min(100, readinessScore));
       const readinessLabel =
-        readinessScore >= 80 ? "Ready to train" : readinessScore >= 60 ? "Train at normal effort" : "Consider a lighter session";
+        readinessScore >= 80 ? "Ready to train" : readinessScore >= 60 ? "Train at normal effort" : "Train with caution";
 
       setState({
         loading: false,

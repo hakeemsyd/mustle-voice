@@ -11,7 +11,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import Animated, { FadeIn, FadeOut } from "react-native-reanimated";
-import { useFocusEffect, useNavigation } from "@react-navigation/native";
+import { useFocusEffect, useNavigation, useRoute, type RouteProp } from "@react-navigation/native";
 
 import { VoiceOrb } from "../components/VoiceOrb";
 import { AppDrawer } from "../components/AppDrawer";
@@ -19,13 +19,22 @@ import { BottomSheet } from "../components/BottomSheet";
 import { FloatingParticles } from "../components/FloatingParticles";
 import { ChatComposer } from "../components/ChatComposer";
 import { ChatTranscript } from "../components/ChatTranscript";
+import { QuickPromptChips } from "../components/QuickPromptChips";
 import { HeroGlow } from "../components/HeroGlow";
 import { VoiceAmbient } from "../components/VoiceAmbient";
 import { useVoiceSession } from "../hooks/useVoiceSession";
 import { useHomeData } from "../hooks/useHomeData";
 import { useHomeChat } from "../hooks/useHomeChat";
 import { colors, fonts } from "../constants/theme";
-import { AudioLinesIcon, CalendarIcon, MenuIcon, MoonIcon, SunIcon, XIcon } from "../icons";
+import {
+  AudioLinesIcon,
+  CalendarIcon,
+  MenuIcon,
+  MoonIcon,
+  SunIcon,
+  XIcon,
+} from "../icons";
+import { MMark } from "../icons/MMark";
 import { getMomentumLine } from "./homeFormat";
 import type { OrbState } from "../components/VoiceOrb";
 
@@ -42,7 +51,6 @@ function getTimeBand(hour: number): TimeBand {
 function getGreeting(band: TimeBand, name: string | null): string {
   return name ? `${band}, ${name}.` : `${band}.`;
 }
-
 
 // "breathing"/"idle" is the gap between turns — connected but neither side is
 // talking — so it reads as the cue for the user to speak, same as the design's
@@ -62,15 +70,36 @@ export function HomeScreen() {
   const [composerFocused, setComposerFocused] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const navigation = useNavigation();
+  const route = useRoute<RouteProp<{ Home: { openChat?: boolean } }, "Home">>();
   const timeBand = getTimeBand(new Date().getHours());
-  const { loading, userId, userName, macros, todaySession, coachMessage, streakDays, loadError, refetch } = useHomeData();
-  const { transcript, coachTyping, sendMessage, appendLocal } = useHomeChat(userId);
+  const {
+    loading,
+    userId,
+    userName,
+    macros,
+    todaySession,
+    coachMessage,
+    streakDays,
+    loadError,
+    planPending,
+    refetch,
+  } = useHomeData();
+  const { transcript, coachTyping, sendMessage, appendLocal } =
+    useHomeChat(userId);
   // The ElevenLabs SDK hands us the real spoken transcript as the call happens (its own
   // STT/TTS text, independent of our brain) — fold it into the same feed as typed
   // messages so a conversation reads as one thread whether it was spoken or typed.
   const { orbState, isActive, toggle } = useVoiceSession(
-    ({ role, text }) => appendLocal(role === "user" ? "user" : "assistant", text),
-    { userId, dynamicVariables: { user_name: userName ?? "there", user_id: userId ?? "" } },
+    ({ role, text }) =>
+      appendLocal(role === "user" ? "user" : "assistant", text),
+    {
+      userId,
+      dynamicVariables: {
+        user_name: userName ?? "there",
+        user_id: userId ?? "",
+        user_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      },
+    },
   );
 
   const protein = macros?.find((m) => m.key === "protein") ?? null;
@@ -87,7 +116,9 @@ export function HomeScreen() {
   // The design hides AppNav entirely while the conversation is open — the overlay
   // owns the full screen below the status bar, tab bar included.
   useEffect(() => {
-    navigation.setOptions({ tabBarStyle: chatOpen ? { display: "none" } : undefined });
+    navigation.setOptions({
+      tabBarStyle: chatOpen ? { display: "none" } : undefined,
+    });
   }, [chatOpen, navigation]);
 
   // Picks up whatever changed off-screen — e.g. a workout just logged in Active Session —
@@ -98,12 +129,27 @@ export function HomeScreen() {
     }, [refetch]),
   );
 
+  // The FloatingCoachButton (Stats/Body/Fuel/Recovery) navigates here with this param to open
+  // the coach straight away — cleared right after so a later, unrelated focus doesn't reopen it.
+  useEffect(() => {
+    if (route.params?.openChat) {
+      setChatOpen(true);
+      navigation.setParams({ openChat: undefined } as never);
+    }
+  }, [route.params?.openChat, navigation]);
+
   const handleSend = () => {
     const text = draftText;
     setDraftText("");
     Keyboard.dismiss();
     setChatOpen(true);
     sendMessage(text).then(refetch);
+  };
+
+  const handleQuickPrompt = (phrase: string) => {
+    Keyboard.dismiss();
+    setChatOpen(true);
+    sendMessage(phrase).then(refetch);
   };
 
   const handleTalk = () => {
@@ -123,7 +169,11 @@ export function HomeScreen() {
         <>
           <View style={styles.header}>
             <View style={styles.brandGroup}>
-              <Pressable style={styles.menuBtn} onPress={() => setDrawerOpen(true)} hitSlop={10}>
+              <Pressable
+                style={styles.menuBtn}
+                onPress={() => setDrawerOpen(true)}
+                hitSlop={10}
+              >
                 <MenuIcon size={18} color={colors.muted} />
               </Pressable>
               <Text style={styles.brand}>MUSTLE</Text>
@@ -156,16 +206,24 @@ export function HomeScreen() {
         behavior={Platform.OS === "ios" ? "padding" : "height"}
       >
         {chatOpen ? (
-          <Animated.View style={styles.flex} entering={FadeIn.duration(220)} exiting={FadeOut.duration(150)}>
+          <Animated.View
+            style={styles.flex}
+            entering={FadeIn.duration(220)}
+            exiting={FadeOut.duration(150)}
+          >
             <View style={styles.chatHeader}>
               <View style={styles.chatHeaderState}>
                 {isActive && <AudioLinesIcon size={13} color={colors.accent} />}
                 <Text style={styles.chatHeaderLabel}>
-                  {isActive ? VOICE_PHASE_LABEL[orbState] : "Coach"}
+                  {isActive ? VOICE_PHASE_LABEL[orbState] : "Muscle"}
                 </Text>
               </View>
               {!isActive && (
-                <Pressable style={styles.chatCloseBtn} onPress={closeConversation} hitSlop={8}>
+                <Pressable
+                  style={styles.chatCloseBtn}
+                  onPress={closeConversation}
+                  hitSlop={8}
+                >
                   <XIcon size={16} color="rgba(255,255,255,0.5)" />
                 </Pressable>
               )}
@@ -176,90 +234,122 @@ export function HomeScreen() {
                 messages={transcript}
                 coachTyping={coachTyping}
                 voiceActive={isActive}
-                onStartDay={(planSessionId) => navigation.navigate("PreWorkoutPreview", { planSessionId })}
+                onStartDay={(planSessionId) =>
+                  navigation.navigate("PreWorkoutPreview", { planSessionId })
+                }
                 onModifyPlan={() => setDraftText("I'd like to change ")}
               />
             </View>
           </Animated.View>
         ) : (
           <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-          <View style={styles.hero}>
-            <FloatingParticles />
-            <HeroGlow />
+            <View style={styles.hero}>
+              <FloatingParticles />
+              <HeroGlow />
 
-            <View style={styles.heroTop}>
-              <View style={styles.captionIconRow}>
-                {timeBand === "Night" ? (
-                  <MoonIcon size={18} color="rgba(180,190,255,0.85)" />
-                ) : (
-                  <SunIcon size={18} color="rgba(251,180,60,0.85)" />
-                )}
-              </View>
-              <Text style={styles.captionGreeting}>{getGreeting(timeBand, userName)}</Text>
-              <Text style={styles.captionMain}>{loading ? "Loading your plan…" : coachMessage}</Text>
-              <Text style={styles.captionSub}>{loading ? "" : getMomentumLine(streakDays)}</Text>
+              <View style={styles.heroTop}>
+                <View style={styles.captionIconRow}>
+                  {timeBand === "Night" ? (
+                    <MoonIcon size={18} color="rgba(180,190,255,0.85)" />
+                  ) : (
+                    <SunIcon size={18} color="rgba(251,180,60,0.85)" />
+                  )}
+                </View>
+                <Text style={styles.captionGreeting}>
+                  {getGreeting(timeBand, userName)}
+                </Text>
+                <Text style={styles.captionMain}>
+                  {loading ? "Loading your plan…" : coachMessage}
+                </Text>
+                <Text style={styles.captionSub}>
+                  {loading ? "" : getMomentumLine(streakDays)}
+                </Text>
 
-              {!loading && (
-                <View style={styles.metaRow}>
-                  {loadError ? (
-                    <Pressable style={styles.restLine} onPress={refetch}>
-                      <View style={styles.restLineDot} />
-                      <Text style={styles.restLineText}>{loadError} Tap to retry</Text>
-                    </Pressable>
-                  ) : todaySession === null ? (
-                    <View style={styles.restLine}>
-                      <View style={styles.restLineDot} />
-                      <Text style={styles.restLineText}>
-                        No plan yet — talk to your coach to set one up
-                      </Text>
-                    </View>
-                  ) : todaySession.hasSession ? (
+                {!loading && (
+                  <View style={styles.metaRow}>
+                    {loadError ? (
+                      <Pressable style={styles.restLine} onPress={refetch}>
+                        <View style={styles.restLineDot} />
+                        <Text style={styles.restLineText}>
+                          {loadError} Tap to retry
+                        </Text>
+                      </Pressable>
+                    ) : todaySession === null && planPending ? (
+                      <Pressable style={styles.restLine} onPress={refetch}>
+                        <View style={styles.restLineDot} />
+                        <Text style={styles.restLineText}>
+                          Still setting up your plan — tap to check
+                        </Text>
+                      </Pressable>
+                    ) : todaySession === null ? (
+                      <View style={styles.restLine}>
+                        <View style={styles.restLineDot} />
+                        <Text style={styles.restLineText}>
+                          No plan yet — talk to your coach to set one up
+                        </Text>
+                      </View>
+                    ) : todaySession.hasSession ? (
+                      <Pressable
+                        style={styles.slimSession}
+                        onPress={() =>
+                          navigation.navigate("PreWorkoutPreview", {
+                            planSessionId: todaySession.planSessionId!,
+                          })
+                        }
+                      >
+                        <View style={styles.slimSessionDot} />
+                        <Text style={styles.slimSessionName}>
+                          {todaySession.name}
+                        </Text>
+                        <Text style={styles.slimSessionTime}>
+                          {todaySession.exerciseCountLabel}
+                        </Text>
+                        <Text style={styles.slimSessionArrow}>→</Text>
+                      </Pressable>
+                    ) : (
+                      <View style={styles.restLine}>
+                        <View style={styles.restLineDot} />
+                        <Text style={styles.restLineText}>
+                          Rest day — focus on recovery
+                        </Text>
+                      </View>
+                    )}
+
                     <Pressable
-                      style={styles.slimSession}
+                      style={styles.planPill}
                       onPress={() =>
-                        navigation.navigate("PreWorkoutPreview", {
-                          planSessionId: todaySession.planSessionId!,
+                        navigation.navigate("Calendar", {
+                          initialScope: "today",
                         })
                       }
                     >
-                      <View style={styles.slimSessionDot} />
-                      <Text style={styles.slimSessionName}>{todaySession.name}</Text>
-                      <Text style={styles.slimSessionTime}>
-                        {todaySession.exerciseCountLabel}
-                      </Text>
-                      <Text style={styles.slimSessionArrow}>→</Text>
+                      <CalendarIcon size={12} color={colors.accent} />
+                      <Text style={styles.planPillText}>Today's Plan</Text>
                     </Pressable>
-                  ) : (
-                    <View style={styles.restLine}>
-                      <View style={styles.restLineDot} />
-                      <Text style={styles.restLineText}>
-                        Rest day — focus on recovery
-                      </Text>
-                    </View>
-                  )}
+                  </View>
+                )}
+              </View>
 
-                  <Pressable
-                    style={styles.planPill}
-                    onPress={() => navigation.navigate("Calendar", { initialScope: "today" })}
-                  >
-                    <CalendarIcon size={12} color={colors.accent} />
-                    <Text style={styles.planPillText}>Today's Plan</Text>
-                  </Pressable>
-                </View>
-              )}
+              <View style={styles.orbWrap}>
+                <Pressable
+                  style={styles.orbBtn}
+                  onPress={handleTalk}
+                  hitSlop={16}
+                >
+                  <VoiceOrb state={orbState} size={120} />
+                  <View style={styles.orbMark} pointerEvents="none">
+                    <MMark size={26} color="rgba(255,255,255,0.92)" />
+                  </View>
+                </Pressable>
+                <Text style={styles.orbHint}>
+                  {isActive ? "tap to stop" : "tap to talk"}
+                </Text>
+              </View>
             </View>
-
-            <View style={styles.orbWrap}>
-              <Pressable style={styles.orbBtn} onPress={handleTalk} hitSlop={16}>
-                <VoiceOrb state={orbState} size={104} />
-              </Pressable>
-              <Text style={styles.orbHint}>
-                {isActive ? "tap to stop" : "tap to talk"}
-              </Text>
-            </View>
-          </View>
           </TouchableWithoutFeedback>
         )}
+
+        {chatOpen && !isActive && <QuickPromptChips onPick={handleQuickPrompt} />}
 
         <ChatComposer
           value={draftText}
@@ -288,7 +378,10 @@ export function HomeScreen() {
             </Text>
           ) : (
             macros.map((m) => {
-              const pct = m.goal > 0 ? Math.min(Math.round((m.current / m.goal) * 100), 100) : 0;
+              const pct =
+                m.goal > 0
+                  ? Math.min(Math.round((m.current / m.goal) * 100), 100)
+                  : 0;
               const remaining = m.goal - m.current;
               return (
                 <View key={m.key} style={styles.macroRow}>
@@ -298,7 +391,9 @@ export function HomeScreen() {
                     />
                     <Text style={styles.macroRowLabel}>{m.label}</Text>
                     <View style={styles.macroRowValues}>
-                      <Text style={[styles.macroRowCurrent, { color: m.color }]}>
+                      <Text
+                        style={[styles.macroRowCurrent, { color: m.color }]}
+                      >
                         {m.current}
                       </Text>
                       <Text style={styles.macroRowSep}>/</Text>
@@ -331,7 +426,9 @@ export function HomeScreen() {
         visible={drawerOpen}
         onClose={() => setDrawerOpen(false)}
         onOpenSettings={() => navigation.navigate("Settings")}
-        onOpenCalendar={() => navigation.navigate("Calendar", { initialScope: "month" })}
+        onOpenCalendar={() =>
+          navigation.navigate("Calendar", { initialScope: "month" })
+        }
         userId={userId}
       />
     </SafeAreaView>
@@ -574,6 +671,11 @@ const styles = StyleSheet.create({
     marginBottom: "auto",
   },
   orbBtn: { alignItems: "center", justifyContent: "center" },
+  orbMark: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   orbHint: {
     fontFamily: fonts.bodyMedium,
     fontSize: 10,

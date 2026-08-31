@@ -39,7 +39,8 @@ export const ScreenSummary = ({
   onComplete,
 }: ScreenSummaryProps) => {
   const injuryValue = (() => {
-    if (state.injuries.length === 0 && !state.injuryDescription) return "Nothing flagged";
+    if (state.injuries.length === 0 && !state.injuryDescription)
+      return "Nothing flagged";
     const parts: string[] = [];
     if (state.injuries.length > 0) parts.push(state.injuries.join(", "));
     if (state.injuryDescription) parts.push(state.injuryDescription);
@@ -51,8 +52,18 @@ export const ScreenSummary = ({
     ? `${state.weight} ${state.units === "imperial" ? "lbs" : "kg"}`
     : "—";
 
-  const rows: { key: string; label: string; value: string; screenKey: string }[] = [
-    { key: "name", label: "NAME", value: state.userName || "—", screenKey: "name" },
+  const rows: {
+    key: string;
+    label: string;
+    value: string;
+    screenKey: string;
+  }[] = [
+    {
+      key: "name",
+      label: "NAME",
+      value: state.userName || "—",
+      screenKey: "name",
+    },
     {
       key: "gender",
       label: "GENDER",
@@ -79,17 +90,24 @@ export const ScreenSummary = ({
     },
     { key: "height", label: "HEIGHT", value: heightVal, screenKey: "height" },
     { key: "weight", label: "WEIGHT", value: weightVal, screenKey: "weight" },
-    { key: "injuries", label: "AVOID", value: injuryValue, screenKey: "injuries" },
+    {
+      key: "injuries",
+      label: "AVOID",
+      value: injuryValue,
+      screenKey: "injuries",
+    },
   ];
 
   return (
     <SafeAreaView style={styles.screen} edges={["top"]}>
       <View style={styles.topBar}>
-        <Pressable onPress={onBack} hitSlop={12}>
+        <Pressable style={styles.topBarSpacer} onPress={onBack} hitSlop={12}>
           <BackIcon />
         </Pressable>
 
         <ProgressDots total={13} current={13} />
+
+        <View style={styles.topBarSpacer} />
       </View>
 
       <View style={styles.header}>
@@ -104,7 +122,10 @@ export const ScreenSummary = ({
         </Text>
       </View>
 
-      <ScrollView style={styles.rows} contentContainerStyle={styles.rowsContent}>
+      <ScrollView
+        style={styles.rows}
+        contentContainerStyle={styles.rowsContent}
+      >
         {rows.map((row) => (
           <Pressable
             key={row.key}
@@ -122,10 +143,10 @@ export const ScreenSummary = ({
 
       <View style={styles.cta}>
         <Pressable style={styles.btnLime} onPress={onComplete}>
-          <Text style={styles.btnLimeText}>START TRAINING</Text>
+          <Text style={styles.btnLimeText}>CREATE ACCOUNT</Text>
         </Pressable>
         <Text style={styles.ctaNote}>
-          You can update your profile anytime in settings.
+          Account creation is required to start training.
         </Text>
       </View>
     </SafeAreaView>
@@ -144,9 +165,13 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
   },
 
+  topBarSpacer: {
+    width: 32,
+  },
+
   header: {
     paddingHorizontal: 24,
-    paddingTop: 32,
+    paddingTop: 42,
     paddingBottom: 20,
   },
 

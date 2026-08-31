@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { useFocusEffect } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { BottomSheet } from "../components/BottomSheet";
 import { MonthGrid } from "../components/MonthGrid";
@@ -53,6 +54,21 @@ export function CalendarScreen({ route, navigation }: Props) {
   const month = useMonthCalendar(monthDate);
   const detail = useDayDetail(detailDate);
 
+  // None of the four hooks above refetch on their own when this screen regains focus — a tab/
+  // drawer screen like this one stays mounted rather than remounting each visit, so without this
+  // finishing a workout elsewhere and coming back here kept showing whatever was true when this
+  // screen was last actually fetched. Confirmed live: a just-completed session still showed as
+  // "Rest Day" and its day-detail sheet still said "Nothing logged this day."
+  useFocusEffect(
+    useCallback(() => {
+      today.refetch();
+      week.refetch();
+      month.refetch();
+      if (detailDate) detail.refetch();
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [detailDate]),
+  );
+
   return (
     <View style={[styles.screen, { paddingTop: insets.top }]}>
       <View style={styles.header}>
@@ -78,86 +94,115 @@ export function CalendarScreen({ route, navigation }: Props) {
             <ActivityIndicator color={colors.accent} style={{ marginTop: 40 }} />
           ) : (
             <View style={styles.todayWrap}>
-              <View style={[styles.todayHero, today.isRestDay ? styles.todayHeroRest : styles.todayHeroActive]}>
-                <View style={styles.todayHeroTop}>
-                  <Text style={[styles.todayEyebrow, !today.isRestDay && styles.todayEyebrowActive]}>
-                    {new Date().toLocaleDateString("en-US", { weekday: "long" })} · Today
-                  </Text>
-                  <View style={[styles.todayIconBadge, !today.isRestDay && styles.todayIconBadgeActive]}>
-                    {today.isRestDay ? (
-                      <MoonIcon size={18} color={colors.muted} />
-                    ) : (
-                      <DumbbellIcon size={18} color={colors.accent} />
-                    )}
-                  </View>
-                </View>
-                <Text style={[styles.todayTitle, !today.isRestDay && styles.todayTitleActive]}>
-                  {today.isRestDay ? "Rest Day" : titleCase(today.session!.focus)}
-                </Text>
-                <Text style={[styles.todayDate, !today.isRestDay && styles.todayDateActive]}>
-                  {new Date().toLocaleDateString("en-US", { month: "long", day: "numeric" })}
-                </Text>
+              {(() => {
+                const completed = today.completedWorkout;
+                // "Rest day" and "already trained today" are both `!today.session`, but they are
+                // not the same thing — confirmed live, finishing today's only session showed as
+                // a bare Rest Day because this distinction didn't exist. `completed` takes
+                // priority: a pinned-weekday plan still reports its session as due even once
+                // it's done, and a done session should never look identical to "not started."
+                const heroActive = !!completed || !today.isRestDay;
+                const heroLabel = completed
+                  ? completed.focus
+                    ? titleCase(completed.focus)
+                    : "Workout Complete"
+                  : today.isRestDay
+                    ? "Rest Day"
+                    : titleCase(today.session!.focus);
 
-                {!today.isRestDay && (
-                  <View style={[styles.todayStatsRow, styles.todayStatsRowActive]}>
-                    <View style={styles.todayStat}>
-                      <Text style={[styles.todayStatValue, styles.todayStatValueActive]}>
-                        {today.session!.exercises.length}
-                      </Text>
-                      <Text style={[styles.todayStatLabel, styles.todayStatLabelActive]}>Exercises</Text>
-                    </View>
-                    <View style={[styles.todayStatDivider, styles.todayStatDividerActive]} />
-                    <View style={styles.todayStat}>
-                      <Text style={[styles.todayStatValue, styles.todayStatValueActive]}>
-                        {today.session!.exercises.reduce((sum, ex) => sum + (ex.sets ?? 0), 0)}
-                      </Text>
-                      <Text style={[styles.todayStatLabel, styles.todayStatLabelActive]}>Total sets</Text>
-                    </View>
-                    <View style={[styles.todayStatDivider, styles.todayStatDividerActive]} />
-                    <View style={styles.todayStat}>
-                      <Text style={[styles.todayStatValue, styles.todayStatValueActive]}>Strength</Text>
-                      <Text style={[styles.todayStatLabel, styles.todayStatLabelActive]}>Type</Text>
-                    </View>
-                  </View>
-                )}
-              </View>
-
-              {today.isRestDay ? (
-                <Text style={styles.restCopy}>Focus on recovery today — your next session hits harder for it.</Text>
-              ) : (
-                <>
-                  <View style={styles.todaySection}>
-                    <View style={styles.todaySectionHeader}>
-                      <DumbbellIcon size={13} color={colors.muted} />
-                      <Text style={styles.todaySectionLabel}>Workout</Text>
-                    </View>
-                    <View style={styles.exerciseList}>
-                      {today.session!.exercises.map((ex, i) => (
-                        <View key={ex.name + i} style={styles.exerciseRow}>
-                          <Text style={styles.exerciseIndex}>{String(i + 1).padStart(2, "0")}</Text>
-                          <View style={styles.exerciseMain}>
-                            <Text style={styles.exerciseName}>{ex.name}</Text>
-                            <View style={styles.exerciseRestRow}>
-                              <TimerIcon size={10.5} color={colors.muted} />
-                              <Text style={styles.exerciseRest}>{formatRestSeconds(estimateRestSeconds(ex.repScheme))}</Text>
-                            </View>
-                          </View>
-                          <Text style={styles.exerciseSets}>
-                            {ex.sets ?? "—"} × {ex.repScheme ?? "—"}
-                          </Text>
+                return (
+                  <>
+                    <View style={[styles.todayHero, heroActive ? styles.todayHeroActive : styles.todayHeroRest]}>
+                      <View style={styles.todayHeroTop}>
+                        <Text style={[styles.todayEyebrow, heroActive && styles.todayEyebrowActive]}>
+                          {new Date().toLocaleDateString("en-US", { weekday: "long" })} · Today
+                        </Text>
+                        <View style={[styles.todayIconBadge, heroActive && styles.todayIconBadgeActive]}>
+                          {completed ? (
+                            <CheckCircleIcon size={18} color={colors.accent} />
+                          ) : today.isRestDay ? (
+                            <MoonIcon size={18} color={colors.muted} />
+                          ) : (
+                            <DumbbellIcon size={18} color={colors.accent} />
+                          )}
                         </View>
-                      ))}
+                      </View>
+                      <Text style={[styles.todayTitle, heroActive && styles.todayTitleActive]}>{heroLabel}</Text>
+                      <Text style={[styles.todayDate, heroActive && styles.todayDateActive]}>
+                        {new Date().toLocaleDateString("en-US", { month: "long", day: "numeric" })}
+                      </Text>
+
+                      {!today.isRestDay && !completed && (
+                        <View style={[styles.todayStatsRow, styles.todayStatsRowActive]}>
+                          <View style={styles.todayStat}>
+                            <Text style={[styles.todayStatValue, styles.todayStatValueActive]}>
+                              {today.session!.exercises.length}
+                            </Text>
+                            <Text style={[styles.todayStatLabel, styles.todayStatLabelActive]}>Exercises</Text>
+                          </View>
+                          <View style={[styles.todayStatDivider, styles.todayStatDividerActive]} />
+                          <View style={styles.todayStat}>
+                            <Text style={[styles.todayStatValue, styles.todayStatValueActive]}>
+                              {today.session!.exercises.reduce((sum, ex) => sum + (ex.sets ?? 0), 0)}
+                            </Text>
+                            <Text style={[styles.todayStatLabel, styles.todayStatLabelActive]}>Total sets</Text>
+                          </View>
+                          <View style={[styles.todayStatDivider, styles.todayStatDividerActive]} />
+                          <View style={styles.todayStat}>
+                            <Text style={[styles.todayStatValue, styles.todayStatValueActive]}>Strength</Text>
+                            <Text style={[styles.todayStatLabel, styles.todayStatLabelActive]}>Type</Text>
+                          </View>
+                        </View>
+                      )}
                     </View>
-                  </View>
-                  <Pressable
-                    style={styles.startBtn}
-                    onPress={() => navigation.navigate("PreWorkoutPreview", { planSessionId: today.session!.planSessionId })}
-                  >
-                    <PlayIcon size={13} color={colors.accentOn} />
-                    <Text style={styles.startBtnText}>Start Session</Text>
-                  </Pressable>
-                </>
-              )}
+
+                    {completed ? (
+                      <Pressable
+                        style={styles.startBtn}
+                        onPress={() => navigation.navigate("SessionReport", { workoutLogId: completed.workoutLogId })}
+                      >
+                        <ChevronRightIcon size={13} color={colors.accentOn} />
+                        <Text style={styles.startBtnText}>View Session Summary</Text>
+                      </Pressable>
+                    ) : today.isRestDay ? (
+                      <Text style={styles.restCopy}>Focus on recovery today — your next session hits harder for it.</Text>
+                    ) : (
+                      <>
+                        <View style={styles.todaySection}>
+                          <View style={styles.todaySectionHeader}>
+                            <DumbbellIcon size={13} color={colors.muted} />
+                            <Text style={styles.todaySectionLabel}>Workout</Text>
+                          </View>
+                          <View style={styles.exerciseList}>
+                            {today.session!.exercises.map((ex, i) => (
+                              <View key={ex.name + i} style={styles.exerciseRow}>
+                                <Text style={styles.exerciseIndex}>{String(i + 1).padStart(2, "0")}</Text>
+                                <View style={styles.exerciseMain}>
+                                  <Text style={styles.exerciseName}>{ex.name}</Text>
+                                  <View style={styles.exerciseRestRow}>
+                                    <TimerIcon size={10.5} color={colors.muted} />
+                                    <Text style={styles.exerciseRest}>{formatRestSeconds(estimateRestSeconds(ex.repScheme))}</Text>
+                                  </View>
+                                </View>
+                                <Text style={styles.exerciseSets}>
+                                  {ex.sets ?? "—"} × {ex.repScheme ?? "—"}
+                                </Text>
+                              </View>
+                            ))}
+                          </View>
+                        </View>
+                        <Pressable
+                          style={styles.startBtn}
+                          onPress={() => navigation.navigate("PreWorkoutPreview", { planSessionId: today.session!.planSessionId })}
+                        >
+                          <PlayIcon size={13} color={colors.accentOn} />
+                          <Text style={styles.startBtnText}>Start Session</Text>
+                        </Pressable>
+                      </>
+                    )}
+                  </>
+                );
+              })()}
 
               <View style={styles.todaySection}>
                 <View style={styles.todaySectionHeader}>

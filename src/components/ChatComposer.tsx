@@ -43,7 +43,9 @@ interface ChatComposerProps {
   onCloseConversation?: () => void;
 }
 
-const REC_BARS = [8, 16, 11, 20, 9, 17, 13, 22, 10, 15, 8, 18, 12, 21, 9, 16, 11, 19, 8, 14];
+const REC_BARS = [
+  8, 16, 11, 20, 9, 17, 13, 22, 10, 15, 8, 18, 12, 21, 9, 16, 11, 19, 8, 14,
+];
 
 function formatTime(sec: number) {
   const m = Math.floor(sec / 60);
@@ -128,10 +130,18 @@ export const ChatComposer = ({
           >
             <PlusIcon size={18} color="#0A0A0A" />
           </Pressable>
-          <Pressable style={styles.voiceControlBtn} onPress={onExitVoiceToKeyboard} hitSlop={6}>
+          <Pressable
+            style={styles.voiceControlBtn}
+            onPress={onExitVoiceToKeyboard}
+            hitSlop={6}
+          >
             <KeyboardIcon size={18} color="#0A0A0A" />
           </Pressable>
-          <Pressable style={styles.voiceControlBtnStop} onPress={onCloseConversation} hitSlop={6}>
+          <Pressable
+            style={styles.voiceControlBtnStop}
+            onPress={onCloseConversation}
+            hitSlop={6}
+          >
             <XIcon size={18} color="#FFFFFF" />
           </Pressable>
         </View>
@@ -144,7 +154,11 @@ export const ChatComposer = ({
       <View style={[styles.bubble, focused && styles.bubbleFocused]}>
         {recording ? (
           <View style={styles.recordingRow}>
-            <Pressable style={styles.recCancel} onPress={dictation.cancel} hitSlop={8}>
+            <Pressable
+              style={styles.recCancel}
+              onPress={dictation.cancel}
+              hitSlop={8}
+            >
               <XIcon size={14} color={colors.muted} />
             </Pressable>
             <RecDot />
@@ -159,7 +173,7 @@ export const ChatComposer = ({
           <TextInput
             value={value}
             onChangeText={onChangeText}
-            placeholder="Ask your coach anything…"
+            placeholder="Talk to your coach...."
             placeholderTextColor="rgba(255,255,255,0.28)"
             style={styles.field}
             multiline
@@ -177,7 +191,7 @@ export const ChatComposer = ({
             <Text style={styles.recHint}>Listening…</Text>
           ) : (
             <Pressable
-              style={[styles.plusBtn, !onAddTap && styles.dimmed]}
+              style={[styles.plusBtn]}
               onPress={onAddTap}
               disabled={!onAddTap}
               hitSlop={6}

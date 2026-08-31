@@ -38,9 +38,10 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
   const [switchOpen, setSwitchOpen] = useState(false);
 
   const isEmpty = !loading && !error && exercises.length === 0;
+  const canResume = lastTime?.status === "partial" && lastTime.exercises.length > 0;
 
-  const startSession = (target: SessionTarget) => {
-    session.start(target);
+  const startSession = (target: SessionTarget, resume = false) => {
+    session.start(target, resume && lastTime ? lastTime.exercises : undefined);
     navigation.replace("ActiveSession");
   };
 
@@ -102,11 +103,13 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
             </View>
 
             <View style={styles.section}>
-              <Text style={styles.sectionLabel}>LAST TIME</Text>
+              <Text style={styles.sectionLabel}>{canResume ? "PICK UP WHERE YOU LEFT OFF" : "LAST TIME"}</Text>
               <View style={styles.feedbackCard}>
                 {lastTime && lastTime.exercises.length > 0 ? (
                   <>
-                    <Text style={styles.lastWhen}>{relativeDay(lastTime.at)}</Text>
+                    <Text style={styles.lastWhen}>
+                      {canResume ? `Stopped ${relativeDay(lastTime.at).toLowerCase()}` : relativeDay(lastTime.at)}
+                    </Text>
                     {lastTime.exercises.map((done) => (
                       <Text key={done.name} style={styles.feedbackText}>
                         {done.name} — {done.sets} sets · {done.reps} reps
@@ -129,10 +132,15 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
         <View style={[styles.footer, { paddingBottom: Math.max(insets.bottom, 24) }]}>
           <Pressable
             style={styles.startBtn}
-            onPress={() => startSession({ type: "strength", planSessionId })}
+            onPress={() => startSession({ type: "strength", planSessionId }, canResume)}
           >
-            <Text style={styles.startText}>START SESSION</Text>
+            <Text style={styles.startText}>{canResume ? "CONTINUE SESSION" : "START SESSION"}</Text>
           </Pressable>
+          {canResume && (
+            <Pressable onPress={() => startSession({ type: "strength", planSessionId }, false)} hitSlop={8}>
+              <Text style={styles.restartLink}>Restart from the beginning instead</Text>
+            </Pressable>
+          )}
           <Pressable style={styles.switchBtn} onPress={() => setSwitchOpen(true)}>
             <SwitchIcon size={14} color={colors.muted} />
             <Text style={styles.switchText}>Switch Workout</Text>
@@ -307,6 +315,13 @@ const styles = StyleSheet.create({
     fontFamily: fonts.bodySemiBold,
     fontSize: 13,
     color: colors.muted,
+  },
+  restartLink: {
+    textAlign: "center",
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: colors.muted,
+    textDecorationLine: "underline",
   },
   startBtn: {
     height: 52,

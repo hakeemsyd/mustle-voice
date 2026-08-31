@@ -33,6 +33,7 @@ import { useActiveSessionContext } from "../session/ActiveSessionContext";
 import { colors, fonts } from "../constants/theme";
 import { BookOpenIcon, ChevronDownIcon, PauseIcon, PlayIcon } from "../icons";
 import { describeParsedSet, looksLikeSetReport, parseSetReport } from "../lib/parseSetReport";
+import { buildLiveSessionSnapshot, describeLiveSessionSnapshot } from "../session/liveSessionState";
 import type { RootStackParamList } from "../navigation/types";
 
 type Props = NativeStackScreenProps<RootStackParamList, "ActiveSession">;
@@ -56,43 +57,162 @@ export function ActiveSessionScreen({ navigation }: Props) {
   } = session;
 
   const isCardio = target?.type === "cardio";
+  const restRemaining = useRestRemaining(restEndAt, restPausedRemainingSec);
 
-  const commitSet = (weight: number | null, reps: number) => {
+  // viaVoice=true skips the set_logged coach cue below — a voice-reported set already got the
+  // user's own spoken turn, so the agent naturally replies on its own; only a typed/tapped log
+  // needs a cue to prompt a spoken confirmation, since nobody spoke for that one.
+  const commitSet = (weight: number | null, reps: number, viaVoice = false) => {
     session.logSet(weight, reps);
     session.noteSetLogged(describeParsedSet({ weight, reps }));
     setDraft("");
+    if (!viaVoice) triggerCueRef.current?.("set_logged");
   };
 
   // sendContextualUpdate isn't available yet when this closure below is created (it comes back
   // from the useVoiceSession call this closure is passed into) — a ref lets the closure reach
   // whatever the latest one is once it exists, instead of only ever seeing the first render's.
   const sendContextRef = useRef<((text: string) => void) | null>(null);
+  // Same story for the proactive-coaching cue trigger, defined further below.
+  const triggerCueRef = useRef<((cue: string) => void) | null>(null);
 
-  const { orbState, isActive, toggle, sendContextualUpdate, reconnecting, voiceDropped } = useVoiceSession(
+  const {
+    orbState, isActive, status: voiceStatus, toggle, sendContextualUpdate, sendUserMessage,
+    reconnecting, voiceDropped, idleClosed,
+  } = useVoiceSession(
     (message) => {
       if (message.role !== "user" || isCardio || resting) return;
       if (!looksLikeSetReport(message.text)) return;
       const parsed = parseSetReport(message.text);
       if (!parsed) return;
-      commitSet(parsed.weight, parsed.reps);
+      commitSet(parsed.weight, parsed.reps, true);
       const setNumber = currentSetCount + 1;
       const loadLabel = parsed.weight !== null ? `${parsed.weight}kg` : "bodyweight";
-      sendContextRef.current?.(
-        `The app just logged this set directly from what the user said: ${currentExercise?.name ?? "the current exercise"}, ` +
-          `set ${setNumber}${currentExercise ? ` of ${currentExercise.sets}` : ""}, ${loadLabel} × ${parsed.reps} reps. ` +
-          `It's already recorded — don't ask what exercise it was, whether they've done it before, or ask them to confirm ` +
-          `any of these details. Acknowledge in one short sentence and move the conversation forward.`,
-      );
+      try {
+        sendContextRef.current?.(
+          `The app just logged this set directly from what the user said: ${currentExercise?.name ?? "the current exercise"}, ` +
+            `set ${setNumber}${currentExercise ? ` of ${currentExercise.sets}` : ""}, ${loadLabel} × ${parsed.reps} reps. ` +
+            `It's already recorded — don't ask what exercise it was, whether they've done it before, or ask them to confirm ` +
+            `any of these details. Acknowledge in one short sentence and move the conversation forward.`,
+        );
+      } catch (err) {
+        console.error("[active session] failed to send set-logged context to voice:", err);
+      }
     },
     {
       userId: session.userId,
-      dynamicVariables: { user_name: session.userName ?? "there", user_id: session.userId ?? "" },
+      dynamicVariables: {
+        user_name: session.userName ?? "there",
+        user_id: session.userId ?? "",
+        user_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      },
     },
   );
 
   useEffect(() => {
     sendContextRef.current = sendContextualUpdate;
   }, [sendContextualUpdate]);
+
+  // sendUserMessage (unlike sendContextualUpdate) makes the agent actually produce a spoken
+  // reply — the only client call that does — so it's what drives proactive coaching moments
+  // where nobody has spoken (greeting the workout, announcing rest, prompting the next set).
+  // The [[SYSTEM_CUE]] marker tells brain-voice this wasn't really said by the user (see
+  // brain-config.ts) and logs it hidden from the visible transcript.
+  useEffect(() => {
+    triggerCueRef.current = (cue: string) => {
+      if (voiceStatus !== "connected") return;
+      try {
+        sendUserMessage(`[[SYSTEM_CUE]] ${cue}`);
+      } catch (err) {
+        console.error("[active session] failed to send coach cue:", err);
+      }
+    };
+  }, [voiceStatus, sendUserMessage]);
+
+  const toggleRef = useRef(toggle);
+  toggleRef.current = toggle;
+
+  // Pushes the live session state (exercise, set, rest status) into the running voice
+  // conversation on every structural change — this is the coach's only source of ground truth
+  // for what the screen actually shows. Deliberately excludes restEndAt/elapsedSec from the
+  // dependency list — those tick every second and would spam a contextual update per second;
+  // resting/restTargetSec/restPausedRemainingSec already capture every transition worth telling
+  // the coach about.
+  //
+  // Must gate on status === "connected", not isActive — isActive is also true while still
+  // "connecting", before the underlying conversation object exists. Calling
+  // sendContextualUpdate that early throws ("No active conversation. Call startSession()
+  // first.") and crashes the screen — confirmed live.
+  useEffect(() => {
+    if (voiceStatus !== "connected") return;
+    const snapshot = buildLiveSessionSnapshot({
+      target,
+      focus,
+      exercises,
+      currentExerciseIndex,
+      loggedSets,
+      resting,
+      restTargetSec,
+      restEndAt: session.restEndAt,
+      restPausedRemainingSec,
+      ended,
+      paused,
+      elapsedSec,
+    });
+    if (!snapshot) return;
+    try {
+      sendContextRef.current?.(describeLiveSessionSnapshot(snapshot));
+    } catch (err) {
+      console.error("[active session] failed to send live state to voice:", err);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [voiceStatus, target, focus, exercises, currentExerciseIndex, loggedSets, resting, restTargetSec, restPausedRemainingSec, paused, ended]);
+
+  // Greets once per session, as soon as both a real session and a connected voice call exist —
+  // whichever arrives second triggers it. Keyed on the target object itself (a fresh one each
+  // session.start()) rather than a boolean, so a brand-new session always re-greets.
+  const greetedSessionRef = useRef<typeof target>(null);
+  useEffect(() => {
+    if (!target || ended || voiceStatus !== "connected") return;
+    if (!isCardio && !currentExercise) return;
+    if (greetedSessionRef.current === target) return;
+    greetedSessionRef.current = target;
+    triggerCueRef.current?.("session_start");
+  }, [target, ended, voiceStatus, isCardio, currentExercise]);
+
+  // Rest-period proactive cues: a heads-up a few seconds before it ends, a prompt once it
+  // actually hits zero, and — only if they still haven't moved on a while after that — a single
+  // non-repetitive check-in. Guarded per rest period (restKey) so each only ever fires once per
+  // rest, and `restingRef` gives the delayed check-in a live read of whether rest is still going
+  // by the time its timer fires, not the stale value from when it was scheduled.
+  const restCueStateRef = useRef({ key: -1, countdown: false, over: false, silence: false });
+  const restingRef = useRef(resting);
+  restingRef.current = resting;
+  useEffect(() => {
+    if (restCueStateRef.current.key !== restKey) {
+      restCueStateRef.current = { key: restKey, countdown: false, over: false, silence: false };
+    }
+  }, [restKey]);
+
+  useEffect(() => {
+    if (!resting || voiceStatus !== "connected") return;
+    const state = restCueStateRef.current;
+    if (state.key !== restKey) return;
+    if (restRemaining <= 0 && !state.over) {
+      state.over = true;
+      triggerCueRef.current?.("rest_over");
+      setTimeout(() => {
+        const s = restCueStateRef.current;
+        if (s.key === restKey && !s.silence && restingRef.current) {
+          s.silence = true;
+          triggerCueRef.current?.("silence_after_rest");
+        }
+      }, 20_000);
+    } else if (restRemaining > 0 && restRemaining <= 10 && !state.countdown) {
+      state.countdown = true;
+      triggerCueRef.current?.("rest_final_countdown");
+    }
+  }, [restRemaining, resting, restKey, voiceStatus]);
 
   // Opening the screen is what "restored" means — the MiniSessionBar hides again.
   useEffect(() => {
@@ -110,9 +230,37 @@ export function ActiveSessionScreen({ navigation }: Props) {
     if (voiceDropped) session.announce("Voice disconnected. Tap to talk and repeat your last set.");
   }, [voiceDropped]);
 
+  useEffect(() => {
+    if (idleClosed) session.announce("Ended the call — you'd gone quiet for a while. Tap to talk again.");
+  }, [idleClosed]);
+
+  // Minimizing intentionally keeps voice running (handleMinimize) — but any other way this
+  // screen goes away (ending the workout, a forced navigation, a crash-recovery unmount) must
+  // not leave the mic silently listening. `session.minimized` is set true by handleMinimize and
+  // reset to false by clear() (which every true-exit path calls first), so it's the one signal
+  // that reliably tells them apart at unmount time.
+  const minimizedRef = useRef(session.minimized);
+  minimizedRef.current = session.minimized;
+  const isActiveRef = useRef(isActive);
+  isActiveRef.current = isActive;
+  useEffect(() => {
+    return () => {
+      if (!minimizedRef.current && isActiveRef.current) toggle();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Ending a workout must end its voice conversation too, not just leave it running through the
+  // post-workout feedback view — confirmed live: voice stayed connected there with nothing left
+  // to talk about. Minimizing an in-progress session still deliberately keeps voice alive
+  // (handleMinimize); this only fires once the session has actually ended.
+  useEffect(() => {
+    if (ended && isActiveRef.current) toggleRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ended]);
+
   const currentSetCount = loggedSets[currentExerciseIndex]?.length ?? 0;
   const parsedDraft = parseSetReport(draft);
-  const restRemaining = useRestRemaining(restEndAt, restPausedRemainingSec);
 
   const coachState: CoachCardState = coachThinking
     ? "thinking"

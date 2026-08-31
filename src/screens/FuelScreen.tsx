@@ -1,15 +1,29 @@
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import React from "react";
+import { ActivityIndicator, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { useFocusEffect } from "@react-navigation/native";
 import { useFuelData } from "../hooks/useFuelData";
 import { colors, fonts } from "../constants/theme";
-import { AppleIcon, XIcon } from "../icons";
+import { AppleIcon } from "../icons";
 
 function formatTime(iso: string): string {
   return new Date(iso).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
 }
 
+// Fuel is read-only in the UI on purpose: every meal entry is coach-managed (log/correct/remove
+// all go through the brain's log_food/update_food/delete_food, which confirm with the user and
+// prevent duplicates) — a direct manual delete here bypassed that entirely and was exactly how a
+// deletion could desync from what the coach believed was still logged.
 export function FuelScreen() {
-  const { loading, macros, entries, deleteEntry } = useFuelData();
+  const { loading, macros, entries, refetch } = useFuelData();
+
+  // This tab stays mounted across navigation, so without this a meal logged via the coach on
+  // another screen (Home chat or mid-workout) wouldn't show up here until the app relaunched.
+  useFocusEffect(
+    React.useCallback(() => {
+      refetch();
+    }, [refetch]),
+  );
 
   return (
     <SafeAreaView style={styles.screen} edges={["top"]}>
@@ -72,9 +86,6 @@ export function FuelScreen() {
                       {formatTime(entry.at)} · {entry.calories} kcal · {entry.proteinG}p / {entry.carbsG}c / {entry.fatG}f
                     </Text>
                   </View>
-                  <Pressable style={styles.logDeleteBtn} onPress={() => deleteEntry(entry.id)} hitSlop={8}>
-                    <XIcon size={13} color={colors.muted} />
-                  </Pressable>
                 </View>
               ))}
             </View>
@@ -139,12 +150,4 @@ const styles = StyleSheet.create({
   logRowMain: { flex: 1, gap: 3 },
   logDescription: { fontFamily: fonts.bodyMedium, fontSize: 13, color: colors.text },
   logMeta: { fontFamily: fonts.body, fontSize: 11, color: colors.muted },
-  logDeleteBtn: {
-    width: 26,
-    height: 26,
-    borderRadius: 13,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: colors.surfaceDeep,
-  },
 });

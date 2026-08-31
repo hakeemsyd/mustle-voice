@@ -51,6 +51,7 @@ export async function syncOnboarding(userId: string, state: OnboardingState) {
   const conversation: string[] = [];
   if (state.trainingHistory) conversation.push(`Training history: ${state.trainingHistory}`);
   if (state.primaryGoal) conversation.push(`Primary goal: ${state.primaryGoal}`);
+  if (state.weeklyFrequency !== null) conversation.push(`Weekly training frequency: ${state.weeklyFrequency} days/week`);
   if (state.injuryDescription) conversation.push(`Injury notes: ${state.injuryDescription}`);
 
   if (conversation.length > 0) {

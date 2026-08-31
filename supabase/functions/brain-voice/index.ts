@@ -1,7 +1,12 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
 import { runBrainTurn } from '../_shared/brain-orchestrator.ts';
 import { replayHistory } from '../_shared/replay-history.ts';
-import { buildSystemPrompt, createCallModel, MODEL as BRAIN_MODEL } from '../_shared/brain-config.ts';
+import {
+  buildSystemPrompt,
+  createCallModel,
+  MODEL as BRAIN_MODEL,
+  MESSAGE_HISTORY_LIMIT,
+} from '../_shared/brain-config.ts';
 import { buildContextBlock } from '../_shared/brain-context.ts';
 import { createHandlers } from '../_shared/brain-handlers.ts';
 import { VOICE_TOOLS } from '../_shared/brain-tools.ts';
@@ -13,6 +18,12 @@ const SUPABASE_SECRET_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
 const SHARED_SECRET = Deno.env.get('BRAIN_VOICE_SHARED_SECRET')!;
 
 const USER_ID_MARKER = /MUSTLE_CONTEXT:(\{[^}]*\})/;
+// A synthetic "user" turn the app injects via sendUserMessage to prompt the coach to speak
+// proactively (workout greeting, rest countdown, etc.) at moments nobody actually said anything —
+// sendUserMessage is the only client call that makes the agent produce a real spoken reply
+// (sendContextualUpdate never triggers one). It isn't something the user said, so it's logged
+// hidden — still real context for the model, just excluded from the human-visible transcript.
+const SYSTEM_CUE_PREFIX = '[[SYSTEM_CUE]]';
 const NO_IDENTITY_REPLY =
   "I couldn't identify your account for this conversation — please reopen the app and try again.";
 const VOICE_ERROR_REPLY = "I'm having trouble reaching your plan right now — let's try again in a moment.";
@@ -21,22 +32,30 @@ function sanitizeForSpeech(text: string): string {
   return text.replace(/\s*[—–]\s*/g, ', ');
 }
 
-function extractUserId(messages: any[]): string | null {
+// Both userId and timezone travel in via the same MUSTLE_CONTEXT marker, embedded in the
+// ElevenLabs agent's system prompt template (dashboard-configured, not this repo) from
+// dynamicVariables the client passes at session start — see useVoiceSession's config.
+// timezone requires the dashboard template to actually include {{user_timezone}} in the marker,
+// same as it already does for {{user_id}}; until that's added there, this falls back to null and
+// buildContextBlock/createHandlers fall back to the stored profile value.
+function extractContext(messages: any[]): { userId: string | null; timezone: string | null } {
   const systemMessage = messages.find((m: any) => m?.role === 'system');
   const content = systemMessage?.content;
   const match = typeof content === 'string' ? content.match(USER_ID_MARKER) : null;
-  if (!match) return null;
+  if (!match) return { userId: null, timezone: null };
   try {
     const parsed = JSON.parse(match[1]);
-    return typeof parsed.userId === 'string' && parsed.userId.length > 0 ? parsed.userId : null;
+    const userId = typeof parsed.userId === 'string' && parsed.userId.length > 0 ? parsed.userId : null;
+    const timezone = typeof parsed.timezone === 'string' && parsed.timezone.length > 0 ? parsed.timezone : null;
+    return { userId, timezone };
   } catch {
-    return null;
+    return { userId: null, timezone: null };
   }
 }
 
-async function prepareTurn(userId: string, userText: string) {
+async function prepareTurn(userId: string, userText: string, timezone: string | null) {
   const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
-  const handlers = createHandlers(supabase, userId);
+  const handlers = createHandlers(supabase, userId, timezone);
 
   const askedAt = new Date();
   const [{ data: history, error: historyError }, contextBlock] = await Promise.all([
@@ -46,8 +65,8 @@ async function prepareTurn(userId: string, userText: string) {
       .eq('user_id', userId)
       .order('at', { ascending: false })
       .order('role', { ascending: true })
-      .limit(20),
-    buildContextBlock(supabase, userId),
+      .limit(MESSAGE_HISTORY_LIMIT),
+    buildContextBlock(supabase, userId, timezone),
   ]);
   if (historyError) throw new Error(`message fetch: ${historyError.message}`);
 
@@ -67,8 +86,16 @@ async function logConversation(
   turnBlocks: any[],
 ) {
   const repliedAt = new Date(Math.max(Date.now(), askedAt.getTime() + 1));
+  const isSystemCue = userText.startsWith(SYSTEM_CUE_PREFIX);
   const { error } = await supabase.from('message').insert([
-    { user_id: userId, role: 'user', content: userText, modality: 'voice', hidden: false, at: askedAt.toISOString() },
+    {
+      user_id: userId,
+      role: 'user',
+      content: userText,
+      modality: 'voice',
+      hidden: isSystemCue,
+      at: askedAt.toISOString(),
+    },
     {
       user_id: userId,
       role: 'assistant',
@@ -93,11 +120,15 @@ function sseChunk(id: string, model: string, delta: { role?: string; content?: s
   return `data: ${JSON.stringify(payload)}\n\n`;
 }
 
-async function resolveReplyBuffered(userId: string | null, userText: string): Promise<string> {
+async function resolveReplyBuffered(
+  userId: string | null,
+  userText: string,
+  timezone: string | null,
+): Promise<string> {
   if (!userId || userText.trim() === '') return NO_IDENTITY_REPLY;
 
   try {
-    const { supabase, handlers, turnMessages, systemPrompt, askedAt } = await prepareTurn(userId, userText);
+    const { supabase, handlers, turnMessages, systemPrompt, askedAt } = await prepareTurn(userId, userText, timezone);
     const result = await runBrainTurn({ systemPrompt, messages: turnMessages, handlers, callModel });
     const turnBlocks = result.messages.slice(turnMessages.length);
     await logConversation(supabase, userId, userText, askedAt, result.reply, turnBlocks);
@@ -121,13 +152,13 @@ Deno.serve(async (req) => {
   }
 
   const { messages: incoming = [], stream = false, model = BRAIN_MODEL } = body;
-  const userId = extractUserId(incoming);
+  const { userId, timezone } = extractContext(incoming);
   const latestUser = [...incoming].reverse().find((m: any) => m?.role === 'user');
   const userText = typeof latestUser?.content === 'string' ? latestUser.content : '';
   const completionId = `mustle-${crypto.randomUUID()}`;
 
   if (!stream) {
-    const reply = sanitizeForSpeech(await resolveReplyBuffered(userId, userText));
+    const reply = sanitizeForSpeech(await resolveReplyBuffered(userId, userText, timezone));
     return new Response(
       JSON.stringify({
         id: completionId,
@@ -154,7 +185,11 @@ Deno.serve(async (req) => {
         send(sanitizeForSpeech(NO_IDENTITY_REPLY));
       } else {
         try {
-          const { supabase, handlers, turnMessages, systemPrompt, askedAt } = await prepareTurn(userId, userText);
+          const { supabase, handlers, turnMessages, systemPrompt, askedAt } = await prepareTurn(
+            userId,
+            userText,
+            timezone,
+          );
           const result = await runBrainTurn({
             systemPrompt,
             messages: turnMessages,

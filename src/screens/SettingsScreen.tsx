@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   Keyboard,
   KeyboardAvoidingView,
   Platform,
@@ -14,6 +15,8 @@ import {
 import { useNavigation } from "@react-navigation/native";
 import { supabase } from "../lib/supabase";
 import { setCachedDisplayName } from "../lib/profileStore";
+import { resetTestAccount } from "../lib/accountReset";
+import { notifyAccountReset } from "../lib/appResetBridge";
 import { useScreenInsets } from "../hooks/useScreenInsets";
 import { colors, fonts } from "../constants/theme";
 import { ArrowLeftIcon, CheckIcon } from "../icons";
@@ -50,6 +53,9 @@ export function SettingsScreen() {
   const [savingName, setSavingName] = useState(false);
   const [savingWeight, setSavingWeight] = useState(false);
   const [savedField, setSavedField] = useState<"name" | "weight" | null>(null);
+  const [resetting, setResetting] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
+  const [deletingAccount, setDeletingAccount] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -139,6 +145,80 @@ export function SettingsScreen() {
     setData({ ...data, weightKg: parsed });
     setSavedField("weight");
     setTimeout(() => setSavedField(null), 1500);
+  };
+
+  const confirmResetTestAccount = () => {
+    if (!data) return;
+    Alert.alert(
+      "Reset test account?",
+      "This deletes your plan, nutrition targets, logs, and coach history, then restarts onboarding. This can't be undone.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Reset",
+          style: "destructive",
+          onPress: async () => {
+            setResetting(true);
+            try {
+              await resetTestAccount(data.userId);
+              notifyAccountReset();
+            } catch (err) {
+              console.error("[settings] failed to reset test account:", err);
+              Alert.alert("Reset failed", "Check the logs and try again.");
+              setResetting(false);
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  const confirmLogOut = () => {
+    Alert.alert("Log out?", "You can log back in any time with your email and password.", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Log Out",
+        style: "destructive",
+        onPress: async () => {
+          setLoggingOut(true);
+          const { error } = await supabase.auth.signOut();
+          if (error) {
+            console.error("[settings] failed to log out:", error.message);
+            Alert.alert("Log out failed", "Check your connection and try again.");
+            setLoggingOut(false);
+          }
+          // On success, App.tsx's auth listener takes over — this screen unmounts shortly after.
+        },
+      },
+    ]);
+  };
+
+  const confirmDeleteAccount = () => {
+    Alert.alert(
+      "Delete your account?",
+      "This permanently deletes your account and everything in it — plan, history, nutrition, coach conversations. This can't be undone.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete Account",
+          style: "destructive",
+          onPress: async () => {
+            setDeletingAccount(true);
+            try {
+              const { error } = await supabase.functions.invoke("delete-account", { body: {} });
+              if (error) throw error;
+              // The account (and its session) no longer exists — App.tsx's auth listener will
+              // notice the next time it checks and start a fresh anonymous session.
+              await supabase.auth.signOut().catch(() => {});
+            } catch (err) {
+              console.error("[settings] failed to delete account:", err);
+              Alert.alert("Delete failed", "Check your connection and try again.");
+              setDeletingAccount(false);
+            }
+          },
+        },
+      ],
+    );
   };
 
   const initial = (data?.displayName || "?").trim().charAt(0).toUpperCase();
@@ -271,6 +351,31 @@ export function SettingsScreen() {
               Tell your coach about a new injury or if one's healed — your plan gets safety-checked
               automatically.
             </Text>
+
+            <Text style={styles.sectionLabel}>ACCOUNT</Text>
+            <Pressable style={styles.row} onPress={confirmLogOut} disabled={loggingOut} hitSlop={8}>
+              <Text style={styles.rowLabel}>Log Out</Text>
+              {loggingOut ? <ActivityIndicator size="small" color={colors.muted} /> : null}
+            </Pressable>
+            <Pressable style={styles.row} onPress={confirmDeleteAccount} disabled={deletingAccount} hitSlop={8}>
+              <Text style={[styles.rowLabel, styles.destructiveLabel]}>Delete Account</Text>
+              {deletingAccount ? <ActivityIndicator size="small" color={colors.muted} /> : null}
+            </Pressable>
+
+            {__DEV__ ? (
+              <>
+                <Text style={styles.sectionLabel}>DEVELOPER</Text>
+                <Pressable
+                  style={styles.row}
+                  onPress={confirmResetTestAccount}
+                  disabled={resetting}
+                  hitSlop={8}
+                >
+                  <Text style={[styles.rowLabel, styles.destructiveLabel]}>Reset Test Account</Text>
+                  {resetting ? <ActivityIndicator size="small" color={colors.muted} /> : null}
+                </Pressable>
+              </>
+            ) : null}
           </ScrollView>
         </KeyboardAvoidingView>
       )}
@@ -360,6 +465,9 @@ const styles = StyleSheet.create({
     fontFamily: fonts.body,
     fontSize: 12,
     color: colors.muted,
+  },
+  destructiveLabel: {
+    color: colors.danger,
   },
   rowEdit: {
     flexDirection: "row",

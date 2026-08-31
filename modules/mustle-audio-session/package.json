@@ -1,0 +1,10 @@
+{
+  "name": "mustle-audio-session",
+  "version": "1.0.0",
+  "description": "Local Expo module: emits an event when iOS interrupts the audio session (an incoming or active phone call, Siri, an alarm) so a running voice conversation can be ended immediately instead of continuing silently in the background.",
+  "main": "index.ts",
+  "types": "index.ts",
+  "license": "UNLICENSED",
+  "author": "Mustle",
+  "homepage": "https://mustle.app"
+}

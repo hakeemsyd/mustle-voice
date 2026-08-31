@@ -14,6 +14,7 @@ import Animated, {
 import Svg, { Circle, Defs, Path, RadialGradient, Rect, Stop } from "react-native-svg";
 
 import { colors, fonts } from "../../constants/theme";
+import { MMark } from "../../icons/MMark";
 
 const AnimatedCircle = Animated.createAnimatedComponent(Circle);
 const ORB_SIZE = 88;
@@ -27,17 +28,23 @@ interface ScreenLoadingProps {
   readyPromise?: Promise<void> | null;
 }
 
+// Sub-labels are real authored copy from the design (mustle-mvp's ScreenLoading.tsx), not
+// decorative — missing from this port entirely before.
 const STEPS = [
-  { label: "BUILDING YOUR PLAN", icon: "barbell" },
-  { label: "PREPARING EXPERIENCE", icon: "sparkle" },
-  { label: "SETTING UP COACH", icon: "avatar" },
+  { label: "CREATING YOUR STARTING POINT", sub: "Generating personalized workouts", icon: "barbell" },
+  { label: "PREPARING EXPERIENCE", sub: "Calibrating to your profile", icon: "sparkle" },
+  { label: "SETTING UP COACH", sub: "Mustle is ready", icon: "avatar" },
 ] as const;
 
 const STEP_DELAYS = [200, 1300, 2400];
 // Long enough that the animation always gets to play even when the plan lands instantly.
 const MIN_DISPLAY_MS = 3000;
 // Plan generation measured ~15s in practice — this is a backstop, not the expected path, so
-// onboarding can never hang forever on a stuck or slow call.
+// onboarding can never hang forever on a stuck or slow call. Deliberately still shorter than
+// the brain call's own 45s timeout (client already pushed back on a 30s wait) — the plan
+// generation promise keeps running in the background regardless of which side of this race
+// wins (see OnboardingFlow.tsx's planReadyRef), so a slow call handing off early doesn't lose
+// the result, it just means Home may briefly show the pending state until it lands.
 const SAFETY_TIMEOUT_MS = 30000;
 
 const BarbellIcon = () => (
@@ -89,10 +96,12 @@ const BgRing = ({ delay }: { delay: number }) => {
 
 const Step = ({
   label,
+  sub,
   icon,
   visible,
 }: {
   label: string;
+  sub: string;
   icon: string;
   visible: boolean;
 }) => {
@@ -118,7 +127,10 @@ const Step = ({
   return (
     <Animated.View entering={FadeInUp.duration(400)} style={styles.step}>
       <View style={styles.iconWrap}>{ICON_MAP[icon]}</View>
-      <Text style={styles.stepLabel}>{label}</Text>
+      <View style={styles.stepText}>
+        <Text style={styles.stepLabel}>{label}</Text>
+        <Text style={styles.stepSub}>{sub}</Text>
+      </View>
       <Animated.View style={[styles.statusDot, dotStyle]} />
     </Animated.View>
   );
@@ -216,11 +228,14 @@ export const ScreenLoading = ({ onComplete, readyPromise }: ScreenLoadingProps) 
             animatedProps={sphereProps}
           />
         </Svg>
+        <View style={styles.orbMark} pointerEvents="none">
+          <MMark size={30} color="#141414" />
+        </View>
       </View>
 
       <View style={styles.steps}>
         {STEPS.map((step, i) => (
-          <Step key={step.label} label={step.label} icon={step.icon} visible={visible[i]} />
+          <Step key={step.label} label={step.label} sub={step.sub} icon={step.icon} visible={visible[i]} />
         ))}
       </View>
     </View>
@@ -257,6 +272,16 @@ const styles = StyleSheet.create({
     left: -(ORB_CANVAS - ORB_SIZE) / 2,
   },
 
+  orbMark: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    width: ORB_SIZE,
+    height: ORB_SIZE,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
   steps: {
     gap: 20,
     width: "100%",
@@ -280,12 +305,23 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
 
-  stepLabel: {
+  stepText: {
     flex: 1,
+    gap: 2,
+  },
+
+  stepLabel: {
     fontFamily: fonts.display,
     fontSize: 14,
     letterSpacing: 1,
     color: "rgba(255,255,255,0.85)",
+  },
+
+  stepSub: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    lineHeight: 15.6,
+    color: "rgba(255,255,255,0.4)",
   },
 
   statusDot: {

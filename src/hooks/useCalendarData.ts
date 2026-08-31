@@ -37,6 +37,12 @@ export interface TodayCalendarData {
   session: { planSessionId: string; focus: string; exercises: TodayExercise[] } | null;
   isRestDay: boolean;
   completedToday: boolean;
+  /** The session actually completed today, if any — independent of `session`/`isRestDay`, which
+   *  only describe what's still due. Without this, finishing today's only session made
+   *  resolveTodaySession correctly report nothing further due, but the screen had no way to
+   *  distinguish that from a genuine rest day and showed "Rest Day" right after a real workout —
+   *  confirmed live. */
+  completedWorkout: { workoutLogId: string; focus: string | null } | null;
   mealsLoggedToday: number;
   refetch: () => void;
 }
@@ -51,7 +57,7 @@ async function fetchPlanAndLogs(userId: string) {
       .maybeSingle(),
     supabase
       .from("workout_log")
-      .select("at, plan_session_id, status")
+      .select("id, at, plan_session_id, status")
       .eq("user_id", userId)
       .order("at", { ascending: false })
       .limit(30),
@@ -68,6 +74,7 @@ export function useTodayCalendar(): TodayCalendarData {
     session: null,
     isRestDay: false,
     completedToday: false,
+    completedWorkout: null,
     mealsLoggedToday: 0,
   });
   const [refetchSignal, setRefetchSignal] = useState(0);
@@ -95,24 +102,40 @@ export function useTodayCalendar(): TodayCalendarData {
       if (cancelled) return;
 
       const today = resolveTodaySession(sessions, logs);
-      const completedToday = logs.some(
-        (log) => log.plan_session_id === today?.id && log.status !== "partial" && localDateKey(new Date(log.at)) === localDateKey(new Date()),
-      );
+      const todayKey = localDateKey(new Date());
+      // Found independent of `today`/resolveTodaySession on purpose: for a flexible rotation,
+      // resolveTodaySession deliberately returns null once today's slot is already completed
+      // (correct — nothing further is due), so completion can't be read off `today.id` the way
+      // the old completedToday check assumed; it needs its own direct "what got logged today"
+      // lookup instead. This also fixes a pinned-weekday plan, which resolveTodaySession returns
+      // regardless of completion — without this, a pinned session already done today looked
+      // identical to one not yet started.
+      const completedLog = logs
+        .slice()
+        .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
+        .find((log) => log.status !== "partial" && localDateKey(new Date(log.at)) === todayKey);
+      const completedSession = completedLog?.plan_session_id
+        ? sessions.find((s) => s.id === completedLog.plan_session_id)
+        : undefined;
 
       setState({
         loading: false,
-        session: today
-          ? {
-              planSessionId: today.id,
-              focus: today.focus,
-              exercises: (today.plan_exercise ?? [])
-                .slice()
-                .sort((a, b) => a.ord - b.ord)
-                .map((e) => ({ name: e.exercise?.name ?? "", sets: e.sets, repScheme: e.rep_scheme, loadScheme: e.load_scheme })),
-            }
+        session:
+          today && !completedLog
+            ? {
+                planSessionId: today.id,
+                focus: today.focus,
+                exercises: (today.plan_exercise ?? [])
+                  .slice()
+                  .sort((a, b) => a.ord - b.ord)
+                  .map((e) => ({ name: e.exercise?.name ?? "", sets: e.sets, repScheme: e.rep_scheme, loadScheme: e.load_scheme })),
+              }
+            : null,
+        isRestDay: !today && !completedLog,
+        completedToday: !!completedLog,
+        completedWorkout: completedLog?.id
+          ? { workoutLogId: completedLog.id, focus: completedSession?.focus ?? null }
           : null,
-        isRestDay: !today,
-        completedToday,
         mealsLoggedToday: foodRes.data?.length ?? 0,
       });
     })();
@@ -375,9 +398,10 @@ export interface DayDetail {
   isPast: boolean;
   isToday: boolean;
   isFuture: boolean;
+  refetch: () => void;
 }
 
-const EMPTY_DAY_DETAIL: Omit<DayDetail, "isPast" | "isToday" | "isFuture"> = {
+const EMPTY_DAY_DETAIL: Omit<DayDetail, "isPast" | "isToday" | "isFuture" | "refetch"> = {
   loading: true,
   workouts: [],
   meals: [],
@@ -392,7 +416,11 @@ function titleCaseArea(area: string): string {
 }
 
 export function useDayDetail(dateKey: string | null): DayDetail {
-  const [state, setState] = useState<Omit<DayDetail, "isPast" | "isToday" | "isFuture">>(EMPTY_DAY_DETAIL);
+  const [state, setState] = useState<Omit<DayDetail, "isPast" | "isToday" | "isFuture" | "refetch">>(
+    EMPTY_DAY_DETAIL,
+  );
+  const [refetchSignal, setRefetchSignal] = useState(0);
+  const refetch = useCallback(() => setRefetchSignal((n) => n + 1), []);
 
   useEffect(() => {
     if (!dateKey) return;
@@ -533,7 +561,7 @@ export function useDayDetail(dateKey: string | null): DayDetail {
     return () => {
       cancelled = true;
     };
-  }, [dateKey]);
+  }, [dateKey, refetchSignal]);
 
   const todayKey = localDateKey(new Date());
   return {
@@ -541,6 +569,7 @@ export function useDayDetail(dateKey: string | null): DayDetail {
     isPast: !!dateKey && dateKey < todayKey,
     isToday: dateKey === todayKey,
     isFuture: !!dateKey && dateKey > todayKey,
+    refetch,
   };
 }
 

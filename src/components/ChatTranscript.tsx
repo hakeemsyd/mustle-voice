@@ -1,9 +1,15 @@
 import React, { useEffect, useRef } from "react";
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { ScrollView, StyleSheet, Text, View } from "react-native";
 import { colors, fonts } from "../constants/theme";
 import type { ChatMessage } from "../hooks/useHomeChat";
-import { ThumbsDownIcon, ThumbsUpIcon } from "../icons";
+import { MMark } from "../icons/MMark";
 import { PlanBreakdownCard } from "./PlanBreakdownCard";
+import { DailyWorkoutCard } from "./DailyWorkoutCard";
+import { NutritionSummaryCard } from "./NutritionSummaryCard";
+import { ProgressReportCard } from "./ProgressReportCard";
+import { ReadinessCard } from "./ReadinessCard";
+import { TopLiftsCard } from "./TopLiftsCard";
+import { CoachMessageText } from "./CoachMessageText";
 
 interface ChatTranscriptProps {
   messages: ChatMessage[];
@@ -43,27 +49,34 @@ export const ChatTranscript = ({
             <Text style={styles.bubbleText}>{m.text}</Text>
           </View>
         ) : (
-          <View key={m.id} style={styles.coachMsg}>
-            <Text style={styles.coachMsgText}>{m.text}</Text>
-            {m.card && onStartDay && onModifyPlan && (
-              <PlanBreakdownCard card={m.card} onStartDay={onStartDay} onModify={onModifyPlan} />
-            )}
-            {/* No feedback handler exists yet — disabled rather than merely unwired, so a
-                press gives no ripple/highlight instead of silently doing nothing. */}
-            <View style={styles.coachMsgFeedback}>
-              <Pressable hitSlop={8} disabled>
-                <ThumbsUpIcon size={14} color="rgba(255,255,255,0.22)" />
-              </Pressable>
-              <Pressable hitSlop={8} disabled>
-                <ThumbsDownIcon size={14} color="rgba(255,255,255,0.22)" />
-              </Pressable>
+          <React.Fragment key={m.id}>
+            <View style={styles.coachMsg}>
+              <View style={styles.coachMsgAvatar}>
+                <MMark size={11} color={colors.accent} />
+              </View>
+              <View style={styles.coachMsgBody}>
+                <CoachMessageText text={m.text} style={styles.coachMsgText} />
+                {m.card?.type === "plan_breakdown" && onStartDay && onModifyPlan && (
+                  <PlanBreakdownCard card={m.card} onStartDay={onStartDay} onModify={onModifyPlan} />
+                )}
+              </View>
             </View>
-          </View>
+            {m.card?.type === "daily_workout" && onStartDay && (
+              <DailyWorkoutCard card={m.card} onStartSession={onStartDay} />
+            )}
+            {m.card?.type === "nutrition_summary" && <NutritionSummaryCard card={m.card} />}
+            {m.card?.type === "progress_report" && <ProgressReportCard card={m.card} />}
+            {m.card?.type === "readiness" && <ReadinessCard card={m.card} />}
+            {m.card?.type === "top_lifts" && <TopLiftsCard card={m.card} />}
+          </React.Fragment>
         ),
       )}
 
       {coachTyping && (
         <View style={styles.coachMsg}>
+          <View style={styles.coachMsgAvatar}>
+            <MMark size={11} color={colors.accent} />
+          </View>
           <Text style={styles.coachMsgTyping}>···</Text>
         </View>
       )}
@@ -77,9 +90,9 @@ const styles = StyleSheet.create({
   },
   content: {
     paddingHorizontal: 16,
-    paddingTop: 12,
-    paddingBottom: 12,
-    gap: 10,
+    paddingTop: 8,
+    paddingBottom: 44,
+    gap: 20,
   },
   bubbleUser: {
     maxWidth: "82%",
@@ -98,30 +111,44 @@ const styles = StyleSheet.create({
   },
   bubbleText: {
     fontFamily: fonts.body,
-    fontSize: 13.5,
-    lineHeight: 20,
+    fontSize: 17,
+    lineHeight: 27,
+    letterSpacing: -0.09,
     color: colors.text,
   },
   coachMsg: {
+    flexDirection: "row",
+    alignItems: "flex-start",
     alignSelf: "stretch",
+    gap: 10,
     paddingHorizontal: 2,
     paddingVertical: 2,
   },
+  coachMsgAvatar: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    marginTop: 2,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.surfaceDeep,
+    borderWidth: 1,
+    borderColor: colors.accentBorder,
+  },
+  coachMsgBody: {
+    flex: 1,
+    gap: 4,
+  },
   coachMsgText: {
     fontFamily: fonts.body,
-    fontSize: 15,
-    lineHeight: 24,
+    fontSize: 17,
+    lineHeight: 27,
+    letterSpacing: -0.09,
     color: "rgba(255,255,255,0.92)",
-  },
-  coachMsgFeedback: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 12,
-    marginTop: 10,
   },
   coachMsgTyping: {
     fontFamily: fonts.body,
-    fontSize: 15,
+    fontSize: 17,
     color: "rgba(255,255,255,0.4)",
   },
 });

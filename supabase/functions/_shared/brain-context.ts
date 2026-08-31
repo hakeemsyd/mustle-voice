@@ -102,7 +102,16 @@ function describeSession(session: PlanSessionRow): string {
   return `"${session.focus}" — ${exercises || 'no exercises listed'}`;
 }
 
-export async function buildContextBlock(supabase: any, userId: string): Promise<string> {
+// The client's live device timezone, sent with every request, always wins over what's stored —
+// profile.timezone was only ever written once at onboarding and never refreshed, so after travel
+// or DST it silently drifts from where the user actually is, misclassifying which local day a
+// meal or workout falls on. Confirmed live: a meal logged late at night got pulled into "today"
+// a full day off. Stored value remains only as a fallback for the rare request that omits it.
+export async function buildContextBlock(
+  supabase: any,
+  userId: string,
+  requestTimezone?: string | null,
+): Promise<string> {
   const [{ data: profile }, { data: activePlan }, { data: recentLogs }] = await Promise.all([
     supabase.from('profile').select('timezone').eq('user_id', userId).maybeSingle(),
     supabase
@@ -119,12 +128,18 @@ export async function buildContextBlock(supabase: any, userId: string): Promise<
       .limit(10),
   ]);
 
-  const now = nowInTimezone(profile?.timezone);
+  const timezone = requestTimezone || profile?.timezone || null;
+  if (requestTimezone && requestTimezone !== profile?.timezone) {
+    const { error } = await supabase.from('profile').update({ timezone: requestTimezone }).eq('user_id', userId);
+    if (error) console.error('[brain] failed to refresh profile.timezone:', error.message);
+  }
+
+  const now = nowInTimezone(timezone);
   const weekday = now.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
-  const dateLine = `Right now it is ${weekday}, ${now.toISOString().slice(0, 10)} (${profile?.timezone ?? 'UTC'} time).`;
+  const dateLine = `Right now it is ${weekday}, ${now.toISOString().slice(0, 10)} (${timezone ?? 'UTC'} time).`;
 
   const sessions: PlanSessionRow[] = activePlan?.plan_session ?? [];
-  const logs: WorkoutLogRow[] = logsInTimezone(recentLogs ?? [], profile?.timezone);
+  const logs: WorkoutLogRow[] = logsInTimezone(recentLogs ?? [], timezone);
 
   let planLine: string;
   if (sessions.length === 0) {

@@ -143,6 +143,9 @@ export function StatsScreen() {
 
             <Text style={styles.subLabel}>ENRICHED BY WEARABLE · ACTIVITY</Text>
             <DeviceConnectCard text="Connect a wearable to see VO2 max, steps, active minutes & energy burned." />
+
+            <Text style={styles.subLabel}>ENRICHED BY SMART SCALE · BODY COMPOSITION</Text>
+            <DeviceConnectCard text="Connect a smart scale to see weight trend, body fat % & lean mass." />
           </View>
 
           <View style={styles.section}>
@@ -341,7 +344,8 @@ const styles = StyleSheet.create({
     borderStyle: "dashed",
     borderColor: "rgba(255,255,255,0.12)",
     borderRadius: 12,
-    padding: 14,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
   },
   deviceIconWrap: {
     width: 34,

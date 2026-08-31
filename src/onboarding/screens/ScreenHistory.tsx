@@ -10,6 +10,10 @@ interface ScreenHistoryProps {
   forceTypeMode?: boolean;
 }
 
+// Quick-tap chips matching the design (mustle-mvp's ScreenHistory.tsx) — missing from this port
+// entirely before now.
+const HISTORY_CHIPS = [{ label: "Beginner" }, { label: "Intermediate" }, { label: "Experienced" }];
+
 export const ScreenHistory = ({
   userName,
   onNext,
@@ -26,6 +30,9 @@ export const ScreenHistory = ({
       onBack={onBack}
       onComplete={onNext}
       forceTypeMode={forceTypeMode}
+      unifiedInput
+      chips={HISTORY_CHIPS}
+      orbSize={126}
     />
   );
 };

@@ -13,11 +13,31 @@ interface ScreenHealthKitProps {
 }
 
 const DATA_POINTS = [
-  { icon: "🏋️", label: "Workouts", desc: "Auto-log every session to Apple Health" },
-  { icon: "❤️", label: "Heart Rate", desc: "Track effort and recovery in real time" },
-  { icon: "⚖️", label: "Body Data", desc: "Sync weight, body fat & measurements" },
-  { icon: "😴", label: "Sleep", desc: "Optimise training load around your rest" },
-  { icon: "👣", label: "Activity", desc: "Steps and movement on your rest days" },
+  {
+    icon: "🏋️",
+    label: "Workouts",
+    desc: "Auto-log every session to Apple Health",
+  },
+  {
+    icon: "❤️",
+    label: "Heart Rate",
+    desc: "Track effort and recovery in real time",
+  },
+  {
+    icon: "⚖️",
+    label: "Body Data",
+    desc: "Sync weight, body fat & measurements",
+  },
+  {
+    icon: "😴",
+    label: "Sleep",
+    desc: "Optimise training load around your rest",
+  },
+  {
+    icon: "👣",
+    label: "Activity",
+    desc: "Steps and movement on your rest days",
+  },
 ];
 
 export const ScreenHealthKit = ({ onNext, onBack }: ScreenHealthKitProps) => {
@@ -31,11 +51,13 @@ export const ScreenHealthKit = ({ onNext, onBack }: ScreenHealthKitProps) => {
   return (
     <SafeAreaView style={styles.screen} edges={["top"]}>
       <View style={styles.topBar}>
-        <Pressable onPress={onBack} hitSlop={12}>
+        <Pressable style={styles.topBarSpacer} onPress={onBack} hitSlop={12}>
           <BackIcon />
         </Pressable>
 
         <ProgressDots total={13} current={11} />
+
+        <View style={styles.topBarSpacer} />
       </View>
 
       <View style={styles.content}>
@@ -104,10 +126,14 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
   },
 
+  topBarSpacer: {
+    width: 32,
+  },
+
   content: {
     flex: 1,
     paddingHorizontal: 24,
-    paddingTop: 12,
+    paddingTop: 42,
   },
 
   iconWrap: {
@@ -134,7 +160,7 @@ const styles = StyleSheet.create({
     fontSize: 11,
     letterSpacing: 1.5,
     color: "rgba(255,255,255,0.3)",
-    marginBottom: 8,
+    marginBottom: 14,
   },
 
   title: {

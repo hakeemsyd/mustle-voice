@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { callBrain, COACH_UNREACHABLE_MESSAGE, type PlanBreakdownCard } from '../lib/brain';
+import { callBrain, COACH_UNREACHABLE_MESSAGE, type ChatCard } from '../lib/brain';
 
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   text: string;
-  card?: PlanBreakdownCard | null;
+  card?: ChatCard | null;
 }
 
 export function useHomeChat(userId: string | null) {

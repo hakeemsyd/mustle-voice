@@ -7,15 +7,16 @@ import Animated, {
   useAnimatedProps,
   useAnimatedStyle,
   useSharedValue,
-  withDelay,
   withRepeat,
-  withSequence,
   withTiming,
 } from 'react-native-reanimated';
 import Svg, { Circle, Defs, Ellipse, RadialGradient, Stop } from 'react-native-svg';
 import { fonts } from '../constants/theme';
+import { MMark } from '../icons/MMark';
 
-export type OrbState = 'idle' | 'breathing' | 'speaking' | 'listening' | 'processing';
+// 'typing' — mic is off, user's attention is on the keyboard below: calm chrome like idle, the
+// Mustle mark shown centered instead of any glow/label.
+export type OrbState = 'idle' | 'breathing' | 'speaking' | 'listening' | 'processing' | 'typing';
 
 const TINT: Record<OrbState, string> = {
   idle: '#C8F135',
@@ -23,16 +24,18 @@ const TINT: Record<OrbState, string> = {
   speaking: '#C8F135',
   listening: '#5BB8F5',
   processing: '#A78BFA',
+  typing: '#C8F135',
 };
 
-const AMBIENT_ALPHA: Record<OrbState, number> = { idle: 0, breathing: 0.1, speaking: 0.26, listening: 0.2, processing: 0.18 };
-const RING_ALPHA: Record<OrbState, number> = { idle: 0.1, breathing: 0.25, speaking: 0.7, listening: 0.55, processing: 0.6 };
+const AMBIENT_ALPHA: Record<OrbState, number> = { idle: 0, breathing: 0.1, speaking: 0.26, listening: 0.2, processing: 0.18, typing: 0 };
+const RING_ALPHA: Record<OrbState, number> = { idle: 0.1, breathing: 0.25, speaking: 0.7, listening: 0.55, processing: 0.6, typing: 0.15 };
 const RING_STROKE: Record<OrbState, string> = {
   idle: 'rgba(200,241,53,0.12)',
   breathing: 'rgba(200,241,53,0.3)',
   speaking: 'rgba(200,241,53,0.5)',
   listening: 'rgba(91,184,245,0.4)',
   processing: 'rgba(167,139,250,0.15)',
+  typing: 'rgba(200,241,53,0.18)',
 };
 const CORE_BORDER: Record<OrbState, string> = {
   idle: 'rgba(68,68,64,0.2)',
@@ -40,14 +43,16 @@ const CORE_BORDER: Record<OrbState, string> = {
   speaking: 'rgba(200,241,53,0.55)',
   listening: 'rgba(91,184,245,0.5)',
   processing: 'rgba(167,139,250,0.35)',
+  typing: 'rgba(200,241,53,0.16)',
 };
-const GLOW_ALPHA: Record<OrbState, number> = { idle: 0, breathing: 0, speaking: 0.8, listening: 0.7, processing: 0.5 };
+const GLOW_ALPHA: Record<OrbState, number> = { idle: 0, breathing: 0, speaking: 0.8, listening: 0.7, processing: 0.5, typing: 0 };
 const BASE: Record<OrbState, [string, string, string]> = {
   idle: ['#111100', '#080800', '#030300'],
   breathing: ['#181800', '#0d0d00', '#050500'],
   speaking: ['#1e2000', '#0f0f00', '#050500'],
   listening: ['#001525', '#000d18', '#000508'],
   processing: ['#0e0015', '#080010', '#030008'],
+  typing: ['#111100', '#080800', '#030300'],
 };
 
 const SPEAK_LAYERS = [
@@ -80,11 +85,10 @@ export const Orb = ({ state, size = 172 }: OrbProps) => {
   const ringDriverA = useSharedValue(0);
   const ringDriverB = useSharedValue(0);
   const spin = useSharedValue(0);
-  const dot1 = useSharedValue(0.15);
-  const dot2 = useSharedValue(0.15);
-  const dot3 = useSharedValue(0.15);
   const listeningLabel = useSharedValue(0);
+  const processingLabel = useSharedValue(0);
   const procPulse = useSharedValue(0);
+  const typingMark = useSharedValue(0);
 
   useEffect(() => {
     breathe.value =
@@ -119,20 +123,10 @@ export const Orb = ({ state, size = 172 }: OrbProps) => {
         ? withRepeat(withTiming(1, { duration: 2000, easing: Easing.inOut(Easing.sin) }), -1, true)
         : withTiming(0, { duration: 400 });
 
-    if (state === 'processing') {
-      const blink = (delay: number) =>
-        withDelay(delay, withRepeat(withSequence(withTiming(1, { duration: 500 }), withTiming(0.15, { duration: 800 })), -1, false));
-      dot1.value = blink(0);
-      dot2.value = blink(220);
-      dot3.value = blink(440);
-    } else {
-      dot1.value = 0.15;
-      dot2.value = 0.15;
-      dot3.value = 0.15;
-    }
-
     listeningLabel.value = state === 'listening' ? withTiming(1, { duration: 400 }) : withTiming(0, { duration: 200 });
-  }, [state, breathe, speakPulse, speakPhase, listenPulse, ringDriverA, ringDriverB, spin, procPulse, dot1, dot2, dot3, listeningLabel]);
+    processingLabel.value = state === 'processing' ? withTiming(1, { duration: 400 }) : withTiming(0, { duration: 200 });
+    typingMark.value = state === 'typing' ? withTiming(1, { duration: 400 }) : withTiming(0, { duration: 200 });
+  }, [state, breathe, speakPulse, speakPhase, listenPulse, ringDriverA, ringDriverB, spin, procPulse, listeningLabel, processingLabel, typingMark]);
 
   const ambientProps = useAnimatedProps(() => {
     let scale = 1;
@@ -213,9 +207,8 @@ export const Orb = ({ state, size = 172 }: OrbProps) => {
   const innerGlowProps = useAnimatedProps(() => ({ opacity: GLOW_ALPHA[state] }));
 
   const listeningLabelStyle = useAnimatedStyle(() => ({ opacity: listeningLabel.value }));
-  const dot1Style = useAnimatedStyle(() => ({ opacity: dot1.value }));
-  const dot2Style = useAnimatedStyle(() => ({ opacity: dot2.value }));
-  const dot3Style = useAnimatedStyle(() => ({ opacity: dot3.value }));
+  const processingLabelStyle = useAnimatedStyle(() => ({ opacity: processingLabel.value }));
+  const typingMarkStyle = useAnimatedStyle(() => ({ opacity: typingMark.value }));
 
   const tint = TINT[state];
   const base = BASE[state];
@@ -283,9 +276,11 @@ export const Orb = ({ state, size = 172 }: OrbProps) => {
 
         <Circle cx={center} cy={center} r={coreR} fill="none" stroke={CORE_BORDER[state]} strokeWidth={1} />
 
+        {/* Source's .orbSpec is top:11%/left:16%/width:38%/height:26% of the core box — that's
+            -15% horizontal / -26% vertical from the core's own center, not -15%/-15%. */}
         <Ellipse
           cx={center - size * 0.15}
-          cy={center - size * 0.15}
+          cy={center - size * 0.26}
           rx={size * 0.19}
           ry={size * 0.13}
           fill="url(#spec)"
@@ -297,11 +292,14 @@ export const Orb = ({ state, size = 172 }: OrbProps) => {
           <Animated.Text style={[styles.listeningLabel, listeningLabelStyle]}>LISTENING</Animated.Text>
         )}
         {state === 'processing' && (
-          <View style={styles.dotsRow}>
-            <Animated.View style={[styles.dot, dot1Style]} />
-            <Animated.View style={[styles.dot, dot2Style]} />
-            <Animated.View style={[styles.dot, dot3Style]} />
-          </View>
+          <Animated.Text style={[styles.processingLabel, processingLabelStyle]}>PROCESSING</Animated.Text>
+        )}
+        {state === 'typing' && (
+          <Animated.View style={typingMarkStyle}>
+            {/* Source hardcodes this at 31px regardless of the orb's own size (its default orb
+                is 172px; unifiedInput screens pass 126) — not a proportional scale. */}
+            <MMark size={31} color="rgba(200,241,53,0.55)" />
+          </Animated.View>
         )}
       </View>
     </View>
@@ -332,6 +330,10 @@ const styles = StyleSheet.create({
     letterSpacing: 1.2,
     color: 'rgba(91,184,245,0.75)',
   },
-  dotsRow: { flexDirection: 'row', gap: 6 },
-  dot: { width: 5, height: 5, borderRadius: 2.5, backgroundColor: 'rgba(167,139,250,0.7)' },
+  processingLabel: {
+    fontFamily: fonts.bodyMedium,
+    fontSize: 10,
+    letterSpacing: 1.2,
+    color: 'rgba(167,139,250,0.75)',
+  },
 });

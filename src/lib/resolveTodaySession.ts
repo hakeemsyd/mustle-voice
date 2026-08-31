@@ -5,6 +5,7 @@ export interface PlanSessionRow {
 }
 
 export interface WorkoutLogRow {
+  id?: string;
   at: string;
   plan_session_id: string | null;
   status?: string | null;

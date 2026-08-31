@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../lib/supabase';
 import { callBrain } from '../lib/brain';
 import { resolveTodaySession } from '../lib/resolveTodaySession';
 import { setCachedDisplayName } from '../lib/profileStore';
+import { isPlanPending, clearPlanPending } from '../lib/planStatus';
 import { MACRO_META, type MacroTarget } from '../screens/homeFormat';
 
 export interface TodaySession {
@@ -21,10 +23,17 @@ export interface HomeData {
   coachMessage: string;
   streakDays: number;
   loadError: string | null;
+  /** Onboarding finished but the coach hadn't actually generated a plan yet as of the last
+   *  check (see src/lib/planStatus.ts) — distinct from a user who genuinely has no plan for
+   *  some other reason, so Home can show an actionable "still setting up" state instead of the
+   *  generic empty one. */
+  planPending: boolean;
   refetch: () => void;
 }
 
 const QUERY_TIMEOUT_MS = 12000;
+const MAX_PENDING_RETRIES = 4;
+const PENDING_RETRY_DELAY_MS = 6000;
 
 function timed<T>(label: string, work: PromiseLike<T>): Promise<T> {
   const started = Date.now();
@@ -79,12 +88,38 @@ function computeStreak(logTimestamps: string[]): number {
 const DEFAULT_COACH_MESSAGE_NO_PLAN = "Let's build your plan — tap the orb and tell me your goals.";
 const DEFAULT_COACH_MESSAGE_HAS_PLAN = 'Tap the orb any time to check in.';
 
+// A cold app launch has nothing to show yet, so it briefly renders "Loading your plan…" instead
+// of real content — confirmed as a jarring flash worth fixing. Caching the last successful load
+// lets a relaunch show real (if a few minutes stale) content immediately while the fresh fetch
+// runs quietly underneath; the plain loading state is now only ever seen on a genuine first-ever
+// launch, when there's truly nothing to show.
+type HomeDataCache = Omit<HomeData, 'loading' | 'loadError' | 'refetch'>;
+const HOME_CACHE_KEY = 'home_data_cache_v1';
+
 // Fired at most once per real day (see the freshness check below) — hidden so it never shows up
 // as a fake question in the visible chat transcript (see useHomeChat's query), but its reply
 // becomes today's Home headline instead of whatever the coach last said in some unrelated
 // conversation, possibly days ago.
-const DAILY_GREETING_PROMPT =
-  "Say hello for the first time today — not a reply to a question, and not generic small talk. One short, motivating line that references what's actually on my plan today (today's workout, or progress toward my goal) — give me a real reason to open the app, not a pleasantry.";
+//
+// The due session is spelled out directly in the prompt rather than left for the model to look
+// up via read_state — confirmed live, twice: asked to "reference what's on my plan today," the
+// model either picked the wrong session out of a full plan dump it had access to, or skipped
+// calling read_state entirely and recalled a stale session from earlier in the conversation
+// history. Since this screen already computes the correct due session deterministically for the
+// session chip below the greeting, handing the model that same fact directly removes the failure
+// entirely — there's no tool call, no history, and no other session for it to reach for instead.
+function buildGreetingPrompt(sessionToday: { focus: string | null; exerciseNames: string[] } | null): string {
+  if (!sessionToday) {
+    return "Say hello for the first time today — not a reply to a question, and not generic small talk. Today is a rest day (or there's nothing due) — one short, motivating line about that or progress toward my goal.";
+  }
+  const exercises = sessionToday.exerciseNames.length > 0 ? sessionToday.exerciseNames.join(', ') : 'the exercises in it';
+  return (
+    `Say hello for the first time today — not a reply to a question, and not generic small talk. ` +
+    `Today's due session is "${sessionToday.focus}": ${exercises}. One short, motivating line that names ` +
+    `this exact session and nothing else — do not call read_state, do not mention any other session from ` +
+    `earlier in this conversation, and do not invent a day number or exercises not listed here.`
+  );
+}
 
 const CAPTION_MAX_CHARS = 140;
 
@@ -125,6 +160,7 @@ export function useHomeData(): HomeData {
     coachMessage: DEFAULT_COACH_MESSAGE_NO_PLAN,
     streakDays: 0,
     loadError: null,
+    planPending: false,
   });
   const [refetchSignal, setRefetchSignal] = useState(0);
   const refetch = useCallback(() => setRefetchSignal((n) => n + 1), []);
@@ -132,6 +168,29 @@ export function useHomeData(): HomeData {
   // firing their own generation call — same instance only; a real cross-device race is a
   // fabricated-not-corrupted duplicate greeting at worst, not the P0 class of bug.
   const greetingInFlightRef = useRef(false);
+  const loadedFromNetworkRef = useRef(false);
+  // Onboarding's plan-generation call can still be settling when Home first mounts (its own
+  // safety timeout hands off before the call necessarily finishes) — a few short auto-retries
+  // catch that case without the user needing to do anything, capped so a genuinely stuck plan
+  // doesn't poll forever.
+  const pendingRetryCountRef = useRef(0);
+
+  // Runs once, in parallel with the real fetch below — an AsyncStorage read resolves in a few ms,
+  // long before any network round-trip, so this reliably wins the race and replaces the plain
+  // "Loading your plan…" state with real (if briefly stale) content. Guarded by
+  // loadedFromNetworkRef so a slow cache read can never clobber a fetch that already finished.
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(HOME_CACHE_KEY);
+        if (!raw || loadedFromNetworkRef.current) return;
+        const cached: HomeDataCache = JSON.parse(raw);
+        setState((prev) => (prev.loading ? { ...cached, loading: false, loadError: null } : prev));
+      } catch (err) {
+        console.warn('[home] failed to read cached data:', err);
+      }
+    })();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -163,7 +222,9 @@ export function useHomeData(): HomeData {
           'plan',
           supabase
             .from('training_plan')
-            .select('id, plan_session(id, day_order, weekday, focus, plan_exercise(id))')
+            .select(
+              'id, created_at, plan_session(id, day_order, weekday, focus, plan_exercise(id, ord, exercise:exercise_id(name)))',
+            )
             .eq('user_id', userId)
             .eq('status', 'active')
             .maybeSingle(),
@@ -215,6 +276,7 @@ export function useHomeData(): HomeData {
       const plan = planRes.data;
       const hasPlan = !!plan;
       let todaySession: TodaySession | null = null;
+      let greetingSession: { focus: string | null; exerciseNames: string[] } | null = null;
       if (plan) {
         const sessionToday = resolveTodaySession(
           (plan.plan_session ?? []) as any[],
@@ -228,6 +290,16 @@ export function useHomeData(): HomeData {
               exerciseCountLabel: `${sessionToday.plan_exercise?.length ?? 0} exercises`,
             }
           : { hasSession: false };
+        greetingSession = sessionToday
+          ? {
+              focus: sessionToday.focus ?? null,
+              exerciseNames: (sessionToday.plan_exercise ?? [])
+                .slice()
+                .sort((a: any, b: any) => a.ord - b.ord)
+                .map((e: any) => e.exercise?.name)
+                .filter(Boolean),
+            }
+          : null;
       }
 
       const nutrition = nutritionRes.data;
@@ -245,14 +317,20 @@ export function useHomeData(): HomeData {
       const lastGreeting = messageRes.data as { content: string; at: string } | null;
       // Same-day isn't enough on its own — completing a session mid-day rotates a flexible
       // plan to the next one (or clears today's session on a pinned plan), and a greeting
-      // generated before that still describes the workout that's no longer queued up.
+      // generated before that still describes the workout that's no longer queued up. A plan
+      // edit (new goal, injury-driven change, a fresh split) is the same problem: confirmed
+      // live, a greeting cached from earlier the same day kept describing a workout from a
+      // plan that had since been replaced, while the (correctly live-queried) session chip
+      // right below it had already moved on — two true-looking but contradictory answers.
       const mostRecentWorkoutAt = ((workoutRes.data ?? []) as any[]).reduce(
         (latest: string | null, row: any) => (!latest || new Date(row.at) > new Date(latest) ? row.at : latest),
         null as string | null,
       );
+      const planCreatedAt = (plan as any)?.created_at ?? null;
       const greetingIsFreshToday = lastGreeting
         ? dateKey(new Date(lastGreeting.at)) === dateKey(new Date()) &&
-          (!mostRecentWorkoutAt || new Date(mostRecentWorkoutAt) <= new Date(lastGreeting.at))
+          (!mostRecentWorkoutAt || new Date(mostRecentWorkoutAt) <= new Date(lastGreeting.at)) &&
+          (!planCreatedAt || new Date(planCreatedAt) <= new Date(lastGreeting.at))
         : false;
 
       let coachMessage: string;
@@ -265,7 +343,7 @@ export function useHomeData(): HomeData {
       } else {
         greetingInFlightRef.current = true;
         try {
-          const generated = await callBrain(userId, DAILY_GREETING_PROMPT, 'text', true);
+          const generated = await callBrain(userId, buildGreetingPrompt(greetingSession), 'text', true);
           coachMessage = sanitizeCoachMessage(generated.reply);
         } catch (err) {
           console.warn('[home] daily greeting generation failed:', err);
@@ -282,7 +360,30 @@ export function useHomeData(): HomeData {
       if (!profileRes.error) setCachedDisplayName(userId, userName);
       const loadError = planRes.error ? "Couldn't load your plan." : null;
 
-      setState({ loading: false, userId, userName, macros, todaySession, coachMessage, streakDays, loadError });
+      let planPending = false;
+      if (hasPlan) {
+        clearPlanPending();
+        pendingRetryCountRef.current = 0;
+      } else {
+        planPending = await isPlanPending();
+        if (planPending && pendingRetryCountRef.current < MAX_PENDING_RETRIES) {
+          pendingRetryCountRef.current += 1;
+          setTimeout(() => {
+            if (!cancelled) refetch();
+          }, PENDING_RETRY_DELAY_MS);
+        }
+      }
+      if (cancelled) return;
+
+      loadedFromNetworkRef.current = true;
+      const next = { loading: false, userId, userName, macros, todaySession, coachMessage, streakDays, loadError, planPending };
+      setState(next);
+      if (!loadError) {
+        const { loading: _loading, loadError: _loadError, ...cacheable } = next;
+        AsyncStorage.setItem(HOME_CACHE_KEY, JSON.stringify(cacheable)).catch((err) =>
+          console.warn('[home] failed to cache data:', err),
+        );
+      }
     })();
 
     return () => {

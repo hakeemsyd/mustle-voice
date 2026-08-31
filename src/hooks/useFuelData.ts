@@ -84,17 +84,5 @@ export function useFuelData() {
     };
   }, [refetchSignal]);
 
-  const deleteEntry = useCallback(
-    async (id: string) => {
-      setEntries((prev) => prev.filter((e) => e.id !== id));
-      const { error } = await supabase.from("food_log").delete().eq("id", id);
-      if (error) {
-        console.error("[fuel] failed to delete food log entry:", error.message);
-        refetch();
-      }
-    },
-    [refetch],
-  );
-
-  return { loading, macros, entries, deleteEntry, refetch };
+  return { loading, macros, entries, refetch };
 }

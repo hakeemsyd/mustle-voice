@@ -1,5 +1,6 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { View, Text, StyleSheet, TouchableOpacity } from "react-native";
+import Animated, { useAnimatedStyle, useSharedValue, withDelay, withTiming } from "react-native-reanimated";
 
 import { ProgressDots } from "../ProgressDots";
 import { GenderCard } from "../../components/GenderCard";
@@ -55,6 +56,15 @@ const OPTIONS = [
 export const ScreenGender = ({ onNext, onBack }: Props) => {
   const [selected, setSelected] = useState<Gender | null>(null);
 
+  const visibleProgress = useSharedValue(0);
+  useEffect(() => {
+    visibleProgress.value = withDelay(80, withTiming(1, { duration: 350 }));
+  }, []);
+  const contentStyle = useAnimatedStyle(() => ({
+    opacity: visibleProgress.value,
+    transform: [{ translateY: (1 - visibleProgress.value) * 10 }],
+  }));
+
   const handleSelect = (gender: Gender) => {
     setSelected(gender);
 
@@ -66,14 +76,16 @@ export const ScreenGender = ({ onNext, onBack }: Props) => {
   return (
     <View style={styles.container}>
       <View style={styles.topBar}>
-        <TouchableOpacity activeOpacity={0.7} onPress={onBack}>
+        <TouchableOpacity style={styles.topBarSpacer} activeOpacity={0.7} onPress={onBack}>
           <BackIcon />
         </TouchableOpacity>
 
         <ProgressDots total={11} current={2} />
+
+        <View style={styles.topBarSpacer} />
       </View>
 
-      <View style={styles.content}>
+      <Animated.View style={[styles.content, contentStyle]}>
         <Text style={styles.eyebrow}>ABOUT YOU</Text>
 
         <Text style={styles.title}>How do you{"\n"}identify?</Text>
@@ -94,7 +106,7 @@ export const ScreenGender = ({ onNext, onBack }: Props) => {
             );
           })}
         </View>
-      </View>
+      </Animated.View>
     </View>
   );
 };
@@ -102,7 +114,7 @@ export const ScreenGender = ({ onNext, onBack }: Props) => {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#000",
+    backgroundColor: colors.bg,
     paddingTop: 60,
   },
 
@@ -112,10 +124,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
   },
 
-  backArrow: {
-    color: "#FFFFFF",
-    fontSize: 24,
-    marginRight: 16,
+  topBarSpacer: {
+    width: 32,
   },
 
   content: {

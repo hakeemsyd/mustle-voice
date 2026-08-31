@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import Animated, {
+  Easing,
   FadeInUp,
   useAnimatedStyle,
   useSharedValue,
@@ -10,6 +11,7 @@ import Animated, {
 
 import { Orb, type OrbState } from "../Orb";
 import { ProgressDots } from "../ProgressDots";
+import { BackIcon } from "../../icons/BackIcon";
 import { useSpeakOnMount } from "../useSpeakOnMount";
 import { PUSH_PROMPT } from "../prompts";
 
@@ -18,70 +20,91 @@ import { useWordTyping } from "../../hooks/useWordTyping";
 
 const COACH_MSG = PUSH_PROMPT;
 
-type Phase = "typing" | "shrinking" | "ready";
+// Matches the source's collapsed "speaking" → "ready" model (see mustle-mvp's ScreenPush.tsx/
+// ScreenMic.tsx header comments) — the message renders at its one, final small size from the
+// first word, no separate shrink-animation phase. This screen previously still ran the old
+// retired big→small animation (its own copy, not shared with ScreenMic/ConversationalScreen),
+// same bug those two had before their own fixes.
+type Phase = "typing" | "ready";
 
 interface ScreenPushProps {
   onNext: (enabled: boolean) => void;
   onBack: () => void;
 }
 
+const WORD_EASE = Easing.bezier(0.2, 0, 0.2, 1);
+
+function RevealWord({
+  text,
+  revealed,
+  isLast,
+}: {
+  text: string;
+  revealed: boolean;
+  isLast: boolean;
+}) {
+  const progress = useSharedValue(revealed ? 1 : 0);
+  useEffect(() => {
+    if (revealed)
+      progress.value = withTiming(1, { duration: 220, easing: WORD_EASE });
+  }, [revealed]);
+  const style = useAnimatedStyle(() => ({
+    opacity: progress.value,
+    transform: [{ translateY: (1 - progress.value) * 6 }],
+  }));
+  return (
+    <Animated.Text style={[styles.message, style]}>
+      {text}
+      {isLast ? "" : " "}
+    </Animated.Text>
+  );
+}
+
 export const ScreenPush = ({ onNext, onBack }: ScreenPushProps) => {
   const [phase, setPhase] = useState<Phase>("typing");
 
-  const fontSize = useSharedValue(26);
-  const lineHeight = useSharedValue(34);
-  const marginTop = useSharedValue(56);
-  const opacity = useSharedValue(1);
-
-  const animatedMessageStyle = useAnimatedStyle(() => ({
-    fontSize: fontSize.value,
-    lineHeight: lineHeight.value,
-    marginTop: marginTop.value,
-    opacity: opacity.value,
-  }));
-
   const { audioDone, audioStarted } = useSpeakOnMount(COACH_MSG);
-  const { count, isDone, words } = useWordTyping(COACH_MSG, phase === "typing" && audioStarted);
+  const { count, isDone, words } = useWordTyping(
+    COACH_MSG,
+    phase === "typing" && audioStarted,
+  );
 
   useEffect(() => {
     if (phase === "typing" && isDone && audioDone) {
-      const timer = setTimeout(() => setPhase("shrinking"), 300);
+      const timer = setTimeout(() => setPhase("ready"), 100);
       return () => clearTimeout(timer);
     }
   }, [phase, isDone, audioDone]);
 
-  useEffect(() => {
-    if (phase === "shrinking") {
-      fontSize.value = withTiming(14, { duration: 350 });
-      lineHeight.value = withTiming(20, { duration: 350 });
-      marginTop.value = withTiming(12, { duration: 350 });
-      opacity.value = withTiming(0.6, { duration: 350 });
-
-      const timer = setTimeout(() => setPhase("ready"), 350);
-      return () => clearTimeout(timer);
-    }
-  }, [phase]);
-
-  const orbState: OrbState = phase === "typing" ? "speaking" : "breathing";
+  const orbState: OrbState = phase === "typing" ? "speaking" : "typing";
   const ctaVisible = phase === "ready";
 
   return (
     <SafeAreaView style={styles.screen} edges={["top"]}>
       <View style={styles.topBar}>
-        <Pressable onPress={onBack} hitSlop={12}>
-          <Text style={styles.backArrow}>←</Text>
+        <Pressable style={styles.topBarSpacer} onPress={onBack} hitSlop={12}>
+          <BackIcon />
         </Pressable>
 
         <ProgressDots total={11} current={9} />
+
+        <View style={styles.topBarSpacer} />
       </View>
 
       <View style={styles.orbArea}>
         <Orb state={orbState} size={140} />
       </View>
 
-      <Animated.Text style={[styles.message, animatedMessageStyle]}>
-        {phase === "typing" ? words.slice(0, count).join(" ") : COACH_MSG}
-      </Animated.Text>
+      <Text style={styles.message}>
+        {words.map((w, i) => (
+          <RevealWord
+            key={i}
+            text={w}
+            isLast={i === words.length - 1}
+            revealed={phase !== "typing" || i < count}
+          />
+        ))}
+      </Text>
 
       {ctaVisible && (
         <Animated.View style={styles.actions} entering={FadeInUp.duration(300)}>
@@ -110,24 +133,27 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
   },
 
-  backArrow: {
-    color: "rgba(255,255,255,0.7)",
-    fontSize: 20,
-    paddingRight: 8,
+  topBarSpacer: {
+    width: 32,
   },
 
   orbArea: {
     alignItems: "center",
-    paddingTop: 20,
+    paddingTop: 12,
   },
 
+  // Matches instantReveal's final ("shrank") state — see ScreenMic.tsx/ConversationalScreen.tsx
+  // for the same fix and rationale.
   message: {
     textAlign: "center",
-    fontFamily: fonts.bodyExtraBold,
+    fontFamily: fonts.bodyMedium,
+    fontSize: 16,
+    lineHeight: 20,
+    opacity: 0.65,
+    marginTop: 36,
     color: colors.text,
     maxWidth: 300,
     alignSelf: "center",
-    paddingHorizontal: 8,
   },
 
   actions: {

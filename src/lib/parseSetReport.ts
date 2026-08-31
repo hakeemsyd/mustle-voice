@@ -3,6 +3,9 @@ import { normalizeSpokenNumbers } from '../onboarding/normalizeSpokenNumbers';
 export interface ParsedSet {
   weight: number | null;
   reps: number;
+  /** "seconds" for a timed/isometric hold (Plank, etc.) — changes how describeParsedSet phrases
+   *  it. Omitted (rep-count) is the default for every other exercise. */
+  unit?: 'seconds';
 }
 
 // Keyword-anchored first, position second. A number followed by kg/lb is the weight and
@@ -15,6 +18,16 @@ export interface ParsedSet {
 // three times against a real session instead of "60kg".
 export function parseSetReport(raw: string): ParsedSet | null {
   const normalized = normalizeSpokenNumbers(raw);
+
+  // Isometric/timed exercises (Plank, holds) report a duration, not a rep count — confirmed
+  // live: "I held it for 52 seconds" matched nothing below and silently fell through to a
+  // plain conversational reply. The held seconds fills the same `reps` slot the rest of the
+  // app already reads for "how much of the target did they do" — bodyweight, no weight.
+  const durationMatch = normalized.match(/(\d+)\s*(?:sec|secs|second|seconds)\b/i);
+  if (durationMatch) {
+    const reps = Math.round(Number(durationMatch[1]));
+    return reps > 0 ? { weight: null, reps, unit: 'seconds' } : null;
+  }
 
   const weightMatch = normalized.match(/(\d+(?:\.\d+)?)\s*(?:kg|kgs|kilos?|lb|lbs|pounds?)\b/i);
   const repsMatch = normalized.match(/(\d+)\s*(?:reps?|x)\b/i);
@@ -42,6 +55,7 @@ export function parseSetReport(raw: string): ParsedSet | null {
 }
 
 export function describeParsedSet(parsed: ParsedSet): string {
+  if (parsed.unit === 'seconds') return `${parsed.reps}s held`;
   return parsed.weight === null
     ? `${parsed.reps} reps · bodyweight`
     : `${parsed.weight}kg × ${parsed.reps} reps`;

@@ -47,6 +47,9 @@ import { BedDoubleIcon } from "./BedDoubleIcon";
 import { TimerIcon } from "./TimerIcon";
 import { CheckCircleIcon } from "./CheckCircleIcon";
 import { CircleIcon } from "./CircleIcon";
+import { ClockIcon } from "./ClockIcon";
+import { TrophyIcon } from "./TrophyIcon";
+import { BatteryChargingIcon } from "./BatteryChargingIcon";
 
 export {
   FemaleIcon,
@@ -98,4 +101,7 @@ export {
   TimerIcon,
   CheckCircleIcon,
   CircleIcon,
+  ClockIcon,
+  TrophyIcon,
+  BatteryChargingIcon,
 };
