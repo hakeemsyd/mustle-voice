@@ -50,6 +50,15 @@ import { CircleIcon } from "./CircleIcon";
 import { ClockIcon } from "./ClockIcon";
 import { TrophyIcon } from "./TrophyIcon";
 import { BatteryChargingIcon } from "./BatteryChargingIcon";
+import { FlagIcon } from "./FlagIcon";
+import { HistoryIcon } from "./HistoryIcon";
+import { CameraIcon } from "./CameraIcon";
+import { ImageIcon } from "./ImageIcon";
+import { PaperclipIcon } from "./PaperclipIcon";
+import { DrumstickIcon } from "./DrumstickIcon";
+import { FishIcon } from "./FishIcon";
+import { EggIcon } from "./EggIcon";
+import { BeefIcon } from "./BeefIcon";
 
 export {
   FemaleIcon,
@@ -104,4 +113,13 @@ export {
   ClockIcon,
   TrophyIcon,
   BatteryChargingIcon,
+  FlagIcon,
+  HistoryIcon,
+  CameraIcon,
+  ImageIcon,
+  PaperclipIcon,
+  DrumstickIcon,
+  FishIcon,
+  EggIcon,
+  BeefIcon,
 };

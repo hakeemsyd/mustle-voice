@@ -4,6 +4,8 @@ import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, View
 import { colors, fonts } from "../constants/theme";
 import { useScreenInsets } from "../hooks/useScreenInsets";
 import { useExerciseGuide } from "../hooks/useExerciseGuide";
+import { getExerciseReference } from "../lib/exerciseGuides";
+import { ExerciseMotionIllustration } from "./ExerciseMotionIllustration";
 import { XIcon } from "../icons/XIcon";
 
 interface Props {
@@ -24,117 +26,139 @@ function whenLabel(iso: string): string {
   return then.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+/**
+ * Guide — a reference layer for one exercise: what the movement is, what it works, and how to
+ * set up and execute it, on a white card over the app's own dark background. Full-screen rather
+ * than a bottom sheet; the header travels with the content as a pinned bar.
+ *
+ * Reference content comes from src/lib/exerciseGuides.ts. The user's own logged history and the
+ * coach's past notes are appended below it, but only when they exist — an exercise the user has
+ * never logged shows pure reference material rather than two empty placeholder cards.
+ */
 export function GuideSheet({ open, onClose, exerciseId, exerciseName, repScheme, loadScheme }: Props) {
   const insets = useScreenInsets();
   const { loading, notes, lastTime } = useExerciseGuide(open ? exerciseId : null, open ? exerciseName : null);
+  const reference = getExerciseReference(exerciseName);
 
   return (
-    <Modal visible={open} transparent animationType="slide" onRequestClose={onClose}>
-      <Pressable style={styles.backdrop} onPress={onClose}>
-        <Pressable
-          style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 20) }]}
-          onPress={(e) => e.stopPropagation()}
-        >
-          <View style={styles.handleWrap}>
-            <View style={styles.handle} />
+    <Modal visible={open} transparent={false} animationType="slide" onRequestClose={onClose}>
+      <View style={styles.screen}>
+        <View style={[styles.stickyBar, { paddingTop: insets.top + 16 }]}>
+          <View style={styles.headerText}>
+            <Text style={styles.eyebrow}>GUIDE</Text>
+            <Text style={styles.title} numberOfLines={2}>
+              {(exerciseName ?? "Exercise").toUpperCase()}
+            </Text>
+            {(repScheme || loadScheme) && (
+              <Text style={styles.target}>{[repScheme, loadScheme].filter(Boolean).join(" · ")}</Text>
+            )}
           </View>
-          <Pressable style={styles.closeBtn} onPress={onClose} hitSlop={8}>
+          <Pressable style={styles.closeBtn} onPress={onClose} hitSlop={10}>
             <XIcon size={15} color={colors.muted} />
           </Pressable>
+        </View>
 
-          <Text style={styles.eyebrow}>EXERCISE GUIDE</Text>
-          <Text style={styles.title}>{(exerciseName ?? "Exercise").toUpperCase()}</Text>
-          {(repScheme || loadScheme) && (
-            <Text style={styles.target}>
-              {[repScheme, loadScheme].filter(Boolean).join(" · ")}
-            </Text>
+        <ScrollView
+          style={styles.scroll}
+          contentContainerStyle={[styles.scrollContent, { paddingBottom: Math.max(insets.bottom, 24) }]}
+          showsVerticalScrollIndicator={false}
+        >
+          {reference ? (
+            <>
+              <View style={styles.guideCard}>
+                <ExerciseMotionIllustration motion={reference.motion} />
+                <Text style={styles.guideSummary}>{reference.summary}</Text>
+                <View style={styles.muscleRow}>
+                  {reference.muscles.map((muscle) => (
+                    <Text key={muscle} style={styles.muscleChip}>
+                      {muscle.toUpperCase()}
+                    </Text>
+                  ))}
+                </View>
+              </View>
+
+              {/* Deliberately outside the white card, on the screen's own dark background. */}
+              <View style={styles.stepBlock}>
+                <Text style={styles.stepLabel}>SETUP</Text>
+                <View style={styles.stepList}>
+                  {reference.setup.map((step, i) => (
+                    <View key={i} style={styles.stepItemRow}>
+                      <Text style={styles.stepBullet}>•</Text>
+                      <Text style={styles.stepItem}>{step}</Text>
+                    </View>
+                  ))}
+                </View>
+              </View>
+
+              <View style={[styles.stepBlock, styles.stepBlockDivided]}>
+                <Text style={styles.stepLabel}>EXECUTION</Text>
+                <View style={styles.stepList}>
+                  {reference.execution.map((step, i) => (
+                    <View key={i} style={styles.stepItemRow}>
+                      <Text style={styles.stepBullet}>•</Text>
+                      <Text style={styles.stepItem}>{step}</Text>
+                    </View>
+                  ))}
+                </View>
+              </View>
+            </>
+          ) : (
+            <View style={styles.card}>
+              <Text style={styles.cardTextMuted}>No reference notes for this exercise yet.</Text>
+            </View>
           )}
 
-          <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
-            <Text style={styles.sectionLabel}>LAST TIME</Text>
-            <View style={styles.card}>
-              {loading ? (
-                <ActivityIndicator color={colors.accent} />
-              ) : lastTime ? (
-                <Text style={styles.cardText}>
-                  {whenLabel(lastTime.at)} — {lastTime.sets} sets · {lastTime.reps} reps
-                  {lastTime.load && lastTime.load !== "bodyweight" ? ` · ${lastTime.load}` : ""}
-                </Text>
-              ) : (
-                <Text style={styles.cardTextMuted}>
-                  No logged history for this exercise yet.
-                </Text>
-              )}
-            </View>
-
-            <Text style={styles.sectionLabel}>COACHING NOTES</Text>
-            {loading ? (
-              <View style={styles.card}>
-                <ActivityIndicator color={colors.accent} />
-              </View>
-            ) : notes.length === 0 ? (
-              <View style={styles.card}>
-                <Text style={styles.cardTextMuted}>
-                  Nothing yet — ask your coach about this exercise mid-set and their answer is
-                  kept here.
-                </Text>
-              </View>
-            ) : (
-              notes.map((note) => (
-                <View key={note.id} style={styles.noteCard}>
-                  <Text style={styles.noteWhen}>{whenLabel(note.at)}</Text>
-                  <Text style={styles.cardText}>{note.note}</Text>
+          {loading ? (
+            <ActivityIndicator color={colors.accent} style={styles.spinner} />
+          ) : (
+            <>
+              {lastTime && (
+                <View style={[styles.stepBlock, styles.stepBlockDivided]}>
+                  <Text style={styles.stepLabel}>LAST TIME</Text>
+                  <Text style={styles.cardText}>
+                    {whenLabel(lastTime.at)} — {lastTime.sets} sets · {lastTime.reps} reps
+                    {lastTime.load && lastTime.load !== "bodyweight" ? ` · ${lastTime.load}` : ""}
+                  </Text>
                 </View>
-              ))
-            )}
+              )}
 
-            <Text style={styles.sectionLabel}>FORM DEMO</Text>
-            <View style={styles.card}>
-              <Text style={styles.cardTextMuted}>Video demo — coming soon.</Text>
-            </View>
-          </ScrollView>
-        </Pressable>
-      </Pressable>
+              {notes.length > 0 && (
+                <View style={[styles.stepBlock, styles.stepBlockDivided]}>
+                  <Text style={styles.stepLabel}>YOUR COACH'S NOTES</Text>
+                  {notes.map((note) => (
+                    <View key={note.id} style={styles.noteCard}>
+                      <Text style={styles.noteWhen}>{whenLabel(note.at)}</Text>
+                      <Text style={styles.cardText}>{note.note}</Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+            </>
+          )}
+        </ScrollView>
+      </View>
     </Modal>
   );
 }
 
 const styles = StyleSheet.create({
-  backdrop: {
+  screen: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.6)",
-    justifyContent: "flex-end",
+    backgroundColor: colors.bg,
   },
-  sheet: {
-    backgroundColor: colors.surface,
-    borderTopLeftRadius: 22,
-    borderTopRightRadius: 22,
-    borderTopWidth: 1,
-    borderColor: colors.border,
+  stickyBar: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 12,
     paddingHorizontal: 20,
-    paddingTop: 8,
-    maxHeight: "82%",
+    paddingBottom: 16,
+    backgroundColor: colors.bg,
   },
-  handleWrap: { alignItems: "center", paddingBottom: 6 },
-  handle: {
-    width: 36,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: "rgba(255,255,255,0.18)",
-  },
-  closeBtn: {
-    position: "absolute",
-    top: 14,
-    right: 16,
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: colors.surfaceDeep,
-    borderWidth: 1,
-    borderColor: colors.border,
-    zIndex: 2,
+  headerText: {
+    flex: 1,
+    minWidth: 0,
+    gap: 2,
   },
   eyebrow: {
     fontFamily: fonts.monoBold,
@@ -144,26 +168,102 @@ const styles = StyleSheet.create({
   },
   title: {
     fontFamily: fonts.display,
-    fontSize: 24,
-    letterSpacing: 0.4,
+    fontSize: 22,
+    letterSpacing: 0.44,
     color: colors.text,
-    marginTop: 2,
   },
   target: {
     fontFamily: fonts.body,
     fontSize: 12.5,
     color: colors.muted,
-    marginTop: 2,
   },
-  scroll: { marginTop: 14 },
-  scrollContent: { paddingBottom: 8, gap: 8 },
-  sectionLabel: {
+  closeBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.surfaceDeep,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  scroll: {
+    flex: 1,
+  },
+  scrollContent: {
+    paddingHorizontal: 20,
+    gap: 14,
+  },
+
+  // White reference card — literal near-black text colours rather than theme tokens, since this
+  // is the one light surface on the screen.
+  guideCard: {
+    gap: 12,
+    borderRadius: 16,
+    backgroundColor: "#FFFFFF",
+    paddingTop: 14,
+    paddingHorizontal: 16,
+    paddingBottom: 16,
+  },
+  guideSummary: {
+    fontFamily: fonts.body,
+    fontSize: 13,
+    lineHeight: 20,
+    color: "#0C0C0C",
+  },
+  muscleRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+  },
+  muscleChip: {
+    overflow: "hidden",
+    fontFamily: fonts.monoBold,
+    fontSize: 9.5,
+    letterSpacing: 0.57,
+    color: "rgba(8,8,8,0.55)",
+    backgroundColor: "rgba(8,8,8,0.06)",
+    borderRadius: 999,
+    paddingVertical: 4,
+    paddingHorizontal: 9,
+  },
+
+  stepBlock: {
+    gap: 6,
+  },
+  stepBlockDivided: {
+    paddingTop: 16,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+  },
+  stepLabel: {
     fontFamily: fonts.monoBold,
     fontSize: 10,
     letterSpacing: 1,
     color: colors.muted,
-    marginTop: 6,
   },
+  stepList: {
+    gap: 6,
+  },
+  stepItemRow: {
+    flexDirection: "row",
+    gap: 8,
+    paddingLeft: 4,
+  },
+  stepBullet: {
+    fontFamily: fonts.body,
+    fontSize: 12.5,
+    lineHeight: 19,
+    color: colors.muted,
+  },
+  stepItem: {
+    flex: 1,
+    fontFamily: fonts.body,
+    fontSize: 12.5,
+    lineHeight: 19,
+    color: colors.text,
+  },
+
   card: {
     paddingVertical: 14,
     paddingHorizontal: 16,
@@ -174,8 +274,8 @@ const styles = StyleSheet.create({
   },
   noteCard: {
     gap: 4,
-    paddingVertical: 14,
-    paddingHorizontal: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
     borderRadius: 14,
     backgroundColor: "rgba(255,255,255,0.05)",
     borderLeftWidth: 2,
@@ -189,8 +289,8 @@ const styles = StyleSheet.create({
   },
   cardText: {
     fontFamily: fonts.body,
-    fontSize: 13.5,
-    lineHeight: 21,
+    fontSize: 13,
+    lineHeight: 20,
     color: colors.text,
   },
   cardTextMuted: {
@@ -198,5 +298,8 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 20,
     color: colors.muted,
+  },
+  spinner: {
+    marginTop: 8,
   },
 });

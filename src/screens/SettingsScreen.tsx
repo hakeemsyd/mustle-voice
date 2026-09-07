@@ -20,6 +20,8 @@ import { notifyAccountReset } from "../lib/appResetBridge";
 import { useScreenInsets } from "../hooks/useScreenInsets";
 import { colors, fonts } from "../constants/theme";
 import { ArrowLeftIcon, CheckIcon } from "../icons";
+import { titleCase } from "../lib/textFormat";
+import { cmToDisplayHeight, kgToDisplayWeightValue, weightToKg, type Units } from "../lib/units";
 
 interface Injury {
   area: string;
@@ -36,11 +38,7 @@ interface SettingsData {
   weeklyFrequency: number | null;
   goalObjective: string | null;
   injuries: Injury[];
-}
-
-function titleCase(value: string | null): string {
-  if (!value) return "—";
-  return value.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  unitPrefs: Units;
 }
 
 export function SettingsScreen() {
@@ -71,7 +69,7 @@ export function SettingsScreen() {
       }
 
       const [profileRes, biometricsRes, weightRes, goalRes, injuryRes] = await Promise.all([
-        supabase.from("profile").select("display_name").eq("user_id", userId).maybeSingle(),
+        supabase.from("profile").select("display_name, unit_prefs").eq("user_id", userId).maybeSingle(),
         supabase
           .from("biometrics")
           .select("height_cm, sex, activity_level, weekly_frequency")
@@ -90,6 +88,8 @@ export function SettingsScreen() {
 
       if (cancelled) return;
 
+      const unitPrefs: Units = (profileRes.data?.unit_prefs as Units | undefined) ?? "metric";
+
       const next: SettingsData = {
         userId,
         displayName: profileRes.data?.display_name ?? "",
@@ -100,11 +100,12 @@ export function SettingsScreen() {
         weeklyFrequency: biometricsRes.data?.weekly_frequency ?? null,
         goalObjective: goalRes.data?.objective ?? null,
         injuries: (injuryRes.data ?? []) as Injury[],
+        unitPrefs,
       };
 
       setData(next);
       setNameDraft(next.displayName);
-      setWeightDraft(next.weightKg != null ? String(next.weightKg) : "");
+      setWeightDraft(next.weightKg != null ? String(kgToDisplayWeightValue(next.weightKg, unitPrefs)) : "");
       setLoading(false);
     })();
 
@@ -133,16 +134,16 @@ export function SettingsScreen() {
 
   const saveWeight = async () => {
     if (!data) return;
-    const parsed = parseFloat(weightDraft);
-    if (!Number.isFinite(parsed) || parsed <= 0 || parsed === data.weightKg) return;
+    const enteredKg = weightToKg(weightDraft, data.unitPrefs);
+    if (enteredKg === null || enteredKg <= 0 || enteredKg === data.weightKg) return;
     setSavingWeight(true);
-    const { error } = await supabase.from("weight_log").insert({ user_id: data.userId, weight_kg: parsed });
+    const { error } = await supabase.from("weight_log").insert({ user_id: data.userId, weight_kg: enteredKg });
     setSavingWeight(false);
     if (error) {
       console.error("[settings] failed to save weight:", error.message);
       return;
     }
-    setData({ ...data, weightKg: parsed });
+    setData({ ...data, weightKg: enteredKg });
     setSavedField("weight");
     setTimeout(() => setSavedField(null), 1500);
   };
@@ -287,7 +288,7 @@ export function SettingsScreen() {
                   onChangeText={setWeightDraft}
                   onBlur={saveWeight}
                   onSubmitEditing={saveWeight}
-                  placeholder="kg"
+                  placeholder={data.unitPrefs === "metric" ? "kg" : "lb"}
                   placeholderTextColor={colors.muted}
                   keyboardType="decimal-pad"
                   style={styles.input}
@@ -298,8 +299,8 @@ export function SettingsScreen() {
                 ) : savedField === "weight" ? (
                   <CheckIcon size={14} color={colors.accent} />
                 ) : (() => {
-                    const parsed = parseFloat(weightDraft);
-                    return Number.isFinite(parsed) && parsed > 0 && parsed !== data.weightKg;
+                    const enteredKg = weightToKg(weightDraft, data.unitPrefs);
+                    return enteredKg !== null && enteredKg > 0 && enteredKg !== data.weightKg;
                   })() ? (
                   <Pressable style={styles.saveBtn} onPress={saveWeight} hitSlop={8}>
                     <Text style={styles.saveBtnText}>Save</Text>
@@ -309,7 +310,9 @@ export function SettingsScreen() {
             </View>
             <View style={styles.row}>
               <Text style={styles.rowLabel}>Height</Text>
-              <Text style={styles.rowValue}>{data.heightCm ? `${data.heightCm} cm` : "—"}</Text>
+              <Text style={styles.rowValue}>
+                {data.heightCm ? cmToDisplayHeight(data.heightCm, data.unitPrefs) : "—"}
+              </Text>
             </View>
             <View style={styles.row}>
               <Text style={styles.rowLabel}>Sex</Text>
@@ -362,20 +365,16 @@ export function SettingsScreen() {
               {deletingAccount ? <ActivityIndicator size="small" color={colors.muted} /> : null}
             </Pressable>
 
-            {__DEV__ ? (
-              <>
-                <Text style={styles.sectionLabel}>DEVELOPER</Text>
-                <Pressable
-                  style={styles.row}
-                  onPress={confirmResetTestAccount}
-                  disabled={resetting}
-                  hitSlop={8}
-                >
-                  <Text style={[styles.rowLabel, styles.destructiveLabel]}>Reset Test Account</Text>
-                  {resetting ? <ActivityIndicator size="small" color={colors.muted} /> : null}
-                </Pressable>
-              </>
-            ) : null}
+            <Text style={styles.sectionLabel}>DEVELOPER</Text>
+            <Pressable
+              style={styles.row}
+              onPress={confirmResetTestAccount}
+              disabled={resetting}
+              hitSlop={8}
+            >
+              <Text style={[styles.rowLabel, styles.destructiveLabel]}>Reset Test Account</Text>
+              {resetting ? <ActivityIndicator size="small" color={colors.muted} /> : null}
+            </Pressable>
           </ScrollView>
         </KeyboardAvoidingView>
       )}

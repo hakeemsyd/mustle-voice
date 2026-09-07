@@ -15,6 +15,7 @@ import {
 import { addDays, formatWeekRange, localDateKey } from "../lib/calendarDate";
 import { useScreenInsets } from "../hooks/useScreenInsets";
 import { estimateRestSeconds, formatRestSeconds } from "../lib/restSuggestion";
+import { chooseRestDay } from "../lib/restDay";
 import { useActiveSessionContext } from "../session/ActiveSessionContext";
 import { colors, fonts } from "../constants/theme";
 import {
@@ -32,13 +33,10 @@ import {
   UtensilsIcon,
 } from "../icons";
 import type { RootStackParamList } from "../navigation/types";
+import { titleCase } from "../lib/textFormat";
 
 type Scope = "today" | "week" | "month";
 type Props = NativeStackScreenProps<RootStackParamList, "Calendar">;
-
-function titleCase(value: string): string {
-  return value.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-}
 
 export function CalendarScreen({ route, navigation }: Props) {
   const insets = useScreenInsets();
@@ -121,7 +119,7 @@ export function CalendarScreen({ route, navigation }: Props) {
                           {completed ? (
                             <CheckCircleIcon size={18} color={colors.accent} />
                           ) : today.isRestDay ? (
-                            <MoonIcon size={18} color={colors.muted} />
+                            <MoonIcon size={18} color={colors.accent} />
                           ) : (
                             <DumbbellIcon size={18} color={colors.accent} />
                           )}
@@ -155,6 +153,22 @@ export function CalendarScreen({ route, navigation }: Props) {
                         </View>
                       )}
                     </View>
+
+                    {/* No planned-meal count in our hooks, so only the workout chip renders here. */}
+                    {!today.isRestDay && (today.completedToday || today.mealsLoggedToday > 0) && (
+                      <View style={styles.progressRow}>
+                        <View style={styles.progressChip}>
+                          {today.completedToday ? (
+                            <CheckCircleIcon size={14} color={colors.accent} />
+                          ) : (
+                            <CircleIcon size={14} color={colors.muted} />
+                          )}
+                          <Text style={styles.progressChipText}>
+                            {today.completedToday ? "Workout logged" : "Workout not logged yet"}
+                          </Text>
+                        </View>
+                      </View>
+                    )}
 
                     {completed ? (
                       <Pressable
@@ -192,11 +206,11 @@ export function CalendarScreen({ route, navigation }: Props) {
                           </View>
                         </View>
                         <Pressable
-                          style={styles.startBtn}
+                          style={styles.todayStartBtn}
                           onPress={() => navigation.navigate("PreWorkoutPreview", { planSessionId: today.session!.planSessionId })}
                         >
-                          <PlayIcon size={13} color={colors.accentOn} />
-                          <Text style={styles.startBtnText}>Start Session</Text>
+                          <PlayIcon size={14} color={colors.accentOn} />
+                          <Text style={styles.todayStartBtnText}>Start Session</Text>
                         </Pressable>
                       </>
                     )}
@@ -233,13 +247,13 @@ export function CalendarScreen({ route, navigation }: Props) {
         {scope === "week" && (
           <>
             <View style={styles.weekNav}>
-              <Pressable onPress={() => setWeekStart((d) => addDays(d, -7))} hitSlop={8}>
+              <Pressable style={styles.weekNavBtn} onPress={() => setWeekStart((d) => addDays(d, -7))} hitSlop={8}>
                 <View style={{ transform: [{ rotate: "180deg" }] }}>
                   <ChevronRightIcon size={14} color={colors.muted} />
                 </View>
               </Pressable>
               <Text style={styles.weekNavLabel}>{formatWeekRange(weekStart)}</Text>
-              <Pressable onPress={() => setWeekStart((d) => addDays(d, 7))} hitSlop={8}>
+              <Pressable style={styles.weekNavBtn} onPress={() => setWeekStart((d) => addDays(d, 7))} hitSlop={8}>
                 <ChevronRightIcon size={14} color={colors.muted} />
               </Pressable>
             </View>
@@ -272,9 +286,13 @@ export function CalendarScreen({ route, navigation }: Props) {
                           <Text style={styles.weekFocus}>{day.focus ? titleCase(day.focus) : "Rest day"}</Text>
                         </View>
                       </View>
-                      {day.status === "missed" && <CircleIcon size={14} color={colors.muted} />}
+                      {day.status === "missed" && (
+                        <View style={{ opacity: 0.6 }}>
+                          <CircleIcon size={14} color={colors.muted} />
+                        </View>
+                      )}
                       {isDone && <CheckCircleIcon size={14} color={colors.accent} />}
-                      <ChevronRightIcon size={13} color={colors.muted} />
+                      <ChevronRightIcon size={14} color={colors.muted} />
                     </Pressable>
                   );
                 })}
@@ -283,36 +301,39 @@ export function CalendarScreen({ route, navigation }: Props) {
           </>
         )}
 
-        {scope === "month" && (
-          <View style={styles.monthWrap}>
-            <MonthGrid
-              monthDate={monthDate}
-              onMonthChange={setMonthDate}
-              onSelectDay={setDetailDate}
-              dayCellStyle={(cell) => (month.plannedDates.has(cell.key) ? styles.scheduledDay : undefined)}
-              renderMarker={(cell) => {
-                const logged = month.completedDates.has(cell.key) || month.partialDates.has(cell.key);
-                if (logged) return <View style={styles.markerFilled} />;
-                if (month.plannedDates.has(cell.key)) return <View style={styles.markerHollow} />;
-                return null;
-              }}
-            />
-            <View style={styles.legend}>
-              <View style={styles.legendItem}>
-                <View style={styles.markerFilled} />
-                <Text style={styles.legendText}>Logged</Text>
-              </View>
-              <View style={styles.legendItem}>
-                <View style={styles.markerHollow} />
-                <Text style={styles.legendText}>Planned</Text>
-              </View>
-              <View style={styles.legendItem}>
-                <View style={styles.legendSwatch} />
-                <Text style={styles.legendText}>Training day</Text>
+        {scope === "month" &&
+          (month.loading ? (
+            <ActivityIndicator color={colors.accent} style={{ marginTop: 40 }} />
+          ) : (
+            <View style={styles.monthWrap}>
+              <MonthGrid
+                monthDate={monthDate}
+                onMonthChange={setMonthDate}
+                onSelectDay={setDetailDate}
+                dayCellStyle={(cell) => (month.plannedDates.has(cell.key) ? styles.scheduledDay : undefined)}
+                renderMarker={(cell) => {
+                  const logged = month.completedDates.has(cell.key) || month.partialDates.has(cell.key);
+                  if (logged) return <View style={styles.markerFilled} />;
+                  if (month.plannedDates.has(cell.key)) return <View style={styles.markerHollow} />;
+                  return null;
+                }}
+              />
+              <View style={styles.legend}>
+                <View style={styles.legendItem}>
+                  <View style={styles.markerFilled} />
+                  <Text style={styles.legendText}>Logged</Text>
+                </View>
+                <View style={styles.legendItem}>
+                  <View style={styles.markerHollow} />
+                  <Text style={styles.legendText}>Planned</Text>
+                </View>
+                <View style={styles.legendItem}>
+                  <View style={styles.legendSwatch} />
+                  <Text style={styles.legendText}>Training day</Text>
+                </View>
               </View>
             </View>
-          </View>
-        )}
+          ))}
       </ScrollView>
 
       <BottomSheet visible={!!detailDate} onClose={() => setDetailDate(null)} heightVariant="full">
@@ -502,6 +523,15 @@ export function CalendarScreen({ route, navigation }: Props) {
           setDetailDate(null);
           navigation.navigate("ActiveSession");
         }}
+        onRestDay={async () => {
+          setSwitchOpen(false);
+          await session.resolveOutgoingSession();
+          if (session.userId) await chooseRestDay(session.userId, detail.plannedSessionId ?? null);
+          setDetailDate(null);
+          today.refetch();
+          week.refetch();
+          month.refetch();
+        }}
       />
     </View>
   );
@@ -547,7 +577,7 @@ const styles = StyleSheet.create({
   scopeBtnText: { fontFamily: fonts.bodySemiBold, fontSize: 11.5, color: colors.muted },
   scopeBtnTextActive: { color: colors.text },
 
-  content: { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 32 },
+  content: { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 24 },
 
   todayHero: { borderRadius: 20, padding: 20, backgroundColor: colors.surfaceDeep, borderWidth: 1, borderColor: colors.border },
   todayHeroRest: { backgroundColor: colors.surface },
@@ -556,7 +586,7 @@ const styles = StyleSheet.create({
   todayEyebrow: {
     fontFamily: fonts.bodySemiBold,
     fontSize: 11,
-    letterSpacing: 1.4,
+    letterSpacing: 1.1,
     textTransform: "uppercase",
     color: colors.muted,
   },
@@ -572,7 +602,14 @@ const styles = StyleSheet.create({
     borderColor: colors.accentBorder,
   },
   todayIconBadgeActive: { backgroundColor: "rgba(8,8,8,0.88)", borderColor: "transparent" },
-  todayTitle: { fontFamily: fonts.display, fontSize: 34, color: colors.text, marginTop: 10, textTransform: "uppercase" },
+  todayTitle: {
+    fontFamily: fonts.display,
+    fontSize: 36,
+    letterSpacing: 0.72,
+    color: colors.text,
+    marginTop: 10,
+    textTransform: "uppercase",
+  },
   todayTitleActive: { color: colors.accentOn },
   todayDate: { fontFamily: fonts.body, fontSize: 13, color: colors.muted, marginTop: 4 },
   todayDateActive: { color: "rgba(8,8,8,0.7)" },
@@ -595,14 +632,28 @@ const styles = StyleSheet.create({
 
   todayWrap: { gap: 20 },
 
-  restCopy: { fontFamily: fonts.body, fontSize: 14, lineHeight: 21, color: colors.text },
+  restCopy: { fontFamily: fonts.body, fontSize: 14, lineHeight: 22, color: colors.text },
+
+  progressRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: -8 },
+  progressChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingVertical: 7,
+    paddingHorizontal: 12,
+    borderRadius: 100,
+    backgroundColor: colors.surfaceDeep,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  progressChipText: { fontFamily: fonts.bodyMedium, fontSize: 11.5, color: colors.text },
 
   todaySection: { gap: 10 },
   todaySectionHeader: { flexDirection: "row", alignItems: "center", gap: 6 },
   todaySectionLabel: {
     fontFamily: fonts.bodyBold,
     fontSize: 11,
-    letterSpacing: 1.4,
+    letterSpacing: 1.1,
     textTransform: "uppercase",
     color: colors.muted,
   },
@@ -619,7 +670,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.border,
   },
-  exerciseIndex: { fontFamily: fonts.bodyBold, fontSize: 11, color: colors.muted, width: 20 },
+  exerciseIndex: { fontFamily: fonts.bodyBold, fontSize: 11, color: colors.muted, width: 22 },
   exerciseMain: { flex: 1, gap: 2 },
   exerciseName: { fontFamily: fonts.bodySemiBold, fontSize: 13.5, color: colors.text },
   exerciseRestRow: { flexDirection: "row", alignItems: "center", gap: 4 },
@@ -658,8 +709,33 @@ const styles = StyleSheet.create({
   },
   startBtnText: { fontFamily: fonts.bodySemiBold, fontSize: 13, color: colors.accentOn },
 
-  weekNav: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 16, marginBottom: 14 },
-  weekNavLabel: { fontFamily: fonts.bodySemiBold, fontSize: 13, color: colors.text, minWidth: 110, textAlign: "center" },
+  todayStartBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    backgroundColor: colors.accent,
+    borderRadius: 100,
+    padding: 15,
+    shadowColor: colors.accent,
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.18,
+    shadowRadius: 20,
+  },
+  todayStartBtnText: { fontFamily: fonts.bodyBold, fontSize: 13.5, letterSpacing: 0.27, color: colors.accentOn },
+
+  weekNav: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 14, marginBottom: 18 },
+  weekNavBtn: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.surfaceDeep,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  weekNavLabel: { fontFamily: fonts.bodySemiBold, fontSize: 12.5, color: colors.text, minWidth: 120, textAlign: "center" },
 
   weekList: { gap: 8 },
   weekRow: {
@@ -674,8 +750,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
   },
   weekRowToday: { backgroundColor: colors.accentDim, borderColor: colors.accentBorder },
-  weekDayBlock: { width: 34, alignItems: "center", gap: 2 },
-  weekDayLabel: { fontFamily: fonts.monoBold, fontSize: 9.5, color: colors.muted },
+  weekDayBlock: { width: 34, alignItems: "center", justifyContent: "center", gap: 2 },
+  weekDayLabel: { fontFamily: fonts.bodyBold, fontSize: 9.5, letterSpacing: 0.57, color: colors.muted },
   weekDayNum: { fontFamily: fonts.bodyBold, fontSize: 17, color: colors.text },
   weekDayTextToday: { color: colors.accent },
   weekInfo: { flex: 1, gap: 3 },

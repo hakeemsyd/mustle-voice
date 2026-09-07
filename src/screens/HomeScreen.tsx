@@ -10,33 +10,22 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import Animated, { FadeIn, FadeOut } from "react-native-reanimated";
-import { useFocusEffect, useNavigation, useRoute, type RouteProp } from "@react-navigation/native";
+import { useFocusEffect, useIsFocused, useNavigation, useRoute, type RouteProp } from "@react-navigation/native";
 
 import { VoiceOrb } from "../components/VoiceOrb";
+import { ActiveWorkoutBanner } from "../components/ActiveWorkoutBanner";
 import { AppDrawer } from "../components/AppDrawer";
 import { BottomSheet } from "../components/BottomSheet";
 import { FloatingParticles } from "../components/FloatingParticles";
 import { ChatComposer } from "../components/ChatComposer";
-import { ChatTranscript } from "../components/ChatTranscript";
-import { QuickPromptChips } from "../components/QuickPromptChips";
 import { HeroGlow } from "../components/HeroGlow";
-import { VoiceAmbient } from "../components/VoiceAmbient";
-import { useVoiceSession } from "../hooks/useVoiceSession";
+import { useSharedVoiceSession } from "../session/VoiceSessionProvider";
+import { useActiveSessionContext } from "../session/ActiveSessionContext";
 import { useHomeData } from "../hooks/useHomeData";
 import { useHomeChat } from "../hooks/useHomeChat";
 import { colors, fonts } from "../constants/theme";
-import {
-  AudioLinesIcon,
-  CalendarIcon,
-  MenuIcon,
-  MoonIcon,
-  SunIcon,
-  XIcon,
-} from "../icons";
-import { MMark } from "../icons/MMark";
+import { CalendarIcon, MenuIcon, MoonIcon, SunIcon } from "../icons";
 import { getMomentumLine } from "./homeFormat";
-import type { OrbState } from "../components/VoiceOrb";
 
 type TimeBand = "Morning" | "Afternoon" | "Evening" | "Night";
 
@@ -52,25 +41,14 @@ function getGreeting(band: TimeBand, name: string | null): string {
   return name ? `${band}, ${name}.` : `${band}.`;
 }
 
-// "breathing"/"idle" is the gap between turns — connected but neither side is
-// talking — so it reads as the cue for the user to speak, same as the design's
-// own fallback copy for that state.
-const VOICE_PHASE_LABEL: Record<OrbState, string> = {
-  idle: "You speak",
-  breathing: "You speak",
-  listening: "Listening",
-  processing: "Thinking",
-  speaking: "Speaking",
-};
-
 export function HomeScreen() {
   const [nutritionOpen, setNutritionOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [draftText, setDraftText] = useState("");
   const [composerFocused, setComposerFocused] = useState(false);
-  const [chatOpen, setChatOpen] = useState(false);
   const navigation = useNavigation();
   const route = useRoute<RouteProp<{ Home: { openChat?: boolean } }, "Home">>();
+  const isFocused = useIsFocused();
   const timeBand = getTimeBand(new Date().getHours());
   const {
     loading,
@@ -84,23 +62,28 @@ export function HomeScreen() {
     planPending,
     refetch,
   } = useHomeData();
-  const { transcript, coachTyping, sendMessage, appendLocal } =
-    useHomeChat(userId);
-  // The ElevenLabs SDK hands us the real spoken transcript as the call happens (its own
-  // STT/TTS text, independent of our brain) — fold it into the same feed as typed
-  // messages so a conversation reads as one thread whether it was spoken or typed.
-  const { orbState, isActive, toggle } = useVoiceSession(
-    ({ role, text }) =>
-      appendLocal(role === "user" ? "user" : "assistant", text),
-    {
+  const { appendLocal } = useHomeChat(userId);
+  const activeSession = useActiveSessionContext();
+  const { orbState, isActive, toggle, setMessageHandler, setSessionConfig } = useSharedVoiceSession();
+  // Home only owns the shared voice conversation's message handler/config when no workout
+  // session is running — once one starts, ActiveSessionScreen claims it for the session's whole
+  // lifetime (including minimized) so the underlying connection never has two competing
+  // registrations, which is what used to force a manual re-tap after starting a session.
+  useEffect(() => {
+    if (activeSession.target || !isFocused) return;
+    // The ElevenLabs SDK hands us the real spoken transcript as the call happens (its own
+    // STT/TTS text, independent of our brain) — fold it into the same feed as typed
+    // messages so a conversation reads as one thread whether it was spoken or typed.
+    setMessageHandler(({ role, text }) => appendLocal(role === "user" ? "user" : "assistant", text));
+    setSessionConfig({
       userId,
       dynamicVariables: {
         user_name: userName ?? "there",
         user_id: userId ?? "",
         user_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       },
-    },
-  );
+    });
+  }, [activeSession.target, isFocused, userId, userName, appendLocal, setMessageHandler, setSessionConfig]);
 
   const protein = macros?.find((m) => m.key === "protein") ?? null;
 
@@ -112,14 +95,6 @@ export function HomeScreen() {
     if (wasVoiceActive.current && !isActive) refetch();
     wasVoiceActive.current = isActive;
   }, [isActive, refetch]);
-
-  // The design hides AppNav entirely while the conversation is open — the overlay
-  // owns the full screen below the status bar, tab bar included.
-  useEffect(() => {
-    navigation.setOptions({
-      tabBarStyle: chatOpen ? { display: "none" } : undefined,
-    });
-  }, [chatOpen, navigation]);
 
   // Picks up whatever changed off-screen — e.g. a workout just logged in Active Session —
   // whenever Home regains focus, not just after a voice session ends.
@@ -133,126 +108,85 @@ export function HomeScreen() {
   // the coach straight away — cleared right after so a later, unrelated focus doesn't reopen it.
   useEffect(() => {
     if (route.params?.openChat) {
-      setChatOpen(true);
+      navigation.navigate("GlobalChat", { initialMode: "keyboard" });
       navigation.setParams({ openChat: undefined } as never);
     }
   }, [route.params?.openChat, navigation]);
 
   const handleSend = () => {
-    const text = draftText;
     setDraftText("");
     Keyboard.dismiss();
-    setChatOpen(true);
-    sendMessage(text).then(refetch);
   };
 
-  const handleQuickPrompt = (phrase: string) => {
-    Keyboard.dismiss();
-    setChatOpen(true);
-    sendMessage(phrase).then(refetch);
+  const handleOpenHistoryEntry = (messageId: string) => {
+    navigation.navigate("GlobalChat", { initialMode: "keyboard", jumpToMessageId: messageId });
   };
 
+  // The orb's own label promises "tap to stop" once a call is live, so it has to actually end it
+  // — it used to navigate to Global Chat either way, which left a live conversation running with
+  // no way to stop it from here.
   const handleTalk = () => {
-    setChatOpen(true);
-    toggle();
-  };
-
-  const closeConversation = () => {
-    Keyboard.dismiss();
-    if (isActive) toggle();
-    setChatOpen(false);
+    if (isActive) {
+      toggle();
+      return;
+    }
+    navigation.navigate("GlobalChat", { initialMode: "mic" });
   };
 
   return (
     <SafeAreaView style={styles.screen} edges={["top"]}>
-      {!chatOpen && (
-        <>
-          <View style={styles.header}>
-            <View style={styles.brandGroup}>
-              <Pressable
-                style={styles.menuBtn}
-                onPress={() => setDrawerOpen(true)}
-                hitSlop={10}
-              >
-                <MenuIcon size={18} color={colors.muted} />
-              </Pressable>
-              <Text style={styles.brand}>MUSTLE</Text>
-            </View>
+      <View style={styles.header}>
+        <View style={styles.brandGroup}>
+          <Pressable
+            style={styles.menuBtn}
+            onPress={() => setDrawerOpen(true)}
+            hitSlop={10}
+          >
+            <MenuIcon size={18} color={colors.muted} />
+          </Pressable>
+          <Text style={styles.brand}>MUSTLE</Text>
+        </View>
 
-            <Pressable
-              style={styles.macroChip}
-              onPress={() => setNutritionOpen(true)}
-            >
-              {loading ? null : protein ? (
-                <>
-                  <Text style={styles.macroChipValue}>{protein.current}</Text>
-                  <Text style={styles.macroChipSep}>/</Text>
-                  <Text style={styles.macroChipGoal}>{protein.goal}g</Text>
-                  <Text style={styles.macroChipLabel}>Protein</Text>
-                </>
-              ) : (
-                <Text style={styles.macroChipLabel}>No targets yet</Text>
-              )}
-              <Text style={styles.macroChipArrow}>▾</Text>
-            </Pressable>
-          </View>
+        <Pressable
+          style={styles.macroChip}
+          onPress={() => setNutritionOpen(true)}
+        >
+          {loading ? null : protein ? (
+            <>
+              <Text style={styles.macroChipValue}>{protein.current}</Text>
+              <Text style={styles.macroChipSep}>/</Text>
+              <Text style={styles.macroChipGoal}>{protein.goal}g</Text>
+              <Text style={styles.macroChipLabel}>Protein</Text>
+            </>
+          ) : (
+            <Text style={styles.macroChipLabel}>No targets yet</Text>
+          )}
+          <Text style={styles.macroChipArrow}>▾</Text>
+        </Pressable>
+      </View>
 
-          <View style={styles.rule} />
-        </>
-      )}
+      <View style={styles.rule} />
 
       <KeyboardAvoidingView
         style={styles.flex}
         behavior={Platform.OS === "ios" ? "padding" : "height"}
       >
-        {chatOpen ? (
-          <Animated.View
-            style={styles.flex}
-            entering={FadeIn.duration(220)}
-            exiting={FadeOut.duration(150)}
-          >
-            <View style={styles.chatHeader}>
-              <View style={styles.chatHeaderState}>
-                {isActive && <AudioLinesIcon size={13} color={colors.accent} />}
-                <Text style={styles.chatHeaderLabel}>
-                  {isActive ? VOICE_PHASE_LABEL[orbState] : "Muscle"}
-                </Text>
-              </View>
-              {!isActive && (
-                <Pressable
-                  style={styles.chatCloseBtn}
-                  onPress={closeConversation}
-                  hitSlop={8}
-                >
-                  <XIcon size={16} color="rgba(255,255,255,0.5)" />
-                </Pressable>
-              )}
-            </View>
-            <View style={styles.flex}>
-              <VoiceAmbient state={orbState} active={isActive} />
-              <ChatTranscript
-                messages={transcript}
-                coachTyping={coachTyping}
-                voiceActive={isActive}
-                onStartDay={(planSessionId) =>
-                  navigation.navigate("PreWorkoutPreview", { planSessionId })
-                }
-                onModifyPlan={() => setDraftText("I'd like to change ")}
-              />
-            </View>
-          </Animated.View>
-        ) : (
-          <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+        <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
             <View style={styles.hero}>
               <FloatingParticles />
               <HeroGlow />
 
               <View style={styles.heroTop}>
-                <View style={styles.captionIconRow}>
+                <View
+                  style={[
+                    styles.captionIconRow,
+                    { shadowColor: timeBand === "Night" ? "#B4BEFF" : "#FBB43C" },
+                  ]}
+                >
                   {timeBand === "Night" ? (
-                    <MoonIcon size={18} color="rgba(180,190,255,0.85)" />
+                    <MoonIcon size={20} color="rgba(180,190,255,0.85)" />
                   ) : (
-                    <SunIcon size={18} color="rgba(251,180,60,0.85)" />
+                    <SunIcon size={20} color="rgba(251,180,60,0.85)" />
                   )}
                 </View>
                 <Text style={styles.captionGreeting}>
@@ -310,7 +244,9 @@ export function HomeScreen() {
                       <View style={styles.restLine}>
                         <View style={styles.restLineDot} />
                         <Text style={styles.restLineText}>
-                          Rest day — focus on recovery
+                          {todaySession.isRestDay
+                            ? "Rest day — you chose to skip today"
+                            : "Rest day — focus on recovery"}
                         </Text>
                       </View>
                     )}
@@ -336,10 +272,7 @@ export function HomeScreen() {
                   onPress={handleTalk}
                   hitSlop={16}
                 >
-                  <VoiceOrb state={orbState} size={120} />
-                  <View style={styles.orbMark} pointerEvents="none">
-                    <MMark size={26} color="rgba(255,255,255,0.92)" />
-                  </View>
+                  <VoiceOrb state={orbState} size={104} />
                 </Pressable>
                 <Text style={styles.orbHint}>
                   {isActive ? "tap to stop" : "tap to talk"}
@@ -347,23 +280,22 @@ export function HomeScreen() {
               </View>
             </View>
           </TouchableWithoutFeedback>
-        )}
-
-        {chatOpen && !isActive && <QuickPromptChips onPick={handleQuickPrompt} />}
 
         <ChatComposer
           value={draftText}
           onChangeText={setDraftText}
           onSend={handleSend}
-          onFocus={() => setChatOpen(true)}
+          onFocus={() => {
+            Keyboard.dismiss();
+            navigation.navigate("GlobalChat", { initialMode: "keyboard" });
+          }}
           focused={composerFocused}
           onFocusChange={setComposerFocused}
           onTalkTap={handleTalk}
-          talkActive={isActive && chatOpen}
-          onExitVoiceToKeyboard={toggle}
-          onCloseConversation={closeConversation}
         />
       </KeyboardAvoidingView>
+
+      <ActiveWorkoutBanner />
 
       <BottomSheet
         visible={nutritionOpen}
@@ -430,6 +362,7 @@ export function HomeScreen() {
           navigation.navigate("Calendar", { initialScope: "month" })
         }
         userId={userId}
+        onOpenHistoryEntry={handleOpenHistoryEntry}
       />
     </SafeAreaView>
   );
@@ -443,35 +376,6 @@ const styles = StyleSheet.create({
 
   flex: {
     flex: 1,
-  },
-
-  chatHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 16,
-    height: 48,
-  },
-  chatHeaderState: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-  },
-  chatHeaderLabel: {
-    fontFamily: fonts.bodyMedium,
-    fontSize: 12,
-    letterSpacing: 0.36,
-    color: "rgba(255,255,255,0.55)",
-  },
-  chatCloseBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: colors.surface,
-    borderWidth: 1,
-    borderColor: colors.border,
   },
 
   header: {
@@ -562,7 +466,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 32,
   },
 
-  captionIconRow: { marginBottom: 2 },
+  captionIconRow: {
+    marginBottom: 2,
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.35,
+    shadowRadius: 6,
+  },
 
   captionGreeting: {
     fontFamily: fonts.bodyMedium,
@@ -618,6 +527,7 @@ const styles = StyleSheet.create({
     fontFamily: fonts.bodySemiBold,
     fontSize: 12,
     color: colors.text,
+    textTransform: "uppercase",
   },
   slimSessionTime: {
     fontFamily: fonts.body,
@@ -671,11 +581,6 @@ const styles = StyleSheet.create({
     marginBottom: "auto",
   },
   orbBtn: { alignItems: "center", justifyContent: "center" },
-  orbMark: {
-    ...StyleSheet.absoluteFillObject,
-    alignItems: "center",
-    justifyContent: "center",
-  },
   orbHint: {
     fontFamily: fonts.bodyMedium,
     fontSize: 10,

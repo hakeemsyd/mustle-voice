@@ -10,6 +10,7 @@ import { useAppFonts } from './src/theme/useAppFonts';
 import { RootStack } from './src/navigation/RootStack';
 import { navigationRef } from './src/navigation/navigationRef';
 import { ActiveSessionProvider } from './src/session/ActiveSessionContext';
+import { VoiceSessionProvider } from './src/session/VoiceSessionProvider';
 import { AppActionBridge } from './src/session/AppActionBridge';
 import { OnboardingFlow } from './src/onboarding/OnboardingFlow';
 import { ScreenSetNewPassword } from './src/onboarding/screens/ScreenSetNewPassword';
@@ -167,8 +168,10 @@ const App = () => {
           <ConversationProvider agentId={AGENT_ID}>
             <NavigationContainer ref={navigationRef} theme={navTheme}>
               <ActiveSessionProvider>
-                <AppActionBridge userId={userId} />
-                <RootStack />
+                <VoiceSessionProvider>
+                  <AppActionBridge userId={userId} />
+                  <RootStack />
+                </VoiceSessionProvider>
               </ActiveSessionProvider>
             </NavigationContainer>
           </ConversationProvider>

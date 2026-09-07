@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useProfileName } from "../hooks/useProfileName";
 import { useMessageHistory, type HistoryTag } from "../hooks/useMessageHistory";
@@ -10,10 +10,14 @@ import {
   HeartPulseIcon,
   MessageCircleDashedIcon,
   MessageCircleIcon,
+  PersonStandingIcon,
   SearchIcon,
   UtensilsIcon,
   XIcon,
 } from "../icons";
+import { useWeekCalendar, startOfWeek } from "../hooks/useCalendarData";
+import { titleCase } from "../lib/textFormat";
+import { supabase } from "../lib/supabase";
 
 type Section = "history" | "calendar" | "profile";
 
@@ -23,12 +27,16 @@ interface AppDrawerProps {
   onOpenSettings: () => void;
   onOpenCalendar: () => void;
   userId: string | null;
+  /** Jumps back into the chat transcript at a specific message — passed through from Home,
+   *  which owns the transcript this drawer's History entries point into. */
+  onOpenHistoryEntry?: (messageId: string) => void;
 }
 
 const TAG_ICON: Record<HistoryTag, typeof UtensilsIcon> = {
   meal: UtensilsIcon,
   workout: DumbbellIcon,
   recovery: HeartPulseIcon,
+  profile: PersonStandingIcon,
   general: MessageCircleIcon,
 };
 
@@ -36,18 +44,45 @@ const TAG_LABEL: Record<HistoryTag, string> = {
   meal: "Meal",
   workout: "Workout",
   recovery: "Recovery",
+  profile: "Profile",
   general: "General",
 };
 
-const TAGS: HistoryTag[] = ["meal", "workout", "recovery", "general"];
+const TAGS: HistoryTag[] = ["meal", "workout", "recovery", "profile", "general"];
 
-export function AppDrawer({ visible, onClose, onOpenSettings, onOpenCalendar, userId }: AppDrawerProps) {
+const WEEK_STATUS_COLOR: Record<string, string> = {
+  completed: colors.accent,
+  partial: "#FBBF24",
+  missed: colors.danger,
+  upcoming: colors.border,
+  rest: colors.borderSubtle,
+};
+
+export function AppDrawer({ visible, onClose, onOpenSettings, onOpenCalendar, userId, onOpenHistoryEntry }: AppDrawerProps) {
   const [section, setSection] = useState<Section>("history");
   const [search, setSearch] = useState("");
   const [activeTag, setActiveTag] = useState<HistoryTag | null>(null);
   const userName = useProfileName(userId);
   const { loading: historyLoading, groups } = useMessageHistory();
   const insets = useScreenInsets();
+  const week = useWeekCalendar(startOfWeek(new Date()));
+  const [injuries, setInjuries] = useState<{ area: string; severity: string | null }[]>([]);
+
+  useEffect(() => {
+    if (!userId) return;
+    let cancelled = false;
+    supabase
+      .from("injury")
+      .select("area, severity")
+      .eq("user_id", userId)
+      .eq("status", "active")
+      .then(({ data }) => {
+        if (!cancelled) setInjuries(data ?? []);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [userId, visible]);
 
   const filteredGroups = useMemo(() => {
     return groups
@@ -129,13 +164,21 @@ export function AppDrawer({ visible, onClose, onOpenSettings, onOpenCalendar, us
                   {group.entries.map((entry) => {
                     const Icon = TAG_ICON[entry.tag];
                     return (
-                      <View key={entry.id} style={styles.entry}>
+                      <Pressable
+                        key={entry.id}
+                        style={styles.entry}
+                        onPress={() => {
+                          if (!onOpenHistoryEntry) return;
+                          onClose();
+                          onOpenHistoryEntry(entry.id);
+                        }}
+                      >
                         <Text style={styles.entryTitle}>{entry.title}</Text>
                         <View style={styles.entryTagRow}>
                           <Icon size={11} color={colors.muted} />
                           <Text style={styles.entryTag}>{TAG_LABEL[entry.tag]}</Text>
                         </View>
-                      </View>
+                      </Pressable>
                     );
                   })}
                 </View>
@@ -144,6 +187,23 @@ export function AppDrawer({ visible, onClose, onOpenSettings, onOpenCalendar, us
           </View>
         ) : section === "calendar" ? (
           <View style={styles.calendarContent}>
+            <Text style={styles.groupLabel}>THIS WEEK</Text>
+            <Pressable
+              style={styles.weekStrip}
+              onPress={() => {
+                onClose();
+                onOpenCalendar();
+              }}
+            >
+              {week.days.map((day) => (
+                <View key={day.dateKey} style={styles.weekDay}>
+                  <Text style={styles.weekDayLabel}>{day.weekdayLabel}</Text>
+                  <View
+                    style={[styles.weekDayDot, { backgroundColor: WEEK_STATUS_COLOR[day.status] ?? colors.border }]}
+                  />
+                </View>
+              ))}
+            </Pressable>
             <Pressable
               style={styles.settingsRow}
               onPress={() => {
@@ -166,6 +226,19 @@ export function AppDrawer({ visible, onClose, onOpenSettings, onOpenCalendar, us
                 <Text style={styles.profileSub}>Coached by MUSTLE</Text>
               </View>
             </View>
+
+            <Text style={styles.groupLabel}>INJURIES & LIMITATIONS</Text>
+            {injuries.length === 0 ? (
+              <Text style={styles.injuryEmpty}>None reported</Text>
+            ) : (
+              injuries.map((injury, i) => (
+                <View key={`${injury.area}-${i}`} style={styles.injuryRow}>
+                  <Text style={styles.injuryArea}>{titleCase(injury.area)}</Text>
+                  {!!injury.severity && <Text style={styles.injurySeverity}>{titleCase(injury.severity)}</Text>}
+                </View>
+              ))
+            )}
+
             <Pressable
               style={styles.settingsRow}
               onPress={() => {
@@ -260,9 +333,39 @@ const styles = StyleSheet.create({
   emptyTitle: { fontFamily: fonts.bodySemiBold, fontSize: 14, color: colors.text },
   emptySub: { fontFamily: fonts.body, fontSize: 12, color: colors.muted, textAlign: "center" },
 
-  calendarContent: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 32 },
+  calendarContent: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 32, gap: 4 },
+  weekStrip: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    paddingVertical: 12,
+    marginBottom: 8,
+  },
+  weekDay: { alignItems: "center", gap: 6 },
+  weekDayLabel: {
+    fontFamily: fonts.monoBold,
+    fontSize: 9,
+    letterSpacing: 0.6,
+    color: colors.muted,
+  },
+  weekDayDot: { width: 8, height: 8, borderRadius: 4 },
 
   profileBody: { paddingHorizontal: 16, paddingTop: 16 },
+  injuryEmpty: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: colors.muted,
+    paddingBottom: 8,
+  },
+  injuryRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.borderSubtle,
+  },
+  injuryArea: { fontFamily: fonts.bodyMedium, fontSize: 13, color: colors.text },
+  injurySeverity: { fontFamily: fonts.body, fontSize: 12, color: colors.muted },
   profileHeader: {
     flexDirection: "row",
     alignItems: "center",

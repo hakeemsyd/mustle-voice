@@ -11,6 +11,7 @@ import { ProgressDots } from "../ProgressDots";
 import { WheelPicker } from "../../components/WheelPicker";
 import { fonts, colors } from "../../constants/theme";
 import { BackIcon } from "../../icons/BackIcon";
+import { useScreenInsets } from "../../hooks/useScreenInsets";
 
 type Units = "metric" | "imperial";
 
@@ -73,8 +74,10 @@ export const ScreenBiometrics = ({ onNext, onBack }: ScreenBiometricsProps) => {
     onNext(height, weight, units);
   };
 
+  const insets = useScreenInsets();
+
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, { paddingTop: insets.top + 8 }]}>
       <View style={styles.topBar}>
         <TouchableOpacity
           style={styles.topBarSpacer}
@@ -209,7 +212,7 @@ export const ScreenBiometrics = ({ onNext, onBack }: ScreenBiometricsProps) => {
         </View>
       </View>
 
-      <View style={styles.cta}>
+      <View style={[styles.cta, { paddingBottom: Math.max(insets.bottom + 12, 24) }]}>
         <TouchableOpacity
           style={styles.ctaBtn}
           activeOpacity={0.85}
@@ -226,7 +229,6 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.bg,
-    paddingTop: 60,
   },
   topBar: {
     flexDirection: "row",
@@ -327,7 +329,6 @@ const styles = StyleSheet.create({
   },
   cta: {
     paddingHorizontal: 24,
-    paddingBottom: 32,
   },
   ctaBtn: {
     backgroundColor: colors.accent,

@@ -12,7 +12,7 @@ interface NextSetInfo {
 interface RestTimerPanelProps {
   /** Live seconds remaining, ticking off the shared wall-clock end time in
    *  ActiveSessionContext — see useRestRemaining. Not owned locally, so the
-   *  minimized MiniSessionBar pill can show the exact same number. */
+   *  minimized ActiveWorkoutBanner can show the exact same number. */
   remaining: number;
   /** The original full duration, for the progress bar's 100% mark. */
   targetSec: number;
@@ -21,6 +21,10 @@ interface RestTimerPanelProps {
   onTogglePause: () => void;
   nextSet: NextSetInfo;
   onContinue: () => void;
+  /** Why the target auto-adapted (short of target reps, cleared it easily, later-set fatigue)
+   *  — shown so an adjusted rest target never looks like it silently changed for no reason.
+   *  Null/omitted when it's just the plain default. */
+  reasonLabel?: string | null;
 }
 
 function formatTime(sec: number) {
@@ -44,6 +48,7 @@ export function RestTimerPanel({
   onTogglePause,
   nextSet,
   onContinue,
+  reasonLabel,
 }: RestTimerPanelProps) {
   const pct = targetSec > 0 ? Math.min(100, Math.max(0, ((targetSec - remaining) / targetSec) * 100)) : 0;
 
@@ -67,6 +72,8 @@ export function RestTimerPanel({
       <View style={styles.track}>
         <View style={[styles.trackFill, { width: `${pct}%` }]} />
       </View>
+
+      {!!reasonLabel && <Text style={styles.reasonLabel}>{reasonLabel}</Text>}
 
       <View style={styles.nextRow}>
         <View style={styles.nextInfo}>
@@ -158,6 +165,11 @@ const styles = StyleSheet.create({
   trackFill: {
     height: "100%",
     backgroundColor: colors.accent,
+  },
+  reasonLabel: {
+    fontFamily: fonts.body,
+    fontSize: 11,
+    color: colors.muted,
   },
   nextRow: {
     flexDirection: "row",

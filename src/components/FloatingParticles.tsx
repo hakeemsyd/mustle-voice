@@ -10,7 +10,14 @@ import Animated, {
 } from 'react-native-reanimated';
 import { colors } from '../constants/theme';
 
-const PARTICLES = [
+export interface ParticleConfig {
+  left: DimensionValue;
+  size: number;
+  duration: number;
+  delay: number;
+}
+
+const DEFAULT_PARTICLES: ParticleConfig[] = [
   { left: '14%', size: 2, duration: 3500, delay: 0 },
   { left: '27%', size: 3, duration: 4200, delay: 800 },
   { left: '41%', size: 2, duration: 3800, delay: 1500 },
@@ -19,7 +26,7 @@ const PARTICLES = [
   { left: '79%', size: 3, duration: 4000, delay: 600 },
   { left: '22%', size: 4, duration: 3600, delay: 2000 },
   { left: '73%', size: 2, duration: 4800, delay: 1800 },
-] as const;
+];
 
 function Particle({
   left,
@@ -54,10 +61,10 @@ function Particle({
   );
 }
 
-export function FloatingParticles() {
+export function FloatingParticles({ particles = DEFAULT_PARTICLES }: { particles?: ParticleConfig[] }) {
   return (
     <View style={StyleSheet.absoluteFill} pointerEvents="none">
-      {PARTICLES.map((p, i) => (
+      {particles.map((p, i) => (
         <Particle key={i} left={p.left} size={p.size} duration={p.duration} delay={p.delay} />
       ))}
     </View>

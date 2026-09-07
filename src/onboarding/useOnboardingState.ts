@@ -48,6 +48,16 @@ export const useOnboardingState = () => {
   const [screenIndex, setScreenIndex] = useState(0);
   const [ready, setReady] = useState(false);
   const loadedRef = useRef(false);
+  // Set only by editStep (Summary jumping into a step to edit it) — goNext reads and clears it,
+  // so the very next "Continue" tap after an edit returns to Summary instead of falling through
+  // to whatever screen normally comes after this one in the linear flow. Confirmed live: tapping
+  // a Summary row, editing, and hitting Continue landed on the NEXT onboarding step, not back at
+  // Summary — every screen's onNext just calls this same shared goNext with no way to know it
+  // was reached out of sequence. A ref, not state: it's read-and-cleared synchronously inside
+  // goNext's own updater, never rendered, and never needs to survive an app relaunch — resuming
+  // a killed-mid-edit session at the next linear step instead of back at Summary is an acceptable
+  // edge case, not worth widening the persisted draft shape for.
+  const editReturnIndexRef = useRef<number | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -79,9 +89,38 @@ export const useOnboardingState = () => {
     setState((prev) => ({ ...prev, ...partial }));
   }, []);
 
-  const goTo = useCallback((index: number) => setScreenIndex(index), []);
-  const goNext = useCallback(() => setScreenIndex((i) => i + 1), []);
-  const goBack = useCallback(() => setScreenIndex((i) => Math.max(0, i - 1)), []);
+  // Any plain jump invalidates a pending edit-return — otherwise bailing out of an edit via the
+  // header back button (rather than Continue) leaves a stale return target that could later fire
+  // on some unrelated goNext call, long after the user gave up on that edit.
+  const goTo = useCallback((index: number) => {
+    editReturnIndexRef.current = null;
+    setScreenIndex(index);
+  }, []);
+
+  // Summary jumping into a step to edit it — records where to come back to. The only way this
+  // ref gets set; every other navigation function clears it.
+  const editStep = useCallback((targetIndex: number) => {
+    setScreenIndex((current) => {
+      editReturnIndexRef.current = current;
+      return targetIndex;
+    });
+  }, []);
+
+  const goNext = useCallback(() => {
+    setScreenIndex((i) => {
+      const returnTo = editReturnIndexRef.current;
+      if (returnTo !== null) {
+        editReturnIndexRef.current = null;
+        return returnTo;
+      }
+      return i + 1;
+    });
+  }, []);
+
+  const goBack = useCallback(() => {
+    editReturnIndexRef.current = null;
+    setScreenIndex((i) => Math.max(0, i - 1));
+  }, []);
 
   const complete = useCallback(() => {
     setState((prev) => ({ ...prev, completedAt: new Date().toISOString() }));
@@ -93,5 +132,5 @@ export const useOnboardingState = () => {
     );
   }, []);
 
-  return { state, screenIndex, ready, update, goTo, goNext, goBack, complete, clearDraft };
+  return { state, screenIndex, ready, update, goTo, editStep, goNext, goBack, complete, clearDraft };
 };

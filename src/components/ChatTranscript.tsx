@@ -1,5 +1,5 @@
-import React, { useEffect, useRef } from "react";
-import { ScrollView, StyleSheet, Text, View } from "react-native";
+import React, { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { Image, Keyboard, ScrollView, StyleSheet, Text, View } from "react-native";
 import { colors, fonts } from "../constants/theme";
 import type { ChatMessage } from "../hooks/useHomeChat";
 import { MMark } from "../icons/MMark";
@@ -9,146 +9,211 @@ import { NutritionSummaryCard } from "./NutritionSummaryCard";
 import { ProgressReportCard } from "./ProgressReportCard";
 import { ReadinessCard } from "./ReadinessCard";
 import { TopLiftsCard } from "./TopLiftsCard";
+import { PreviousWorkoutCard } from "./PreviousWorkoutCard";
 import { CoachMessageText } from "./CoachMessageText";
 
 interface ChatTranscriptProps {
   messages: ChatMessage[];
   coachTyping: boolean;
-  /** Softens the user bubble's neon tint while a voice call is live — the
-   *  accent-dim reads too intense against the ambient wash behind it. */
-  voiceActive?: boolean;
   onStartDay?: (planSessionId: string) => void;
   onModifyPlan?: () => void;
+  onOpenPreview?: (planSessionId: string) => void;
+  /** Which treatment the structured cards use. The thread itself is always the dark surface;
+   *  this only picks how the cards inside it are toned, and they default to the light (white
+   *  card on dark thread) treatment the design uses. */
+  cardVariant?: "dark" | "light";
 }
 
-export const ChatTranscript = ({
-  messages,
-  coachTyping,
-  voiceActive = false,
-  onStartDay,
-  onModifyPlan,
-}: ChatTranscriptProps) => {
-  const scrollRef = useRef<ScrollView>(null);
+export interface ChatTranscriptHandle {
+  /** Scrolls to a specific message (a History-entry tap, e.g.) and briefly highlights it. A
+   *  no-op if the message isn't currently laid out (not yet loaded into `messages`) — the
+   *  caller is responsible for loading it first (see useHomeChat's loadMessageContext). */
+  scrollToMessageId: (id: string) => void;
+}
 
-  useEffect(() => {
-    const timer = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 80);
-    return () => clearTimeout(timer);
-  }, [messages.length, coachTyping]);
+export const ChatTranscript = forwardRef<ChatTranscriptHandle, ChatTranscriptProps>(
+  ({ messages, coachTyping, onStartDay, onModifyPlan, onOpenPreview, cardVariant = "light" }, ref) => {
+    const scrollRef = useRef<ScrollView>(null);
+    const offsetsRef = useRef<Record<string, number>>({});
+    const [highlightId, setHighlightId] = useState<string | null>(null);
 
-  return (
-    <ScrollView
-      ref={scrollRef}
-      style={styles.stage}
-      contentContainerStyle={styles.content}
-      keyboardShouldPersistTaps="handled"
-      keyboardDismissMode="on-drag"
-    >
-      {messages.map((m) =>
-        m.role === "user" ? (
-          <View key={m.id} style={[styles.bubbleUser, voiceActive && styles.bubbleUserVoice]}>
-            <Text style={styles.bubbleText}>{m.text}</Text>
-          </View>
-        ) : (
-          <React.Fragment key={m.id}>
-            <View style={styles.coachMsg}>
-              <View style={styles.coachMsgAvatar}>
-                <MMark size={11} color={colors.accent} />
-              </View>
-              <View style={styles.coachMsgBody}>
-                <CoachMessageText text={m.text} style={styles.coachMsgText} />
-                {m.card?.type === "plan_breakdown" && onStartDay && onModifyPlan && (
-                  <PlanBreakdownCard card={m.card} onStartDay={onStartDay} onModify={onModifyPlan} />
-                )}
-              </View>
+    useEffect(() => {
+      const timer = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 80);
+      return () => clearTimeout(timer);
+    }, [messages.length, coachTyping]);
+
+    // Opening the keyboard shrinks this scroll view's own visible height (KeyboardAvoidingView
+    // pads the screen below it) without changing `messages` at all, so the effect above never
+    // re-fires — the last message, previously sitting flush with the old, taller viewport's
+    // bottom, was left behind the keyboard.
+    //
+    // `keyboardWillShow` alone wasn't enough: it fires the instant the keyboard *starts* rising,
+    // before KeyboardAvoidingView's own padding animation has actually shrunk this ScrollView's
+    // layout — so `scrollToEnd()` at that point still measures the OLD, taller height and lands
+    // short. `keyboardDidShow` fires once the keyboard (and that resize) has actually finished,
+    // so it's the one that lands on the真 correct offset; `keyboardWillShow` is kept alongside it
+    // purely so the scroll starts moving immediately instead of visibly waiting for the keyboard
+    // to finish first.
+    useEffect(() => {
+      const scrollToEnd = () => scrollRef.current?.scrollToEnd({ animated: true });
+      const willShow = Keyboard.addListener("keyboardWillShow", scrollToEnd);
+      const didShow = Keyboard.addListener("keyboardDidShow", scrollToEnd);
+      return () => {
+        willShow.remove();
+        didShow.remove();
+      };
+    }, []);
+
+    useImperativeHandle(ref, () => ({
+      scrollToMessageId: (id: string) => {
+        const offset = offsetsRef.current[id];
+        if (offset === undefined) return;
+        scrollRef.current?.scrollTo({ y: Math.max(0, offset - 24), animated: true });
+        setHighlightId(id);
+        setTimeout(() => setHighlightId((current) => (current === id ? null : current)), 1500);
+      },
+    }));
+
+    return (
+      <ScrollView
+        ref={scrollRef}
+        style={styles.stage}
+        contentContainerStyle={styles.content}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+      >
+        {messages.map((m) =>
+          m.role === "user" ? (
+            <View
+              key={m.id}
+              onLayout={(e) => {
+                offsetsRef.current[m.id] = e.nativeEvent.layout.y;
+              }}
+              style={[
+                m.imageUrl ? styles.userImageRow : styles.userRow,
+                highlightId === m.id && styles.rowHighlight,
+              ]}
+            >
+              {m.imageUrl ? (
+                <Image source={{ uri: m.imageUrl }} style={styles.userImage} resizeMode="cover" />
+              ) : (
+                <Text style={styles.userText}>{m.text}</Text>
+              )}
             </View>
-            {m.card?.type === "daily_workout" && onStartDay && (
-              <DailyWorkoutCard card={m.card} onStartSession={onStartDay} />
-            )}
-            {m.card?.type === "nutrition_summary" && <NutritionSummaryCard card={m.card} />}
-            {m.card?.type === "progress_report" && <ProgressReportCard card={m.card} />}
-            {m.card?.type === "readiness" && <ReadinessCard card={m.card} />}
-            {m.card?.type === "top_lifts" && <TopLiftsCard card={m.card} />}
-          </React.Fragment>
-        ),
-      )}
+          ) : (
+            <React.Fragment key={m.id}>
+              <View
+                onLayout={(e) => {
+                  offsetsRef.current[m.id] = e.nativeEvent.layout.y;
+                }}
+                style={[styles.coachMsg, highlightId === m.id && styles.rowHighlight]}
+              >
+                <View style={styles.coachMsgAvatar}>
+                  <MMark size={10.8} color={colors.accentOn} />
+                </View>
+                <View style={styles.coachMsgBody}>
+                  <CoachMessageText text={m.text} style={styles.coachMsgText} variant="plain" />
+                  {m.card?.type === "plan_breakdown" && onStartDay && onModifyPlan && (
+                    <PlanBreakdownCard
+                      card={m.card}
+                      onStartDay={onStartDay}
+                      onModify={onModifyPlan}
+                      onOpenPreview={onOpenPreview}
+                      variant={cardVariant}
+                    />
+                  )}
+                </View>
+              </View>
+              {m.card?.type === "daily_workout" && onStartDay && (
+                <DailyWorkoutCard card={m.card} onStartSession={onStartDay} variant={cardVariant} />
+              )}
+              {m.card?.type === "nutrition_summary" && <NutritionSummaryCard card={m.card} variant={cardVariant} />}
+              {m.card?.type === "progress_report" && <ProgressReportCard card={m.card} variant={cardVariant} />}
+              {m.card?.type === "readiness" && <ReadinessCard card={m.card} variant={cardVariant} />}
+              {m.card?.type === "top_lifts" && <TopLiftsCard card={m.card} variant={cardVariant} />}
+              {m.card?.type === "previous_workout" && <PreviousWorkoutCard card={m.card} />}
+            </React.Fragment>
+          ),
+        )}
 
-      {coachTyping && (
-        <View style={styles.coachMsg}>
-          <View style={styles.coachMsgAvatar}>
-            <MMark size={11} color={colors.accent} />
+        {coachTyping && (
+          <View style={styles.coachMsg}>
+            <View style={styles.coachMsgAvatar}>
+              <MMark size={10.8} color={colors.accentOn} />
+            </View>
+            <Text style={styles.coachMsgTyping}>···</Text>
           </View>
-          <Text style={styles.coachMsgTyping}>···</Text>
-        </View>
-      )}
-    </ScrollView>
-  );
-};
+        )}
+      </ScrollView>
+    );
+  },
+);
 
 const styles = StyleSheet.create({
   stage: {
     flex: 1,
   },
   content: {
-    paddingHorizontal: 16,
-    paddingTop: 8,
-    paddingBottom: 44,
-    gap: 20,
+    paddingHorizontal: 20,
+    paddingTop: 16,
+    paddingBottom: 52,
+    gap: 16,
   },
-  bubbleUser: {
-    maxWidth: "82%",
+  // No bubbles anywhere — a hard brand rule. A user turn is distinguished from a coach turn by
+  // alignment and colour weight only, never by a container.
+  userRow: {
+    maxWidth: "84%",
     alignSelf: "flex-end",
-    paddingVertical: 10,
-    paddingHorizontal: 13,
-    borderRadius: 16,
-    borderBottomRightRadius: 4,
-    backgroundColor: colors.accentDim,
-    borderWidth: 1,
-    borderColor: colors.accentBorder,
   },
-  bubbleUserVoice: {
-    backgroundColor: "rgba(190,235,170,0.12)",
-    borderColor: "rgba(190,235,170,0.3)",
-  },
-  bubbleText: {
+  userText: {
     fontFamily: fonts.body,
-    fontSize: 17,
-    lineHeight: 27,
-    letterSpacing: -0.09,
-    color: colors.text,
+    fontSize: 16,
+    lineHeight: 24,
+    textAlign: "right",
+    color: colors.muted,
+  },
+  userImageRow: {
+    maxWidth: "60%",
+    alignSelf: "flex-end",
+  },
+  userImage: {
+    width: "100%",
+    height: 220,
+    borderRadius: 14,
+  },
+  rowHighlight: {
+    backgroundColor: "rgba(200,241,53,0.1)",
+    borderRadius: 12,
   },
   coachMsg: {
     flexDirection: "row",
     alignItems: "flex-start",
     alignSelf: "stretch",
-    gap: 10,
-    paddingHorizontal: 2,
-    paddingVertical: 2,
+    gap: 8,
   },
   coachMsgAvatar: {
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    marginTop: 2,
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    marginTop: 1,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: colors.surfaceDeep,
-    borderWidth: 1,
-    borderColor: colors.accentBorder,
+    backgroundColor: colors.accent,
   },
   coachMsgBody: {
     flex: 1,
+    minWidth: 0,
     gap: 4,
   },
   coachMsgText: {
     fontFamily: fonts.body,
-    fontSize: 17,
-    lineHeight: 27,
-    letterSpacing: -0.09,
-    color: "rgba(255,255,255,0.92)",
+    fontSize: 16,
+    lineHeight: 24,
+    color: colors.text,
   },
   coachMsgTyping: {
     fontFamily: fonts.body,
-    fontSize: 17,
+    fontSize: 16,
     color: "rgba(255,255,255,0.4)",
   },
 });

@@ -1,11 +1,12 @@
 import { StyleSheet, Text, View } from "react-native";
-import { colors, fonts } from "../constants/theme";
+import { colors, fonts, lightCard } from "../constants/theme";
 import { UtensilsIcon } from "../icons";
 import { ProgressRing } from "./ProgressRing";
 import type { NutritionSummaryCard as NutritionSummaryCardData } from "../lib/brain";
 
 interface NutritionSummaryCardProps {
   card: NutritionSummaryCardData;
+  variant?: "dark" | "light";
 }
 
 const MACRO_COLORS: Record<string, string> = {
@@ -14,63 +15,157 @@ const MACRO_COLORS: Record<string, string> = {
   Fat: colors.chartFat,
 };
 
-export function NutritionSummaryCard({ card }: NutritionSummaryCardProps) {
-  // The ring fill represents progress made (calories consumed), not what's left —
-  // an empty ring at the start of the day and a filling ring as meals are logged.
+const LIGHT_BAR_COLORS: Record<string, string> = {
+  Calories: "rgba(10,10,10,0.75)",
+  Protein: "#8fac00",
+  Carbs: "#3b82f6",
+  Fat: "#f97316",
+};
+
+function buildNote(proteinPct: number): string {
+  if (proteinPct >= 100) return "Protein target hit for today — nice work staying on pace.";
+  if (proteinPct >= 70) return "You're on pace for your protein target — keep this going through your next meal.";
+  return "Still some room on protein today — a meal with lean protein would close the gap fast.";
+}
+
+function MacroBarRow({
+  label,
+  value,
+  goal,
+  unit,
+  color,
+}: {
+  label: string;
+  value: number;
+  goal: number;
+  unit: string;
+  color: string;
+}) {
+  const pct = Math.min(100, Math.round((value / Math.max(1, goal)) * 100));
+  return (
+    <View style={barStyles.row}>
+      <View style={barStyles.top}>
+        <Text style={barStyles.label}>{label}</Text>
+        <Text style={barStyles.values}>
+          {value.toLocaleString()}
+          <Text style={barStyles.sep}> / </Text>
+          {goal.toLocaleString()}
+          {unit}
+        </Text>
+      </View>
+      <View style={barStyles.track}>
+        <View style={[barStyles.fill, { width: `${pct}%`, backgroundColor: color }]} />
+      </View>
+    </View>
+  );
+}
+
+export function NutritionSummaryCard({ card, variant = "dark" }: NutritionSummaryCardProps) {
+  const isLight = variant === "light";
+
   const consumed = card.calories_target - card.calories_left;
   const progress =
     card.calories_target > 0
       ? Math.max(0, Math.min(1, consumed / card.calories_target))
       : 0;
 
+  const protein = card.macros.find((m) => m.label === "Protein");
+  const carbs = card.macros.find((m) => m.label === "Carbs");
+  const fat = card.macros.find((m) => m.label === "Fat");
+  const proteinConsumed = protein ? Math.round(protein.target * progress) : 0;
+  const carbsConsumed = carbs ? Math.round(carbs.target * progress) : 0;
+  const fatConsumed = fat ? Math.round(fat.target * progress) : 0;
+  const proteinPct = protein && protein.target > 0 ? Math.round((proteinConsumed / protein.target) * 100) : 0;
+
   return (
-    <View style={styles.card}>
+    <View style={[styles.card, isLight && styles.cardLight]}>
       <View style={styles.header}>
-        <View style={styles.headerIcon}>
-          <UtensilsIcon size={18} color={colors.accent} />
+        <View style={[styles.headerIcon, isLight && styles.headerIconLight]}>
+          <UtensilsIcon size={18} color={isLight ? colors.accentOn : colors.accent} />
         </View>
         <View style={styles.headerText}>
-          <Text style={styles.title}>TODAY'S FUEL</Text>
-          <Text style={styles.subtitle}>
+          <Text style={[styles.title, isLight && styles.titleLight]}>TODAY'S FUEL</Text>
+          <Text style={[styles.subtitle, isLight && styles.subtitleLight]}>
             Macro summary · Personalized by MUSTLE
           </Text>
         </View>
       </View>
 
-      <View style={styles.ringWrap}>
-        <ProgressRing
-          size={168}
-          strokeWidth={14}
-          progress={progress}
-          color={colors.accent}
-        >
-          <Text style={styles.ringValue}>{card.calories_left}</Text>
-          <Text style={styles.ringLabel}>CAL LEFT</Text>
-        </ProgressRing>
-      </View>
-
-      <View style={styles.macrosRow}>
-        {card.macros.map((m) => (
-          <View key={m.label} style={styles.macroCol}>
-            <View
-              style={[
-                styles.macroDot,
-                { backgroundColor: MACRO_COLORS[m.label] ?? colors.muted },
-              ]}
-            />
-            <Text style={styles.macroValue}>
-              {m.target}
-              {m.unit}
-            </Text>
-            <Text style={styles.macroLabel}>{m.label}</Text>
-          </View>
-        ))}
-      </View>
-
-      {!!card.insight && (
-        <View style={styles.insightRow}>
-          <Text style={styles.insightText}>{card.insight}</Text>
+      {isLight ? (
+        <View style={barStyles.bars}>
+          <MacroBarRow
+            label="Calories"
+            value={consumed}
+            goal={card.calories_target}
+            unit=" kcal"
+            color={LIGHT_BAR_COLORS.Calories}
+          />
+          <MacroBarRow
+            label="Protein"
+            value={proteinConsumed}
+            goal={protein?.target ?? 0}
+            unit="g"
+            color={LIGHT_BAR_COLORS.Protein}
+          />
+          <MacroBarRow
+            label="Carbs"
+            value={carbsConsumed}
+            goal={carbs?.target ?? 0}
+            unit="g"
+            color={LIGHT_BAR_COLORS.Carbs}
+          />
+          <MacroBarRow
+            label="Fat"
+            value={fatConsumed}
+            goal={fat?.target ?? 0}
+            unit="g"
+            color={LIGHT_BAR_COLORS.Fat}
+          />
         </View>
+      ) : (
+        <>
+          <View style={styles.ringWrap}>
+            <ProgressRing
+              size={168}
+              strokeWidth={14}
+              progress={progress}
+              color={colors.accent}
+            >
+              <Text style={styles.ringValue}>{card.calories_left}</Text>
+              <Text style={styles.ringLabel}>CAL LEFT</Text>
+            </ProgressRing>
+          </View>
+
+          <View style={styles.macrosRow}>
+            {card.macros.map((m) => (
+              <View key={m.label} style={styles.macroCol}>
+                <View
+                  style={[
+                    styles.macroDot,
+                    { backgroundColor: MACRO_COLORS[m.label] ?? colors.muted },
+                  ]}
+                />
+                <Text style={styles.macroValue}>
+                  {m.target}
+                  {m.unit}
+                </Text>
+                <Text style={styles.macroLabel}>{m.label}</Text>
+              </View>
+            ))}
+          </View>
+        </>
+      )}
+
+      {isLight ? (
+        <View style={[styles.insightRow, styles.insightRowLight]}>
+          <Text style={[styles.insightText, styles.insightTextLight]}>{buildNote(proteinPct)}</Text>
+        </View>
+      ) : (
+        !!card.insight && (
+          <View style={styles.insightRow}>
+            <Text style={styles.insightText}>{card.insight}</Text>
+          </View>
+        )
       )}
     </View>
   );
@@ -85,6 +180,10 @@ const styles = StyleSheet.create({
     padding: 16,
     gap: 16,
     marginTop: 6,
+  },
+  cardLight: {
+    backgroundColor: lightCard.bg,
+    borderColor: lightCard.border,
   },
   header: {
     flexDirection: "row",
@@ -101,6 +200,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.accentBorder,
   },
+  headerIconLight: {
+    backgroundColor: colors.accent,
+    borderColor: colors.accent,
+  },
   headerText: {
     flex: 1,
   },
@@ -110,22 +213,35 @@ const styles = StyleSheet.create({
     letterSpacing: 0.2,
     color: colors.text,
   },
+  titleLight: {
+    color: lightCard.text,
+  },
   subtitle: {
     fontFamily: fonts.body,
     fontSize: 12,
     color: colors.muted,
     marginTop: 2,
   },
+  subtitleLight: {
+    color: lightCard.muted,
+  },
   insightRow: {
     borderTopWidth: 1,
     borderTopColor: "rgba(255,255,255,0.08)",
     paddingTop: 14,
+  },
+  insightRowLight: {
+    borderTopColor: lightCard.dividerBg,
   },
   insightText: {
     fontFamily: fonts.body,
     fontSize: 13,
     lineHeight: 19,
     color: colors.muted,
+    textAlign: "center",
+  },
+  insightTextLight: {
+    color: lightCard.muted,
   },
   ringWrap: {
     alignItems: "center",
@@ -165,5 +281,43 @@ const styles = StyleSheet.create({
     fontFamily: fonts.bodySemiBold,
     fontSize: 15,
     color: colors.text,
+  },
+});
+
+const barStyles = StyleSheet.create({
+  bars: {
+    gap: 12,
+    paddingVertical: 2,
+  },
+  row: {
+    gap: 5,
+  },
+  top: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    justifyContent: "space-between",
+  },
+  label: {
+    fontFamily: fonts.bodySemiBold,
+    fontSize: 12.5,
+    color: lightCard.text,
+  },
+  values: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: "rgba(10,10,10,0.5)",
+  },
+  sep: {
+    color: "rgba(10,10,10,0.5)",
+  },
+  track: {
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: "rgba(10,10,10,0.08)",
+    overflow: "hidden",
+  },
+  fill: {
+    height: "100%",
+    borderRadius: 3,
   },
 });

@@ -5,6 +5,7 @@ import { PreWorkoutPreviewScreen } from '../screens/PreWorkoutPreviewScreen';
 import { SessionReportScreen } from '../screens/SessionReportScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
 import { CalendarScreen } from '../screens/CalendarScreen';
+import { GlobalChatScreen } from '../screens/GlobalChatScreen';
 import type { RootStackParamList } from './types';
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -38,6 +39,7 @@ export function RootStack() {
         component={CalendarScreen}
         options={{ presentation: 'fullScreenModal', headerShown: false, animation: 'slide_from_bottom' }}
       />
+      <Stack.Screen name="GlobalChat" component={GlobalChatScreen} options={{ headerShown: false }} />
     </Stack.Navigator>
   );
 }

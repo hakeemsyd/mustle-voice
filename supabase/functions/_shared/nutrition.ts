@@ -37,3 +37,32 @@ export function computeNutritionTargets(weightKg: number, goal: GoalObjective): 
 
   return { calories, protein_g, carbs_g, fat_g };
 }
+
+export interface BodyFatGoalResult {
+  currentWeightKg: number;
+  currentBodyFatPct: number;
+  targetBodyFatPct: number;
+  leanMassKg: number;
+  targetWeightKg: number;
+  fatMassToLoseKg: number;
+}
+
+// Holds lean mass constant and solves for the weight at which the target body-fat % is hit — a
+// simplifying assumption (a real cut loses some lean mass too), not a clinical model, same v0
+// caveat class as computeNutritionTargets above.
+export function computeBodyFatGoal(
+  currentWeightKg: number,
+  currentBodyFatPct: number,
+  targetBodyFatPct: number,
+): BodyFatGoalResult {
+  const leanMassKg = currentWeightKg * (1 - currentBodyFatPct / 100);
+  const targetWeightKg = leanMassKg / (1 - targetBodyFatPct / 100);
+  return {
+    currentWeightKg,
+    currentBodyFatPct,
+    targetBodyFatPct,
+    leanMassKg: Math.round(leanMassKg * 10) / 10,
+    targetWeightKg: Math.round(targetWeightKg * 10) / 10,
+    fatMassToLoseKg: Math.round((currentWeightKg - targetWeightKg) * 10) / 10,
+  };
+}

@@ -29,6 +29,7 @@ import {
   type StopReason,
 } from "../onboarding/useVoiceRecorder";
 import { useSpeakOnMount } from "../onboarding/useSpeakOnMount";
+import { useKeyboardOpen } from "../hooks/useKeyboardOpen";
 
 import { BackIcon } from "../icons/BackIcon";
 
@@ -130,6 +131,12 @@ export const ConversationalScreen = ({
   const [capturedValue, setCapturedValue] = useState("");
   const [unifiedListening, setUnifiedListening] = useState(false);
   const [unifiedMode, setUnifiedMode] = useState<"mic" | "keyboard">("mic");
+  const keyboardOpen = useKeyboardOpen();
+  // Confirmed live: tap a chip, toggle to text, and the keyboard pushes the question + captured
+  // answer down until they crowd the chips/input right above the keyboard — worst on a shorter
+  // phone screen. The orb was never load-bearing once typing starts, so it's the one thing safe
+  // to drop for the room; it comes back the moment the keyboard closes.
+  const orbHiddenForKeyboard = unifiedInput && unifiedMode === "keyboard" && keyboardOpen;
 
   const { audioDone, audioStarted } = useSpeakOnMount(
     coachMessage,
@@ -307,11 +314,13 @@ export const ConversationalScreen = ({
               layout={LinearTransition.springify()}
               entering={FadeIn.duration(250)}
             >
-              <View style={styles.orbContainer}>
-                <Orb state={orbState} size={orbSize} />
-              </View>
+              {!orbHiddenForKeyboard && (
+                <View style={styles.orbContainer}>
+                  <Orb state={orbState} size={orbSize} />
+                </View>
+              )}
 
-              <Text style={styles.message}>
+              <Text style={[styles.message, orbHiddenForKeyboard && styles.messageKeyboardOpen]}>
                 {coachWords.map((w, i) => (
                   <RevealWord
                     key={i}
@@ -634,6 +643,9 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 20,
+    // A little beyond the raw safe-area edge SafeAreaView already insets for — sitting flush
+    // against that boundary read as crowding the notch/Dynamic Island on a real device.
+    paddingTop: 8,
   },
 
   topBarSpacer: {
@@ -648,6 +660,13 @@ const styles = StyleSheet.create({
   orbContainer: {
     alignItems: "center",
     paddingTop: 12,
+  },
+
+  // Applied to the coach message only while the keyboard is open in text mode (see
+  // orbHiddenForKeyboard) — with the orb gone, the question sits right at the top of `content`
+  // instead of below it, giving the chips/input the extra room they need above the keyboard.
+  messageKeyboardOpen: {
+    marginTop: 8,
   },
 
   // Matches the source's instantReveal final ("shrank") state — every consumer of this

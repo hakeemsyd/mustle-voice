@@ -84,12 +84,30 @@ export function describeLiveSessionSnapshot(snapshot: LiveSessionSnapshot): stri
     const c = snapshot.currentExercise;
     const loggedDesc =
       c.loggedSets.length > 0
-        ? c.loggedSets.map((s) => `${s.weight != null ? `${s.weight}kg` : 'bodyweight'}×${s.reps}`).join(', ')
+        ? c.loggedSets
+            .map((s) =>
+              s.unit === 'seconds'
+                ? `${s.reps}s held`
+                : `${s.weight != null ? `${s.weight}kg` : 'bodyweight'}×${s.reps}`,
+            )
+            .join(', ')
         : 'none yet';
+    const done = c.loggedSets.length;
+    const remaining = Math.max(0, c.totalSets - done);
+    // Spelled out as completed-vs-remaining rather than a bare "set N of M" ordinal. Confirmed
+    // live: "set 4 of 4" (3 done, the 4th still to do) was read as "4 of 4 finished", and the
+    // coach moved on to the next exercise while the app was still waiting on the last set.
     lines.push(
-      `- Current exercise: "${c.name}", set ${c.setIndex + 1} of ${c.totalSets} ` +
-        `(target ${c.repScheme}${c.loadScheme ? `, ${c.loadScheme}` : ''}). Sets logged this exercise: ${loggedDesc}.`,
+      `- Current exercise: "${c.name}" (target ${c.repScheme}${c.loadScheme ? `, ${c.loadScheme}` : ''}).`,
     );
+    lines.push(
+      remaining > 0
+        ? `- Sets COMPLETED on it: ${done} of ${c.totalSets}. ${remaining} still to do — the next one ` +
+            `to perform is set ${done + 1}, which has NOT happened yet. Do not move on to another ` +
+            `exercise until all ${c.totalSets} are completed.`
+        : `- Sets COMPLETED on it: ${done} of ${c.totalSets}. This exercise is finished.`,
+    );
+    lines.push(`- Loads logged so far on this exercise: ${loggedDesc}.`);
   } else {
     lines.push('- No current exercise (session not yet loaded or already finished).');
   }
@@ -107,7 +125,12 @@ export function describeLiveSessionSnapshot(snapshot: LiveSessionSnapshot): stri
   lines.push(
     'This is what the screen actually shows right now — never claim a different exercise, set, or ' +
       'timer value than what is listed here, and never claim you changed it unless the corresponding ' +
-      'tool call actually succeeds.',
+      'tool call actually succeeds. The target reps/load and the logged sets above are the ONLY ' +
+      'numbers you may state for this exercise — never state a different rep range, set count, or a ' +
+      'specific weight that is not one of the values actually logged above (confirmed live: the app ' +
+      'is programmed for one scheme and load was invented as something else entirely). If "Sets ' +
+      'logged this exercise" says none yet and the user asks what weight to use, say you don\'t have ' +
+      'one on record and ask — never invent a number to sound helpful.',
   );
 
   return lines.join('\n');

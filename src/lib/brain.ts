@@ -1,4 +1,5 @@
 import { supabase } from './supabase';
+import { setCachedDisplayName } from './profileStore';
 
 export type BrainModality = 'voice' | 'text' | 'image' | 'file' | 'live_photo';
 
@@ -58,18 +59,30 @@ export interface TopLiftsCard {
   insight: string;
 }
 
+export interface PreviousWorkoutCard {
+  type: 'previous_workout';
+  day_label: string;
+  status: 'completed' | 'partial' | 'switched';
+  total_sets: number;
+  target_sets: number;
+  top_set_label: string;
+  duration_sec: number | null;
+}
+
 export type ChatCard =
   | PlanBreakdownCard
   | DailyWorkoutCard
   | NutritionSummaryCard
   | ProgressReportCard
   | ReadinessCard
-  | TopLiftsCard;
+  | TopLiftsCard
+  | PreviousWorkoutCard;
 
 export interface BrainResult {
   reply: string;
   toolCalls: string[];
   card?: ChatCard | null;
+  updatedDisplayName?: string | null;
 }
 
 const BRAIN_TIMEOUT_MS = 25000;
@@ -83,6 +96,12 @@ export async function callBrain(
   hidden: boolean = false,
   timeoutMs: number = BRAIN_TIMEOUT_MS,
   liveSessionState?: string,
+  attachmentUrl?: string,
+  // Home's daily-greeting call only — tells the server to skip its usual "new vs. ongoing
+  // conversation" note, which otherwise contradicts buildGreetingPrompt's own explicit "say hello"
+  // instruction for any user with prior history (nearly everyone). See buildSystemPrompt's own
+  // comment in brain-config.ts for the full story.
+  isDailyGreeting: boolean = false,
 ): Promise<BrainResult> {
   // The device's own current timezone, sent every call — profile.timezone is only written once
   // at onboarding and never refreshed, which silently drifted after travel/DST and misclassified
@@ -90,9 +109,15 @@ export async function callBrain(
   // stored value and opportunistically refreshes it too.
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const { data, error } = await supabase.functions.invoke('brain', {
-    body: { userId, message, modality, hidden, liveSessionState, timezone },
+    body: { userId, message, modality, hidden, liveSessionState, timezone, attachmentUrl, isDailyGreeting },
     timeout: timeoutMs,
   });
   if (error) throw new Error(`brain invoke failed: ${error.message}`);
-  return data as BrainResult;
+  const result = data as BrainResult;
+  // Only a real correction should touch the cache — updatedDisplayName is present but null on
+  // every ordinary reply, and writing null would wipe an already-correct cached name.
+  if (result.updatedDisplayName) {
+    setCachedDisplayName(userId, result.updatedDisplayName);
+  }
+  return result;
 }

@@ -1,3 +1,4 @@
+import { humanizeFocus } from './humanize.ts';
 interface PlanSessionRow {
   id: string;
   day_order: number;
@@ -46,10 +47,18 @@ export function nowInTimezone(timezone: string | null | undefined): Date {
 }
 
 // resolveTodaySession/sameLocalDay compare `now` against each log's `.at` — both sides must be
-// shifted into the same timezone or "same day" silently compares two different calendars.
-export function logsInTimezone<T extends WorkoutLogRow>(logs: T[], timezone: string | null | undefined): T[] {
+// shifted into the same timezone or "same day" silently compares two different calendars. Any
+// timestamped row can go through this, not just workout logs — computeStatsSnapshot uses it for
+// food_log rows too, which is why the constraint is the minimal `{at: string}` shape rather than
+// the full WorkoutLogRow.
+export function logsInTimezone<T extends { at: string }>(logs: T[], timezone: string | null | undefined): T[] {
   if (!timezone) return logs;
   return logs.map((log) => ({ ...log, at: toTimezone(new Date(log.at), timezone).toISOString() }));
+}
+
+export async function fetchRestDayDates(supabase: any, userId: string, sinceIso: string): Promise<Set<string>> {
+  const { data } = await supabase.from('rest_day').select('date').eq('user_id', userId).gte('date', sinceIso);
+  return new Set((data ?? []).map((r: any) => r.date));
 }
 
 function isPartial(log: WorkoutLogRow): boolean {
@@ -64,8 +73,10 @@ export function resolveTodaySession(
   sessions: PlanSessionRow[],
   logs: WorkoutLogRow[],
   now: Date,
+  restDayDates: Set<string> = new Set(),
 ): PlanSessionRow | null {
   if (sessions.length === 0) return null;
+  if (restDayDates.has(now.toISOString().slice(0, 10))) return null;
 
   const scheduled = sessions.find((s) => s.weekday === now.getDay());
   if (scheduled) return scheduled;
@@ -99,7 +110,7 @@ function describeSession(session: PlanSessionRow): string {
     .map((e) => e.exercise?.name)
     .filter((name): name is string => Boolean(name))
     .join(', ');
-  return `"${session.focus}" — ${exercises || 'no exercises listed'}`;
+  return `"${humanizeFocus(session.focus)}" — ${exercises || 'no exercises listed'}`;
 }
 
 // The client's live device timezone, sent with every request, always wins over what's stored —
@@ -112,7 +123,8 @@ export async function buildContextBlock(
   userId: string,
   requestTimezone?: string | null,
 ): Promise<string> {
-  const [{ data: profile }, { data: activePlan }, { data: recentLogs }] = await Promise.all([
+  const ninetyDaysAgo = new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10);
+  const [{ data: profile }, { data: activePlan }, { data: recentLogs }, restDayDates] = await Promise.all([
     supabase.from('profile').select('timezone').eq('user_id', userId).maybeSingle(),
     supabase
       .from('training_plan')
@@ -126,6 +138,7 @@ export async function buildContextBlock(
       .eq('user_id', userId)
       .order('at', { ascending: false })
       .limit(10),
+    fetchRestDayDates(supabase, userId, ninetyDaysAgo),
   ]);
 
   const timezone = requestTimezone || profile?.timezone || null;
@@ -145,16 +158,19 @@ export async function buildContextBlock(
   if (sessions.length === 0) {
     planLine = 'No active training plan yet.';
   } else {
-    const today = resolveTodaySession(sessions, logs, now);
+    const today = resolveTodaySession(sessions, logs, now, restDayDates);
     if (!today) {
-      planLine = 'Today is a rest day — no scheduled session.';
+      planLine = restDayDates.has(now.toISOString().slice(0, 10))
+        ? 'Today is a rest day — the user chose to skip it.'
+        : 'Today is a rest day — no scheduled session.';
     } else {
       const alreadyDone = logs.some(
         (log) => log.plan_session_id === today.id && log.status !== 'partial' && sameLocalDay(new Date(log.at), now),
       );
       planLine = alreadyDone
         ? `Today's scheduled session (${describeSession(today)}) was already completed today.`
-        : `Today's scheduled session: ${describeSession(today)}.`;
+        : `Today's scheduled session (scheduled, not started unless a live session state block ` +
+          `below says otherwise): ${describeSession(today)}.`;
     }
   }
 

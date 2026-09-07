@@ -10,8 +10,18 @@ const SUPABASE_SECRET_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
 
 Deno.serve(async (req) => {
   try {
-    const { userId, message, modality = 'text', hidden = false, liveSessionState, timezone } = await req.json();
-    if (!userId || !message) {
+    const {
+      userId,
+      message,
+      modality = 'text',
+      hidden = false,
+      liveSessionState,
+      timezone,
+      attachmentUrl,
+      isDailyGreeting = false,
+    } = await req.json();
+    const hasAttachment = modality === 'image' && typeof attachmentUrl === 'string' && attachmentUrl.length > 0;
+    if (!userId || (!message && !hasAttachment)) {
       return new Response(JSON.stringify({ error: 'userId and message are required' }), { status: 400 });
     }
 
@@ -33,13 +43,19 @@ Deno.serve(async (req) => {
 
     const priorMessages = replayHistory((history ?? []).reverse());
 
-    const messages = [...priorMessages, { role: 'user', content: message }];
+    const userContent = hasAttachment
+      ? [
+          { type: 'image', source: { type: 'url', url: attachmentUrl } },
+          { type: 'text', text: message ? message : 'What do you see here?' },
+        ]
+      : message;
+    const messages = [...priorMessages, { role: 'user', content: userContent }];
 
     const fullContextBlock =
       typeof liveSessionState === 'string' && liveSessionState.length > 0
         ? `${contextBlock}\n\n${liveSessionState}`
         : contextBlock;
-    const systemPrompt = buildSystemPrompt((history ?? []).length > 0, fullContextBlock);
+    const systemPrompt = buildSystemPrompt((history ?? []).length > 0, fullContextBlock, 'text', isDailyGreeting);
     const result = await runBrainTurn({ systemPrompt, messages, handlers, callModel });
 
     const turnBlocks = result.messages.slice(messages.length);
@@ -53,12 +69,26 @@ Deno.serve(async (req) => {
       'show_progress_report',
       'show_readiness',
       'show_top_lifts',
+      'show_previous_workout',
     ]);
     const cardCall = result.toolCalls.find((t) => CARD_TOOL_NAMES.has(t.name) && t.result?.card);
     const card = cardCall?.result.card ?? null;
 
+    const profileUpdateCall = result.toolCalls.find(
+      (t) => t.name === 'update_profile' && t.result?.status === 'updated',
+    );
+    const updatedDisplayName = profileUpdateCall?.result.display_name ?? null;
+
     const { error: logError } = await supabase.from('message').insert([
-      { user_id: userId, role: 'user', content: message, modality, hidden, at: askedAt.toISOString() },
+      {
+        user_id: userId,
+        role: 'user',
+        content: message,
+        modality,
+        hidden,
+        attachment_url: hasAttachment ? attachmentUrl : null,
+        at: askedAt.toISOString(),
+      },
       {
         user_id: userId,
         role: 'assistant',
@@ -77,6 +107,7 @@ Deno.serve(async (req) => {
         reply: result.reply,
         toolCalls: result.toolCalls.map((t) => t.name),
         card,
+        updatedDisplayName,
       }),
       { headers: { 'content-type': 'application/json' } },
     );

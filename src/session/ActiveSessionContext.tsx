@@ -9,11 +9,22 @@ import React, {
 } from "react";
 import { supabase } from "../lib/supabase";
 import { callBrain, COACH_UNREACHABLE_MESSAGE } from "../lib/brain";
-import { DEFAULT_REST_SEC, suggestRestSeconds } from "../lib/restSuggestion";
+import { DEFAULT_REST_SEC, suggestRestSeconds, type RestSuggestionReason } from "../lib/restSuggestion";
 import { useProfileName } from "../hooks/useProfileName";
 import { buildLiveSessionSnapshot, describeLiveSessionSnapshot } from "./liveSessionState";
 
+// Module-level, not a ref — confirmed live: two messages landed with the exact same generated id
+// ("<same millisecond>-13"), which a per-instance useRef(0) counter can only produce if two
+// provider instances briefly existed at once (a remount overlap) and both happened to be on
+// their 13th message. A counter that lives here, at module scope, never resets for as long as the
+// JS process is alive, so no two instances — overlapping or not — can ever draw the same value.
+let globalMessageCounter = 0;
+
 const EXTEND_REST_SEC = 10;
+// How long an identical set report is treated as a repeat of the one just logged rather than a
+// new set. Generous because logging a set immediately starts a rest period, so a real second set
+// of the same load and reps cannot physically arrive inside this window.
+const DUPLICATE_SET_WINDOW_MS = 10_000;
 
 export interface SessionExercise {
   id: string;
@@ -31,6 +42,13 @@ export interface SessionExercise {
 export interface LoggedSet {
   weight: number | null;
   reps: number;
+  /** "seconds" for a timed/isometric hold (Plank, etc.) — `reps` holds the held duration, not a
+   *  rep count, in that case. Carried only through the live in-memory session: the persisted
+   *  workout_log record still can't distinguish a 52-rep set from a 52-second hold (both are a
+   *  bare number in the same comma-joined string), which is exactly the gap the "per-set schema"
+   *  backlog item exists to close — this fix is scoped to what the user sees WHILE the session is
+   *  active (the card, the thread, the spoken confirmation), not the persisted record. */
+  unit?: 'seconds';
 }
 
 /** Same shape workout_log.exercises_done is written in (see writeWorkoutLog below) — passed
@@ -42,6 +60,38 @@ export interface ResumeExerciseEntry {
   sets: number;
   reps: string;
   load: string;
+}
+
+interface LastSetSnapshot {
+  loggedSets: LoggedSet[][];
+  currentExerciseIndex: number;
+  resting: boolean;
+  restKey: number;
+  restTargetSec: number;
+  restEndAt: number | null;
+  restPausedRemainingSec: number | null;
+  /** Set once the async workout_log insert this set triggered actually resolves, so undo knows
+   *  whether it also needs to delete a row, not just roll back in-memory state. */
+  createdWorkoutLogId: string | null;
+}
+
+function restReasonCopy(reason: RestSuggestionReason): string | null {
+  switch (reason) {
+    case "missed_reps":
+      return "Auto-extended — short of target reps";
+    case "exceeded_reps":
+      return "Auto-shortened — cleared target easily";
+    case "fatigue_addon":
+      return "Auto-extended — later-set fatigue";
+    default:
+      return null;
+  }
+}
+
+export interface SessionThreadMessage {
+  id: string;
+  role: "coach" | "user";
+  text: string;
 }
 
 function parseResumeSets(entry: ResumeExerciseEntry | undefined): LoggedSet[] {
@@ -104,7 +154,10 @@ interface ActiveSessionValue {
   restEndAt: number | null;
   /** Set while paused, to a frozen remaining-seconds value; null while actively ticking. */
   restPausedRemainingSec: number | null;
-  extendRest: (seconds?: number) => void;
+  /** Why the current/last rest target came out where it did (auto-extended for missed reps,
+   *  etc.) — null when it's just the plain default, never auto-adjusted. */
+  restReasonLabel: string | null;
+  extendRest: (seconds?: number, source?: "manual" | "coach") => void;
   toggleRestPause: () => void;
   pauseRest: () => void;
   resumeRest: () => void;
@@ -118,15 +171,21 @@ interface ActiveSessionValue {
   hasLoggedAnySet: boolean;
   coachMessage: string;
   coachThinking: boolean;
+  messages: SessionThreadMessage[];
+  appendMessage: (role: "coach" | "user", text: string) => void;
   elapsedSec: number;
   paused: boolean;
   minimized: boolean;
   start: (target: SessionTarget, resumeExercisesDone?: ResumeExerciseEntry[]) => void;
   minimize: () => void;
   restore: () => void;
-  logSet: (weight: number | null, reps: number) => void;
+  logSet: (weight: number | null, reps: number, unit?: 'seconds') => void;
   skipExercise: () => void;
   addSet: () => void;
+  undoLastSet: () => void;
+  /** Persists the outgoing session as `partial` if anything was logged — used before a switch/
+   *  rest-day choice that doesn't go through start() (which already does this itself). */
+  resolveOutgoingSession: () => Promise<void>;
   removeQueuedExercise: (exerciseRowId: string) => void;
   swapQueuedExercise: (exerciseRowId: string, replacement: { id: string; name: string }) => void;
   finishRest: () => void;
@@ -169,12 +228,14 @@ export function ActiveSessionProvider({
   const [restPausedRemainingSec, setRestPausedRemainingSec] = useState<
     number | null
   >(null);
+  const [restReasonLabel, setRestReasonLabel] = useState<string | null>(null);
   const [ended, setEnded] = useState(false);
   const [endedStatus, setEndedStatus] = useState<SessionStatus | null>(null);
   const [workoutLogId, setWorkoutLogId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [coachMessage, setCoachMessage] = useState("Ready when you are.");
   const [coachThinking, setCoachThinking] = useState(false);
+  const [messages, setMessages] = useState<SessionThreadMessage[]>([]);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [paused, setPaused] = useState(false);
   const [minimized, setMinimized] = useState(false);
@@ -184,32 +245,70 @@ export function ActiveSessionProvider({
   const userIdRef = useRef<string | null>(null);
   const logIdRef = useRef<string | null>(null);
   const resumeDataRef = useRef<ResumeExerciseEntry[] | null>(null);
+  // Latest writeWorkoutLog, kept current every render (assigned right after its own declaration
+  // below) — lets start() call it before resetting state without needing writeWorkoutLog defined
+  // earlier in this file, and without start()'s own identity needing to depend on it.
+  const writeWorkoutLogRef = useRef<((sets: LoggedSet[][], status: SessionStatus) => Promise<void>) | null>(null);
+  // Guards a single workout_log row per session run — logSet's completion branch, skipExercise's
+  // completion branch, and endSession must never all independently insert one for the same run.
+  const workoutLogWrittenRef = useRef(false);
+  // Reentrancy guard for logSet — a duplicated trigger landing in the same tick before a
+  // re-render must not double-append or double-write.
+  const loggingRef = useRef(false);
+  // Content-level idempotency, which the reentrancy guard above cannot provide: the same set can
+  // arrive twice a few hundred milliseconds apart (the voice SDK re-emitting a final transcript,
+  // a spoken report racing a tapped "Set done"), by which point the guard has already released.
+  // Keyed on exercise + load + reps, so a genuine repeat is only ever suppressed if it lands
+  // inside the window below — and no real second set of identical load and reps happens that
+  // fast, because logging one starts a rest period.
+  const recentSetRef = useRef<{ key: string; at: number } | null>(null);
+  const lastSetSnapshotRef = useRef<LastSetSnapshot | null>(null);
 
-  const start = useCallback((next: SessionTarget, resumeExercisesDone?: ResumeExerciseEntry[]) => {
-    resumeDataRef.current = resumeExercisesDone ?? null;
-    setTarget(next);
-    setLoading(next.type === "strength");
-    setError(null);
-    setFocus(next.type === "cardio" ? next.activity : null);
-    setExercises([]);
-    setCurrentExerciseIndex(0);
-    setLoggedSets([]);
-    setResting(false);
-    setRestTargetSec(DEFAULT_REST_SEC);
-    setRestEndAt(null);
-    setRestPausedRemainingSec(null);
-    setEnded(false);
-    setEndedStatus(null);
-    setCoachMessage("Ready when you are.");
-    setElapsedSec(0);
-    setPaused(false);
-    setMinimized(false);
-    logIdRef.current = null;
-    setWorkoutLogId(null);
-  }, []);
+  const start = useCallback(
+    (next: SessionTarget, resumeExercisesDone?: ResumeExerciseEntry[]) => {
+      // Persist whatever was in progress before resetting — the outgoing session's own
+      // exercises/target/elapsedSec are still what writeWorkoutLogRef's current closure holds
+      // at this point, since state hasn't reset yet.
+      if (target && !ended && loggedSets.some((sets) => sets.length > 0)) {
+        void writeWorkoutLogRef.current?.(loggedSets, "partial");
+      }
+      workoutLogWrittenRef.current = false;
+      loggingRef.current = false;
+      lastSetSnapshotRef.current = null;
+      resumeDataRef.current = resumeExercisesDone ?? null;
+      setTarget(next);
+      setLoading(next.type === "strength");
+      setError(null);
+      setFocus(next.type === "cardio" ? next.activity : null);
+      setExercises([]);
+      setCurrentExerciseIndex(0);
+      setLoggedSets([]);
+      setResting(false);
+      setRestTargetSec(DEFAULT_REST_SEC);
+      setRestEndAt(null);
+      setRestPausedRemainingSec(null);
+      setRestReasonLabel(null);
+      setEnded(false);
+      setEndedStatus(null);
+      setCoachMessage("Ready when you are.");
+      setMessages([]);
+      setElapsedSec(0);
+      setPaused(false);
+      setMinimized(false);
+      logIdRef.current = null;
+      setWorkoutLogId(null);
+    },
+    [target, ended, loggedSets],
+  );
 
   const minimize = useCallback(() => setMinimized(true), []);
   const restore = useCallback(() => setMinimized(false), []);
+
+  const appendMessage = useCallback((role: "coach" | "user", text: string) => {
+    if (!text.trim()) return;
+    globalMessageCounter += 1;
+    setMessages((prev) => [...prev, { id: `${Date.now()}-${globalMessageCounter}`, role, text }]);
+  }, []);
 
   // Resolved once, independent of any running session: the voice agent needs the user's id
   // to attribute the conversation, and useProfileName (shared with Home) fills their name for
@@ -234,6 +333,13 @@ export function ActiveSessionProvider({
   }, []);
 
   const clear = useCallback(() => {
+    const clearedUserId = userIdRef.current;
+    if (clearedUserId) {
+      // A session that truly ends must leave no live_session_state row behind — brain-voice
+      // treats the absence of a fresh row as "no session running," which only holds if this
+      // never leaves a stale one for a session that's actually over.
+      void supabase.from("live_session_state").delete().eq("user_id", clearedUserId);
+    }
     setTarget(null);
     setEnded(false);
     setEndedStatus(null);
@@ -244,6 +350,11 @@ export function ActiveSessionProvider({
     setResting(false);
     setRestEndAt(null);
     setRestPausedRemainingSec(null);
+    setRestReasonLabel(null);
+    setMessages([]);
+    workoutLogWrittenRef.current = false;
+    loggingRef.current = false;
+    lastSetSnapshotRef.current = null;
     logIdRef.current = null;
     setWorkoutLogId(null);
   }, []);
@@ -328,7 +439,7 @@ export function ActiveSessionProvider({
   const writeWorkoutLog = useCallback(
     async (sets: LoggedSet[][], status: SessionStatus) => {
       const userId = userIdRef.current;
-      if (!userId || !target) return;
+      if (!userId || !target || workoutLogWrittenRef.current) return;
 
       const isCardio = target.type === "cardio";
 
@@ -345,6 +456,7 @@ export function ActiveSessionProvider({
         }));
 
       if (!isCardio && exercisesDone.length === 0) return;
+      workoutLogWrittenRef.current = true;
 
       const vsPlanned = isCardio
         ? null
@@ -381,6 +493,7 @@ export function ActiveSessionProvider({
       setSaving(false);
 
       if (insertError) {
+        workoutLogWrittenRef.current = false; // allow a genuine retry after a real failure
         console.error(
           "[active session] failed to log workout:",
           insertError.message,
@@ -392,47 +505,117 @@ export function ActiveSessionProvider({
     },
     [exercises, target, elapsedSec],
   );
+  writeWorkoutLogRef.current = writeWorkoutLog;
+
+  const persistPartialIfAny = useCallback(async () => {
+    if (!target || ended) return;
+    if (!loggedSets.some((sets) => sets.length > 0)) return;
+    await writeWorkoutLogRef.current?.(loggedSets, "partial");
+  }, [target, ended, loggedSets]);
 
   const logSet = useCallback(
-    (weight: number | null, reps: number) => {
+    (weight: number | null, reps: number, unit?: 'seconds') => {
       const exercise = exercises[currentExerciseIndex];
-      if (!exercise) return;
+      if (!exercise || loggingRef.current) return;
+
+      const dedupeKey = `${exercise.id}:${weight ?? 'bodyweight'}:${reps}`;
+      const now = Date.now();
+      const recent = recentSetRef.current;
+      if (recent && recent.key === dedupeKey && now - recent.at < DUPLICATE_SET_WINDOW_MS) {
+        console.warn('[session] ignored a duplicate set report:', dedupeKey);
+        return;
+      }
+      recentSetRef.current = { key: dedupeKey, at: now };
+
+      loggingRef.current = true;
+
+      lastSetSnapshotRef.current = {
+        loggedSets,
+        currentExerciseIndex,
+        resting,
+        restKey,
+        restTargetSec,
+        restEndAt,
+        restPausedRemainingSec,
+        createdWorkoutLogId: null,
+      };
 
       const next = loggedSets.map((sets) => sets.slice());
       next[currentExerciseIndex] = [
         ...next[currentExerciseIndex],
-        { weight, reps },
+        { weight, reps, unit },
       ];
       setLoggedSets(next);
 
       const setsSoFar = next[currentExerciseIndex].length;
       if (setsSoFar < exercise.sets) {
-        const seconds = suggestRestSeconds(
+        const suggestion = suggestRestSeconds(
           reps,
           exercise.repScheme,
           setsSoFar,
           exercise.sets,
         );
-        setRestTargetSec(seconds);
-        setRestEndAt(Date.now() + seconds * 1000);
+        setRestTargetSec(suggestion.seconds);
+        setRestEndAt(Date.now() + suggestion.seconds * 1000);
         setRestPausedRemainingSec(null);
         setResting(true);
         setRestKey((k) => k + 1);
+        setRestReasonLabel(restReasonCopy(suggestion.reason));
       } else if (currentExerciseIndex === exercises.length - 1) {
         setEnded(true);
         setEndedStatus("completed");
-        void writeWorkoutLog(next, "completed");
+        void writeWorkoutLog(next, "completed").then(() => {
+          if (lastSetSnapshotRef.current) lastSetSnapshotRef.current.createdWorkoutLogId = logIdRef.current;
+        });
       } else {
         setCurrentExerciseIndex((i) => i + 1);
       }
+
+      queueMicrotask(() => {
+        loggingRef.current = false;
+      });
     },
-    [currentExerciseIndex, exercises, loggedSets, writeWorkoutLog],
+    [
+      currentExerciseIndex,
+      exercises,
+      loggedSets,
+      resting,
+      restKey,
+      restTargetSec,
+      restEndAt,
+      restPausedRemainingSec,
+      writeWorkoutLog,
+    ],
   );
 
+  const undoLastSet = useCallback(async () => {
+    const snap = lastSetSnapshotRef.current;
+    if (!snap) return;
+    lastSetSnapshotRef.current = null;
+    if (snap.createdWorkoutLogId) {
+      await supabase.from("workout_log").delete().eq("id", snap.createdWorkoutLogId);
+      logIdRef.current = null;
+      setWorkoutLogId(null);
+      workoutLogWrittenRef.current = false; // allow the corrected next set to actually write the row
+    }
+    setLoggedSets(snap.loggedSets);
+    setCurrentExerciseIndex(snap.currentExerciseIndex);
+    setResting(snap.resting);
+    setRestKey(snap.restKey);
+    setRestTargetSec(snap.restTargetSec);
+    setRestEndAt(snap.restEndAt);
+    setRestPausedRemainingSec(snap.restPausedRemainingSec);
+    setRestReasonLabel(null);
+    setEnded(false);
+    setEndedStatus(null);
+  }, []);
+
   const skipExercise = useCallback(() => {
+    lastSetSnapshotRef.current = null;
     setResting(false);
     setRestEndAt(null);
     setRestPausedRemainingSec(null);
+    setRestReasonLabel(null);
 
     if (currentExerciseIndex === exercises.length - 1) {
       const status: SessionStatus = loggedSets.some((sets) => sets.length > 0) ? "completed" : "partial";
@@ -481,19 +664,26 @@ export function ActiveSessionProvider({
   );
 
   const finishRest = useCallback(() => {
+    lastSetSnapshotRef.current = null;
     setResting(false);
     setRestEndAt(null);
     setRestPausedRemainingSec(null);
+    setRestReasonLabel(null);
   }, []);
 
-  const extendRest = useCallback((seconds?: number) => {
-    const amount = seconds && seconds > 0 ? seconds : EXTEND_REST_SEC;
-    setRestTargetSec((sec) => sec + amount);
-    setRestEndAt((endAt) => (endAt === null ? endAt : endAt + amount * 1000));
-    setRestPausedRemainingSec((remaining) =>
-      remaining === null ? remaining : remaining + amount,
-    );
-  }, []);
+  const extendRest = useCallback(
+    (seconds?: number, source: "manual" | "coach" = "manual") => {
+      if (!resting) return; // nothing actively resting — matches adjust_rest_timer's own "ask before calling" contract
+      const amount = seconds && seconds > 0 ? Math.min(120, seconds) : EXTEND_REST_SEC;
+      setRestTargetSec((sec) => sec + amount);
+      setRestEndAt((endAt) => (endAt === null ? endAt : endAt + amount * 1000));
+      setRestPausedRemainingSec((remaining) =>
+        remaining === null ? remaining : remaining + amount,
+      );
+      if (source === "coach") setRestReasonLabel("Coach extended your rest");
+    },
+    [resting],
+  );
 
   // Split into explicit pause/resume (not just a toggle) so a voice command like "pause the
   // timer" can act on the timer's actual current state rather than blindly flipping whatever
@@ -522,6 +712,7 @@ export function ActiveSessionProvider({
 
   const endSession = useCallback(
     async (status: SessionStatus) => {
+      lastSetSnapshotRef.current = null;
       setEnded(true);
       setEndedStatus(status);
       await writeWorkoutLog(loggedSets, status);
@@ -555,6 +746,7 @@ export function ActiveSessionProvider({
       const userId = userIdRef.current;
       if (!userId || !text.trim()) return;
       const requestId = ++latestAskRef.current;
+      appendMessage("user", text.trim());
       setCoachThinking(true);
       try {
         const snapshot = buildLiveSessionSnapshot({
@@ -575,6 +767,7 @@ export function ActiveSessionProvider({
         const result = await callBrain(userId, text.trim(), "text", false, undefined, liveSessionState);
         if (latestAskRef.current !== requestId) return;
         setCoachMessage(result.reply);
+        appendMessage("coach", result.reply);
 
         const exercise = exercises[currentExerciseIndex];
         if (exercise && result.reply.trim()) {
@@ -595,6 +788,7 @@ export function ActiveSessionProvider({
         console.error("[active session] coach call failed:", err);
         if (latestAskRef.current !== requestId) return;
         setCoachMessage(COACH_UNREACHABLE_MESSAGE);
+        appendMessage("coach", COACH_UNREACHABLE_MESSAGE);
       } finally {
         if (latestAskRef.current === requestId) setCoachThinking(false);
       }
@@ -612,12 +806,17 @@ export function ActiveSessionProvider({
       ended,
       paused,
       elapsedSec,
+      appendMessage,
     ],
   );
 
-  const announce = useCallback((text: string) => {
-    setCoachMessage(text);
-  }, []);
+  const announce = useCallback(
+    (text: string) => {
+      setCoachMessage(text);
+      appendMessage("coach", text);
+    },
+    [appendMessage],
+  );
 
   const noteSetLogged = useCallback(
     (summary: string) => {
@@ -644,6 +843,7 @@ export function ActiveSessionProvider({
       restTargetSec,
       restEndAt,
       restPausedRemainingSec,
+      restReasonLabel,
       ended,
       endedStatus,
       workoutLogId,
@@ -651,6 +851,8 @@ export function ActiveSessionProvider({
       hasLoggedAnySet: loggedSets.some((sets) => sets.length > 0),
       coachMessage,
       coachThinking,
+      messages,
+      appendMessage,
       elapsedSec,
       paused,
       minimized,
@@ -660,6 +862,8 @@ export function ActiveSessionProvider({
       logSet,
       skipExercise,
       addSet,
+      undoLastSet,
+      resolveOutgoingSession: persistPartialIfAny,
       removeQueuedExercise,
       swapQueuedExercise,
       finishRest,
@@ -690,12 +894,15 @@ export function ActiveSessionProvider({
       restTargetSec,
       restEndAt,
       restPausedRemainingSec,
+      restReasonLabel,
       ended,
       endedStatus,
       workoutLogId,
       saving,
       coachMessage,
       coachThinking,
+      messages,
+      appendMessage,
       elapsedSec,
       paused,
       minimized,
@@ -705,6 +912,8 @@ export function ActiveSessionProvider({
       logSet,
       skipExercise,
       addSet,
+      undoLastSet,
+      persistPartialIfAny,
       removeQueuedExercise,
       swapQueuedExercise,
       finishRest,

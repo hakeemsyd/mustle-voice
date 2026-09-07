@@ -2,7 +2,6 @@ import { useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { MiniSessionBar } from '../components/MiniSessionBar';
 import { FloatingCoachButton } from '../components/FloatingCoachButton';
 import { HomeScreen } from '../screens/HomeScreen';
 import { StatsScreen } from '../screens/StatsScreen';
@@ -11,12 +10,7 @@ import { FuelScreen } from '../screens/FuelScreen';
 import { RecoveryScreen } from '../screens/RecoveryScreen';
 import { colors, fonts } from '../constants/theme';
 import { AppleIcon, HouseIcon, MoonIcon, PersonStandingIcon, TrendingUpIcon } from '../icons';
-import { useActiveSessionContext } from '../session/ActiveSessionContext';
 import { navigateFromAppAction } from './navigationRef';
-
-// MiniSessionBar's own rendered height (padding + two text lines) plus its gap above the tab
-// bar — when it's showing, the FAB needs to sit above it instead of overlapping.
-const MINI_SESSION_BAR_CLEARANCE = 72;
 
 const Tab = createBottomTabNavigator();
 
@@ -39,8 +33,6 @@ export function RootNavigator() {
   const insets = useSafeAreaInsets();
   const tabBarHeight = 56 + insets.bottom;
   const [activeTab, setActiveTab] = useState('Home');
-  const session = useActiveSessionContext();
-  const miniSessionVisible = session.running && session.minimized && !!session.target;
 
   return (
     <View style={styles.root}>
@@ -80,10 +72,9 @@ export function RootNavigator() {
         <Tab.Screen name="Fuel" component={FuelScreen} />
         <Tab.Screen name="Recovery" component={RecoveryScreen} />
       </Tab.Navigator>
-      <MiniSessionBar bottomOffset={tabBarHeight + 12} />
       {FAB_SCREENS.has(activeTab) && (
         <FloatingCoachButton
-          bottomOffset={tabBarHeight + 24 + (miniSessionVisible ? MINI_SESSION_BAR_CLEARANCE : 0)}
+          bottomOffset={tabBarHeight + 24}
           onPress={() => navigateFromAppAction('Home', { openChat: true })}
         />
       )}

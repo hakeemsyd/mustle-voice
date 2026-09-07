@@ -1,13 +1,117 @@
-import React from "react";
-import { ActivityIndicator, ScrollView, StyleSheet, Text, View } from "react-native";
+import React, { useState } from "react";
+import {
+  ActivityIndicator,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
+import Svg, { Circle } from "react-native-svg";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useFocusEffect } from "@react-navigation/native";
-import { useFuelData } from "../hooks/useFuelData";
+import { useFuelData, type FoodLogEntry } from "../hooks/useFuelData";
 import { colors, fonts } from "../constants/theme";
-import { AppleIcon } from "../icons";
+import {
+  AppleIcon,
+  BeefIcon,
+  CalendarIcon,
+  ChevronRightIcon,
+  DrumstickIcon,
+  EggIcon,
+  FishIcon,
+  MoonIcon,
+  SunIcon,
+  UtensilsIcon,
+} from "../icons";
+import { ProgressRing } from "../components/ProgressRing";
+import { BottomSheet } from "../components/BottomSheet";
+import { MonthGrid } from "../components/MonthGrid";
+import type { ComponentType } from "react";
 
 function formatTime(iso: string): string {
-  return new Date(iso).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  return new Date(iso).toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function formatLongDate(iso: string): string {
+  return new Date(iso).toLocaleDateString("en-US", {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+  });
+}
+
+// "Today"/"Yesterday" beat a bare date once the user's browsed back only a day or two — same
+// convention as the reference's own formatLoggedDateLabel.
+function formatLoggedDateLabel(dateKey: string, todayKey: string): string {
+  if (dateKey === todayKey) return "Today";
+  const yesterday = new Date(`${todayKey}T00:00:00`);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (dateKey === `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, "0")}-${String(yesterday.getDate()).padStart(2, "0")}`) {
+    return "Yesterday";
+  }
+  return new Date(`${dateKey}T00:00:00`).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+// Same 4 time-of-day boundaries as the reference's inferMealTypeFromTime — coarse on
+// purpose, this build has no workout-timing context to key a "pre/post" bucket off.
+type MealBucket = "breakfast" | "lunch" | "snack" | "dinner";
+
+const MEAL_BADGE: Record<
+  MealBucket,
+  { Icon: ComponentType<{ size?: number; color?: string }>; label: string }
+> = {
+  breakfast: { Icon: SunIcon, label: "Breakfast" },
+  lunch: { Icon: UtensilsIcon, label: "Lunch" },
+  snack: { Icon: AppleIcon, label: "Snack" },
+  dinner: { Icon: MoonIcon, label: "Dinner" },
+};
+
+function inferMealBucket(iso: string): MealBucket {
+  const h = new Date(iso).getHours();
+  if (h < 11) return "breakfast";
+  if (h < 15) return "lunch";
+  if (h < 18) return "snack";
+  return "dinner";
+}
+
+// Same 4-keyword heuristic as the reference's getMealSummaryIcon, minus its
+// matchProfile/ingredient-DB fallback — we have no ingredient nutrition
+// database in this app, so anything past these 4 checks falls straight to
+// UtensilsIcon instead of a protein/carb/veg/fat category icon.
+function getMealIcon(
+  description: string,
+): ComponentType<{ size?: number; color?: string }> {
+  const first = description.split(",")[0]?.trim().toLowerCase() ?? "";
+  if (/chicken|turkey/.test(first)) return DrumstickIcon;
+  if (/fish|salmon|shrimp|tuna/.test(first)) return FishIcon;
+  if (/egg/.test(first)) return EggIcon;
+  if (/beef|steak|pork/.test(first)) return BeefIcon;
+  return UtensilsIcon;
+}
+
+type MealTab = "upcoming" | "logged";
+
+function EmptyRing({ text }: { text: string }) {
+  return (
+    <View style={styles.emptyRingWrap}>
+      <Svg width={172} height={172} viewBox="0 0 172 172" opacity={0.6}>
+        <Circle
+          cx={86}
+          cy={86}
+          r={72}
+          stroke="rgba(255,255,255,0.08)"
+          strokeWidth={10}
+          strokeDasharray="4 6"
+          fill="none"
+        />
+      </Svg>
+      <Text style={styles.emptyRingText}>{text}</Text>
+    </View>
+  );
 }
 
 // Fuel is read-only in the UI on purpose: every meal entry is coach-managed (log/correct/remove
@@ -15,7 +119,26 @@ function formatTime(iso: string): string {
 // prevent duplicates) — a direct manual delete here bypassed that entirely and was exactly how a
 // deletion could desync from what the coach believed was still logged.
 export function FuelScreen() {
-  const { loading, macros, entries, refetch } = useFuelData();
+  const {
+    loading,
+    macros,
+    refetch,
+    loggedDate,
+    setLoggedDate,
+    loggedEntries,
+    loggedLoading,
+    goToPreviousDay,
+    goToNextDay,
+    canGoToNextDay,
+    todayKey,
+  } = useFuelData();
+  // Defaults to "logged", not the reference's "upcoming" — Upcoming Meals
+  // has no suggestion engine behind it in this app (see the empty-state
+  // copy below), so defaulting there would always land on an empty tab.
+  const [mealTab, setMealTab] = useState<MealTab>("logged");
+  const [selectedEntry, setSelectedEntry] = useState<FoodLogEntry | null>(null);
+  const [datePickerOpen, setDatePickerOpen] = useState(false);
+  const [pickerMonth, setPickerMonth] = useState(() => new Date());
 
   // This tab stays mounted across navigation, so without this a meal logged via the coach on
   // another screen (Home chat or mid-workout) wouldn't show up here until the app relaunched.
@@ -25,10 +148,27 @@ export function FuelScreen() {
     }, [refetch]),
   );
 
+  const proteinMacro = macros?.find((m) => m.key === "protein");
+  const carbsMacro = macros?.find((m) => m.key === "carbs");
+  const fatMacro = macros?.find((m) => m.key === "fat");
+  const caloriesMacro = macros?.find((m) => m.key === "calories");
+
+  const caloriesGoal = caloriesMacro?.goal ?? 0;
+  const caloriesCurrent = caloriesMacro?.current ?? 0;
+  const ringProgress =
+    caloriesGoal > 0 ? Math.min(1, caloriesCurrent / caloriesGoal) : 0;
+  const caloriesRemaining = Math.max(
+    0,
+    Math.round(caloriesGoal - caloriesCurrent),
+  );
+  const caloriesOver = Math.max(0, Math.round(caloriesCurrent - caloriesGoal));
+  const overLimit =
+    !!macros && macros.some((m) => m.goal > 0 && m.current > m.goal);
+  const hasLoggedToday = caloriesCurrent > 0;
+
   return (
     <SafeAreaView style={styles.screen} edges={["top"]}>
       <View style={styles.header}>
-        <AppleIcon size={18} color={colors.accent} />
         <Text style={styles.headerTitle}>FUEL</Text>
       </View>
 
@@ -37,63 +177,249 @@ export function FuelScreen() {
           <ActivityIndicator color={colors.accent} />
         </View>
       ) : (
-        <ScrollView contentContainerStyle={styles.content}>
-          <Text style={styles.sectionLabel}>TODAY'S NUTRITION</Text>
+        <ScrollView
+          contentContainerStyle={styles.content}
+          showsVerticalScrollIndicator={false}
+        >
           {!macros ? (
-            <Text style={styles.emptyText}>No nutrition targets yet — tell your coach your goal to get started.</Text>
+            <EmptyRing text="No nutrition targets yet — tell your coach your goal to get started." />
+          ) : !hasLoggedToday ? (
+            <EmptyRing text="Log your first meal to see today's macros" />
           ) : (
-            <View style={styles.macroCard}>
-              {macros.map((m) => {
-                const pct = m.goal > 0 ? Math.min(Math.round((m.current / m.goal) * 100), 100) : 0;
-                const remaining = m.goal - m.current;
-                return (
-                  <View key={m.key} style={styles.macroRow}>
-                    <View style={styles.macroRowTop}>
-                      <View style={[styles.macroRowDot, { backgroundColor: m.color }]} />
-                      <Text style={styles.macroRowLabel}>{m.label}</Text>
-                      <View style={styles.macroRowValues}>
-                        <Text style={[styles.macroRowCurrent, { color: m.color }]}>{m.current}</Text>
-                        <Text style={styles.macroRowSep}>/</Text>
-                        <Text style={styles.macroRowGoal}>
-                          {m.goal}
-                          {m.unit}
-                        </Text>
-                      </View>
-                    </View>
-                    <View style={styles.macroRowBar}>
-                      <View style={[styles.macroRowFill, { width: `${pct}%`, backgroundColor: m.color }]} />
-                    </View>
-                    <Text style={styles.macroRowRemaining}>
-                      {remaining}
-                      {m.unit} remaining
+            <View style={styles.ringSection}>
+              <View style={styles.ringWrap}>
+                <ProgressRing
+                  size={172}
+                  strokeWidth={10}
+                  progress={ringProgress}
+                  color={overLimit ? colors.danger : colors.accent}
+                >
+                  <Text
+                    style={[
+                      styles.ringValue,
+                      overLimit && styles.ringValueAlert,
+                    ]}
+                  >
+                    {overLimit ? `+${caloriesOver}` : caloriesRemaining}
+                  </Text>
+                  <Text style={styles.ringLabel}>
+                    {overLimit ? "CAL OVER" : "CAL LEFT"}
+                  </Text>
+                </ProgressRing>
+              </View>
+
+              {overLimit && (
+                <Text style={styles.overNotice}>
+                  Over today's target — logging still works.
+                </Text>
+              )}
+
+              <View style={styles.statsRow}>
+                {[
+                  { label: "Protein", macro: proteinMacro },
+                  { label: "Carbs", macro: carbsMacro },
+                  { label: "Fat", macro: fatMacro },
+                ].map(({ label, macro }) => (
+                  <View key={label} style={styles.statChip}>
+                    <View
+                      style={[
+                        styles.statDot,
+                        { backgroundColor: macro?.color ?? colors.muted },
+                      ]}
+                    />
+                    <Text style={styles.statValue}>
+                      {Math.max(
+                        0,
+                        Math.round((macro?.goal ?? 0) - (macro?.current ?? 0)),
+                      )}
+                      {macro?.unit ?? "g"}
                     </Text>
+                    <Text style={styles.statLabel}>{label}</Text>
                   </View>
-                );
-              })}
+                ))}
+              </View>
             </View>
           )}
 
-          <Text style={styles.sectionLabel}>TODAY'S LOG</Text>
-          {entries.length === 0 ? (
-            <Text style={styles.emptyText}>Nothing logged yet — tell your coach what you ate.</Text>
+          <View style={styles.tabBar}>
+            <Pressable
+              style={[
+                styles.tabBtn,
+                mealTab === "upcoming" && styles.tabBtnActive,
+              ]}
+              onPress={() => setMealTab("upcoming")}
+            >
+              <Text
+                style={[
+                  styles.tabBtnText,
+                  mealTab === "upcoming" && styles.tabBtnTextActive,
+                ]}
+              >
+                Upcoming Meals
+              </Text>
+            </Pressable>
+            <Pressable
+              style={[
+                styles.tabBtn,
+                mealTab === "logged" && styles.tabBtnActive,
+              ]}
+              onPress={() => setMealTab("logged")}
+            >
+              <Text
+                style={[
+                  styles.tabBtnText,
+                  mealTab === "logged" && styles.tabBtnTextActive,
+                ]}
+              >
+                Meals Logged
+              </Text>
+            </Pressable>
+          </View>
+
+          {mealTab === "upcoming" ? (
+            <Text style={[styles.emptyText, styles.tabPanelEmptyText]}>
+              Not enough data yet — log a few meals to get suggestions
+            </Text>
           ) : (
-            <View style={styles.logList}>
-              {entries.map((entry) => (
-                <View key={entry.id} style={styles.logRow}>
-                  <View style={styles.logRowMain}>
-                    <Text style={styles.logDescription}>{entry.description}</Text>
-                    <Text style={styles.logMeta}>
-                      {formatTime(entry.at)} · {entry.calories} kcal · {entry.proteinG}p / {entry.carbsG}c / {entry.fatG}f
-                    </Text>
+            <>
+              <View style={styles.dateNavRow}>
+                <Pressable style={styles.dateNavBtn} onPress={goToPreviousDay} hitSlop={6}>
+                  <View style={{ transform: [{ rotate: "180deg" }] }}>
+                    <ChevronRightIcon size={16} color={colors.text} />
                   </View>
+                </Pressable>
+                <Pressable style={styles.dateLabelBtn} onPress={() => setDatePickerOpen(true)}>
+                  <CalendarIcon size={13} color={colors.text} />
+                  <Text style={styles.dateLabelText}>{formatLoggedDateLabel(loggedDate, todayKey)}</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.dateNavBtn, !canGoToNextDay && styles.dateNavBtnDisabled]}
+                  onPress={goToNextDay}
+                  disabled={!canGoToNextDay}
+                  hitSlop={6}
+                >
+                  <ChevronRightIcon size={16} color={canGoToNextDay ? colors.text : colors.muted} />
+                </Pressable>
+              </View>
+
+              {loggedLoading ? (
+                <ActivityIndicator color={colors.accent} style={styles.tabPanelEmptyText} />
+              ) : loggedEntries.length === 0 ? (
+                <Text style={[styles.emptyText, styles.tabPanelEmptyText]}>
+                  {loggedDate === todayKey
+                    ? "Nothing logged yet — tell your coach what you ate."
+                    : "No meals logged that day."}
+                </Text>
+              ) : (
+                <View style={styles.logList}>
+                  {loggedEntries.map((entry) => {
+                    const badge = MEAL_BADGE[inferMealBucket(entry.at)];
+                    const MealIcon = getMealIcon(entry.description);
+                    return (
+                      <Pressable
+                        key={entry.id}
+                        style={styles.logRow}
+                        onPress={() => setSelectedEntry(entry)}
+                      >
+                        <View style={styles.logIconTile}>
+                          <MealIcon size={20} color={colors.accent} />
+                        </View>
+                        <View style={styles.logRowMain}>
+                          <Text style={styles.logDescription}>
+                            {entry.description}
+                          </Text>
+                          <View style={styles.logRowType}>
+                            <badge.Icon size={11} color={colors.text} />
+                            <Text style={styles.logRowTypeText}>{badge.label}</Text>
+                          </View>
+                          <Text style={styles.logMacros}>
+                            {entry.proteinG}g protein · {entry.carbsG}g carbs ·{" "}
+                            {entry.fatG}g fat
+                          </Text>
+                          <Text style={styles.logMeta}>
+                            {formatTime(entry.at)} · {entry.calories} kcal
+                          </Text>
+                        </View>
+                      </Pressable>
+                    );
+                  })}
                 </View>
-              ))}
-            </View>
+              )}
+            </>
           )}
 
           <View style={{ height: 24 }} />
         </ScrollView>
       )}
+
+      <BottomSheet
+        visible={!!selectedEntry}
+        onClose={() => setSelectedEntry(null)}
+      >
+        {selectedEntry && (
+          <View style={styles.detailWrap}>
+            <View style={styles.detailHeader}>
+              <View style={styles.logIconTile}>
+                {(() => {
+                  const DetailIcon = getMealIcon(selectedEntry.description);
+                  return <DetailIcon size={20} color={colors.accent} />;
+                })()}
+              </View>
+              <View style={styles.detailHeaderText}>
+                <Text style={styles.detailEyebrow}>
+                  {formatLongDate(selectedEntry.at)}
+                </Text>
+                <Text style={styles.detailTitle}>
+                  {selectedEntry.description}
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.detailStatsRow}>
+              <View style={styles.detailStat}>
+                <Text style={styles.detailStatValue}>
+                  {selectedEntry.calories}
+                </Text>
+                <Text style={styles.detailStatLabel}>cal</Text>
+              </View>
+              <View style={styles.detailStatDivider} />
+              <View style={styles.detailStat}>
+                <Text style={styles.detailStatValue}>
+                  {selectedEntry.proteinG}g
+                </Text>
+                <Text style={styles.detailStatLabel}>protein</Text>
+              </View>
+              <View style={styles.detailStatDivider} />
+              <View style={styles.detailStat}>
+                <Text style={styles.detailStatValue}>
+                  {selectedEntry.carbsG}g
+                </Text>
+                <Text style={styles.detailStatLabel}>carbs</Text>
+              </View>
+              <View style={styles.detailStatDivider} />
+              <View style={styles.detailStat}>
+                <Text style={styles.detailStatValue}>
+                  {selectedEntry.fatG}g
+                </Text>
+                <Text style={styles.detailStatLabel}>fat</Text>
+              </View>
+            </View>
+          </View>
+        )}
+      </BottomSheet>
+
+      <BottomSheet visible={datePickerOpen} onClose={() => setDatePickerOpen(false)}>
+        <MonthGrid
+          monthDate={pickerMonth}
+          onMonthChange={setPickerMonth}
+          onSelectDay={(key) => {
+            if (key > todayKey) return;
+            setLoggedDate(key);
+            setDatePickerOpen(false);
+          }}
+          dayCellStyle={(info) => (info.key === loggedDate ? styles.dayCellSelected : undefined)}
+        />
+      </BottomSheet>
     </SafeAreaView>
   );
 }
@@ -101,41 +427,117 @@ export function FuelScreen() {
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.bg },
   centerFill: { flex: 1, alignItems: "center", justifyContent: "center" },
-  header: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 20, height: 48 },
-  headerTitle: { fontFamily: fonts.bodySemiBold, fontSize: 13, letterSpacing: 1.4, color: colors.text },
-  content: { paddingHorizontal: 20, paddingBottom: 24 },
-
-  sectionLabel: {
-    fontFamily: fonts.monoBold,
-    fontSize: 10,
-    letterSpacing: 1.2,
-    color: colors.muted,
-    marginTop: 16,
-    marginBottom: 10,
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 20,
+    height: 48,
+    borderBottomWidth: 1,
+    borderBottomColor: "rgba(200,241,53,0.1)",
   },
-  emptyText: { fontFamily: fonts.body, fontSize: 12, color: colors.muted, lineHeight: 18 },
+  headerTitle: {
+    fontFamily: fonts.display,
+    fontSize: 22,
+    letterSpacing: 1.32,
+    color: colors.text,
+  },
+  content: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 24 },
 
-  macroCard: {
+  emptyText: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: colors.muted,
+    lineHeight: 18,
+  },
+  tabPanelEmptyText: { marginTop: 14 },
+
+  dateNavRow: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 14 },
+  dateNavBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
     backgroundColor: colors.surface,
     borderWidth: 1,
     borderColor: colors.border,
-    borderRadius: 14,
-    padding: 16,
-    gap: 16,
   },
-  macroRow: { gap: 6 },
-  macroRowTop: { flexDirection: "row", alignItems: "center", gap: 7 },
-  macroRowDot: { width: 7, height: 7, borderRadius: 3.5 },
-  macroRowLabel: { flex: 1, fontFamily: fonts.bodyMedium, fontSize: 13, color: "rgba(255,255,255,0.7)" },
-  macroRowValues: { flexDirection: "row", alignItems: "baseline", gap: 2 },
-  macroRowCurrent: { fontFamily: fonts.display, fontSize: 19 },
-  macroRowSep: { fontFamily: fonts.body, fontSize: 11, color: "rgba(255,255,255,0.22)" },
-  macroRowGoal: { fontFamily: fonts.bodyMedium, fontSize: 12, color: "rgba(255,255,255,0.35)" },
-  macroRowBar: { height: 4, borderRadius: 2, backgroundColor: "rgba(255,255,255,0.07)", overflow: "hidden" },
-  macroRowFill: { height: "100%", borderRadius: 2 },
-  macroRowRemaining: { fontFamily: fonts.body, fontSize: 10.5, color: "rgba(255,255,255,0.28)" },
+  dateNavBtnDisabled: { opacity: 0.4 },
+  dateLabelBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    height: 32,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 10,
+  },
+  dateLabelText: { fontFamily: fonts.bodySemiBold, fontSize: 12, color: colors.text },
 
-  logList: { gap: 8 },
+  ringSection: { alignItems: "center", gap: 14, paddingVertical: 8 },
+  ringWrap: { alignItems: "center" },
+  ringValue: { fontFamily: fonts.display, fontSize: 34, color: colors.text },
+  ringValueAlert: { color: colors.danger },
+  ringLabel: {
+    fontFamily: fonts.body,
+    fontSize: 11,
+    letterSpacing: 0.6,
+    color: colors.muted,
+    marginTop: 2,
+  },
+  overNotice: {
+    fontFamily: fonts.body,
+    fontSize: 11,
+    color: colors.danger,
+    textAlign: "center",
+  },
+
+  statsRow: { flexDirection: "row", gap: 20, justifyContent: "center" },
+  statChip: { alignItems: "center", gap: 2 },
+  statDot: { width: 6, height: 6, borderRadius: 3, marginBottom: 2 },
+  statValue: { fontFamily: fonts.display, fontSize: 16, color: colors.text },
+  statLabel: { fontFamily: fonts.body, fontSize: 10, color: colors.muted },
+
+  emptyRingWrap: { alignItems: "center", gap: 14, paddingVertical: 8 },
+  emptyRingText: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: colors.muted,
+    textAlign: "center",
+    width: 200,
+    marginTop: -8,
+  },
+
+  tabBar: {
+    flexDirection: "row",
+    gap: 4,
+    backgroundColor: colors.surfaceDeep,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 100,
+    padding: 3,
+    marginTop: 16,
+  },
+  tabBtn: {
+    flex: 1,
+    height: 34,
+    borderRadius: 100,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  tabBtnActive: { backgroundColor: colors.accent },
+  tabBtnText: {
+    fontFamily: fonts.bodySemiBold,
+    fontSize: 11.5,
+    color: colors.muted,
+  },
+  tabBtnTextActive: { color: colors.bg },
+
+  logList: { gap: 8, marginTop: 14 },
   logRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -143,11 +545,71 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surface,
     borderWidth: 1,
     borderColor: colors.border,
-    borderRadius: 12,
+    borderRadius: 10,
     paddingVertical: 12,
     paddingHorizontal: 14,
   },
-  logRowMain: { flex: 1, gap: 3 },
-  logDescription: { fontFamily: fonts.bodyMedium, fontSize: 13, color: colors.text },
-  logMeta: { fontFamily: fonts.body, fontSize: 11, color: colors.muted },
+  logIconTile: {
+    width: 52,
+    height: 52,
+    borderRadius: 10,
+    backgroundColor: colors.bg,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  logRowMain: { flex: 1, gap: 4 },
+  logDescription: {
+    fontFamily: fonts.bodyMedium,
+    fontSize: 13,
+    color: colors.text,
+  },
+  logRowType: { flexDirection: "row", alignItems: "center", gap: 4 },
+  logRowTypeText: {
+    fontFamily: fonts.bodyMedium,
+    fontSize: 11,
+    color: colors.text,
+  },
+  logMacros: { fontFamily: fonts.body, fontSize: 11, color: colors.muted },
+  logMeta: {
+    fontFamily: fonts.body,
+    fontSize: 10,
+    color: "rgba(255,255,255,0.35)",
+  },
+
+  detailWrap: { gap: 18, paddingHorizontal: 4 },
+  detailHeader: { flexDirection: "row", alignItems: "center", gap: 12 },
+  // The sheet's own close button is absolutely positioned top-right (BottomSheet.tsx) with no
+  // layout space reserved for it — a two-line wrapped title ran straight underneath it.
+  detailHeaderText: { flex: 1, gap: 4, paddingRight: 36 },
+  detailEyebrow: {
+    fontFamily: fonts.bodyBold,
+    fontSize: 10.5,
+    letterSpacing: 1.05,
+    textTransform: "uppercase",
+    color: colors.muted,
+  },
+  detailTitle: {
+    fontFamily: fonts.display,
+    fontSize: 24,
+    letterSpacing: 0.24,
+    color: colors.text,
+    lineHeight: 27,
+  },
+  detailStatsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    padding: 16,
+    borderRadius: 14,
+    backgroundColor: colors.surfaceDeep,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  detailStat: { flex: 1, alignItems: "center", gap: 2 },
+  detailStatValue: { fontFamily: fonts.bodyBold, fontSize: 16, color: colors.text },
+  detailStatLabel: { fontFamily: fonts.body, fontSize: 10.5, color: colors.muted },
+  detailStatDivider: { width: 1, height: 26, backgroundColor: colors.border },
+
+  dayCellSelected: { backgroundColor: colors.accentDim, borderColor: colors.accentBorder },
 });

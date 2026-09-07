@@ -1,5 +1,5 @@
-import React, { useEffect } from "react";
-import { StyleSheet, Text, View } from "react-native";
+import React, { useEffect, useState } from "react";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import Animated, {
   Easing,
   FadeInUp,
@@ -24,8 +24,13 @@ interface ScreenLoadingProps {
   onComplete: () => void;
   /** Resolves once plan generation has actually settled (success or handled failure) — waited
    *  on so this screen never hands off to Home before the plan exists. Absent readyPromise
-   *  falls back to the minimum display time alone. */
+   *  falls back to the minimum display time alone. Rejects only on a genuine failure — a slow
+   *  call that just hasn't settled yet by the safety timeout is not a rejection, and still
+   *  proceeds to Home in the background (see OnboardingFlow.tsx's planReadyRef comment). */
   readyPromise?: Promise<void> | null;
+  /** Re-invokes plan generation after a genuine failure — omitted (or the failure never occurs)
+   *  means the retry UI never shows. */
+  onRetry?: () => void;
 }
 
 // Sub-labels are real authored copy from the design (mustle-mvp's ScreenLoading.tsx), not
@@ -33,7 +38,7 @@ interface ScreenLoadingProps {
 const STEPS = [
   { label: "CREATING YOUR STARTING POINT", sub: "Generating personalized workouts", icon: "barbell" },
   { label: "PREPARING EXPERIENCE", sub: "Calibrating to your profile", icon: "sparkle" },
-  { label: "SETTING UP COACH", sub: "Mustle is ready", icon: "avatar" },
+  { label: "SETTING UP COACH", sub: "MUSTLE is ready", icon: "avatar" },
 ] as const;
 
 const STEP_DELAYS = [200, 1300, 2400];
@@ -136,8 +141,9 @@ const Step = ({
   );
 };
 
-export const ScreenLoading = ({ onComplete, readyPromise }: ScreenLoadingProps) => {
+export const ScreenLoading = ({ onComplete, readyPromise, onRetry }: ScreenLoadingProps) => {
   const [visible, setVisible] = React.useState<boolean[]>([false, false, false]);
+  const [status, setStatus] = useState<"pending" | "failed">("pending");
 
   const orbBreath = useSharedValue(0);
 
@@ -159,6 +165,9 @@ export const ScreenLoading = ({ onComplete, readyPromise }: ScreenLoadingProps) 
   }));
 
   useEffect(() => {
+    let cancelled = false;
+    setStatus("pending");
+    setVisible([false, false, false]);
     const timers: ReturnType<typeof setTimeout>[] = [];
 
     STEP_DELAYS.forEach((delay, i) => {
@@ -183,16 +192,28 @@ export const ScreenLoading = ({ onComplete, readyPromise }: ScreenLoadingProps) 
     const minDisplay = new Promise<void>((resolve) => {
       timers.push(setTimeout(resolve, MIN_DISPLAY_MS));
     });
-    // Never reject — a failed plan call still stops blocking; the resulting empty state is
-    // Home's problem to show, not this screen's to hang on.
-    const ready = readyPromise ? readyPromise.then(() => undefined, () => undefined) : Promise.resolve();
-    const safetyTimeout = new Promise<void>((resolve) => {
-      timers.push(setTimeout(resolve, SAFETY_TIMEOUT_MS));
+    // Distinguishes a genuine failure from success — only a real rejection shows the retry UI;
+    // everything else (including the safety-timeout race below) proceeds to the next screen.
+    const ready: Promise<"done" | "failed"> = readyPromise
+      ? readyPromise.then(() => "done" as const, () => "failed" as const)
+      : Promise.resolve("done" as const);
+    const safetyTimeout = new Promise<"timeout">((resolve) => {
+      timers.push(setTimeout(() => resolve("timeout"), SAFETY_TIMEOUT_MS));
     });
 
-    Promise.race([Promise.all([minDisplay, ready]), safetyTimeout]).then(finish);
+    Promise.race([Promise.all([minDisplay, ready]).then(([, result]) => result), safetyTimeout]).then((result) => {
+      if (cancelled) return;
+      if (result === "failed") {
+        setStatus("failed");
+        return;
+      }
+      finish();
+    });
 
-    return () => timers.forEach(clearTimeout);
+    return () => {
+      cancelled = true;
+      timers.forEach(clearTimeout);
+    };
   }, [onComplete, readyPromise]);
 
   return (
@@ -233,11 +254,21 @@ export const ScreenLoading = ({ onComplete, readyPromise }: ScreenLoadingProps) 
         </View>
       </View>
 
-      <View style={styles.steps}>
-        {STEPS.map((step, i) => (
-          <Step key={step.label} label={step.label} sub={step.sub} icon={step.icon} visible={visible[i]} />
-        ))}
-      </View>
+      {status === "failed" ? (
+        <View style={styles.failedWrap}>
+          <Text style={styles.failedTitle}>Couldn't finish setting up</Text>
+          <Text style={styles.failedSub}>Check your connection and try again.</Text>
+          <Pressable style={styles.retryBtn} onPress={onRetry} hitSlop={8}>
+            <Text style={styles.retryText}>Retry</Text>
+          </Pressable>
+        </View>
+      ) : (
+        <View style={styles.steps}>
+          {STEPS.map((step, i) => (
+            <Step key={step.label} label={step.label} sub={step.sub} icon={step.icon} visible={visible[i]} />
+          ))}
+        </View>
+      )}
     </View>
   );
 };
@@ -329,5 +360,36 @@ const styles = StyleSheet.create({
     height: 8,
     borderRadius: 4,
     backgroundColor: colors.accent,
+  },
+
+  failedWrap: {
+    alignItems: "center",
+    gap: 8,
+    maxWidth: 280,
+  },
+  failedTitle: {
+    fontFamily: fonts.display,
+    fontSize: 16,
+    letterSpacing: 0.4,
+    color: "rgba(255,255,255,0.85)",
+    textAlign: "center",
+  },
+  failedSub: {
+    fontFamily: fonts.body,
+    fontSize: 13,
+    color: "rgba(255,255,255,0.4)",
+    textAlign: "center",
+  },
+  retryBtn: {
+    marginTop: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 28,
+    borderRadius: 12,
+    backgroundColor: colors.accent,
+  },
+  retryText: {
+    fontFamily: fonts.bodySemiBold,
+    fontSize: 14,
+    color: "#141414",
   },
 });

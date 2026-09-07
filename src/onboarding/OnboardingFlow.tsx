@@ -41,7 +41,7 @@ interface OnboardingFlowProps {
 const LAST_BUILT_SCREEN = 13;
 
 export const OnboardingFlow = ({ userId, onComplete, skipSplash = false }: OnboardingFlowProps) => {
-  const { state, screenIndex, ready, update, goTo, goNext, goBack, complete, clearDraft } =
+  const { state, screenIndex, ready, update, goTo, editStep, goNext, goBack, complete, clearDraft } =
     useOnboardingState();
   // Landing/Login/Forgot-Password sit between Splash and the rest of the flow but aren't
   // themselves numbered steps — same choice the source design made (kept out of screenIndex's
@@ -67,6 +67,10 @@ export const OnboardingFlow = ({ userId, onComplete, skipSplash = false }: Onboa
   // (5.8s) — without this, onboarding routinely hands off to Home before the plan exists,
   // and Home has no way to know one is still coming. ScreenLoading waits on this instead.
   const planReadyRef = useRef<Promise<void> | null>(null);
+  // Bumped after a retry re-assigns planReadyRef.current to a fresh promise — planReadyRef is a
+  // plain ref, so mutating it alone doesn't re-render; this forces one so ScreenLoading receives
+  // the new promise as a fresh prop.
+  const [, setPlanAttempt] = useState(0);
 
   useEffect(() => {
     if (screenIndex > LAST_BUILT_SCREEN) {
@@ -92,47 +96,64 @@ export const OnboardingFlow = ({ userId, onComplete, skipSplash = false }: Onboa
     );
   }
 
+  // Resolves once the plan-generation call has genuinely settled — rejects only on a real
+  // failure (network/tool error), so ScreenLoading can tell that apart from a
+  // slow-but-still-running call. A successful call doesn't guarantee the model actually called
+  // generate_training_plan (it might ask a clarifying question or just reply conversationally
+  // instead), so this verifies a plan row actually exists before treating it as done — Home
+  // reads the pending flag to show an actionable state instead of the generic empty one.
+  //
+  // hidden:true (not false) — this reply is deliberately routed through the SAME "daily
+  // greeting" channel useHomeData.ts already reads and shows prominently on Home, rather than
+  // sitting as a real chat message a new user would have no reason to go looking for. Previously
+  // this was hidden:false: the coach's actual explanation of why this plan/split/targets were
+  // chosen was technically visible in the chat transcript, but nothing surfaced it — Home's own
+  // greeting caption came from a separate, later synthetic call, so a new user landed on Home
+  // seeing only a generic workout command with the real "why" buried in a transcript they had no
+  // reason to open. Marking it hidden:true makes it the exact message useHomeData's greeting
+  // query picks up as the first thing shown, with no new screen needed.
+  const runPlanGeneration = () => {
+    if (!userId) {
+      console.warn("[onboarding] no session — skipping sync");
+      return;
+    }
+    planReadyRef.current = syncOnboarding(userId, state)
+      .then(() =>
+        callBrain(
+          userId,
+          "I just finished onboarding — please set up my training plan and nutrition targets from what you know about me, and briefly explain why you chose this split and these targets.",
+          'text',
+          true,
+          45000,
+        ),
+      )
+      .then(async () => {
+        const { data } = await supabase
+          .from('training_plan')
+          .select('id')
+          .eq('user_id', userId)
+          .eq('status', 'active')
+          .maybeSingle();
+        if (data) await clearPlanPending();
+        else await markPlanPending();
+      })
+      .catch((err) => {
+        console.error("[onboarding] sync/plan generation failed:", err);
+        markPlanPending();
+        throw err;
+      });
+  };
+
+  const retryPlanGeneration = () => {
+    runPlanGeneration();
+    setPlanAttempt((n) => n + 1);
+  };
+
   // Runs once Account Creation succeeds — was Summary's onComplete directly before Account
   // Creation existed as its own step; unchanged otherwise.
   const finishOnboarding = () => {
     complete();
-    if (userId) {
-      // Resolves (never rejects) once the plan-generation call has settled either way —
-      // ScreenLoading awaits this so it never hands off to Home before the plan is real. A
-      // successful call doesn't guarantee the model actually called generate_training_plan
-      // (it might ask a clarifying question or just reply conversationally instead), so this
-      // verifies a plan row actually exists before treating onboarding as fully done — Home
-      // reads the pending flag to show an actionable state instead of the generic empty one.
-      planReadyRef.current = syncOnboarding(userId, state)
-        .then(() =>
-          callBrain(
-            userId,
-            "I just finished onboarding — please set up my training plan and nutrition targets from what you know about me.",
-            'text',
-            false,
-            45000,
-          ),
-        )
-        .then(async () => {
-          const { data } = await supabase
-            .from('training_plan')
-            .select('id')
-            .eq('user_id', userId)
-            .eq('status', 'active')
-            .maybeSingle();
-          if (data) await clearPlanPending();
-          else await markPlanPending();
-        })
-        .then(
-          () => undefined,
-          (err) => {
-            console.error("[onboarding] sync/plan generation failed:", err);
-            markPlanPending();
-          },
-        );
-    } else {
-      console.warn("[onboarding] no session — skipping sync");
-    }
+    runPlanGeneration();
     goNext();
   };
 
@@ -307,7 +328,7 @@ export const OnboardingFlow = ({ userId, onComplete, skipSplash = false }: Onboa
       return (
         <ScreenSummary
           state={state}
-          onNavigateTo={goTo}
+          onNavigateTo={editStep}
           onBack={goBack}
           onComplete={() => setShowAccountCreation(true)}
         />
@@ -321,6 +342,7 @@ export const OnboardingFlow = ({ userId, onComplete, skipSplash = false }: Onboa
             clearDraft();
             onComplete();
           }}
+          onRetry={retryPlanGeneration}
         />
       );
 

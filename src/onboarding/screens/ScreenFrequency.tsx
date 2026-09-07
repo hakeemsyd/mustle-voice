@@ -5,6 +5,7 @@ import { ProgressDots } from "../ProgressDots";
 import { WheelPicker } from "../../components/WheelPicker";
 import { fonts, colors } from "../../constants/theme";
 import { BackIcon } from "../../icons/BackIcon";
+import { useScreenInsets } from "../../hooks/useScreenInsets";
 
 interface ScreenFrequencyProps {
   initialDays?: number;
@@ -21,9 +22,10 @@ const DEFAULT_DAYS = 4;
 // replaces (confirmed live: "88 days a week" was accepted and displayed as-is).
 export const ScreenFrequency = ({ initialDays, onNext, onBack }: ScreenFrequencyProps) => {
   const [days, setDays] = useState(initialDays ?? DEFAULT_DAYS);
+  const insets = useScreenInsets();
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, { paddingTop: insets.top + 8 }]}>
       <View style={styles.topBar}>
         <TouchableOpacity style={styles.topBarSpacer} activeOpacity={0.7} onPress={onBack}>
           <BackIcon />
@@ -51,7 +53,7 @@ export const ScreenFrequency = ({ initialDays, onNext, onBack }: ScreenFrequency
         </View>
       </View>
 
-      <View style={styles.cta}>
+      <View style={[styles.cta, { paddingBottom: Math.max(insets.bottom + 12, 24) }]}>
         <TouchableOpacity style={styles.ctaBtn} activeOpacity={0.85} onPress={() => onNext(days)}>
           <Text style={styles.ctaBtnText}>CONTINUE</Text>
         </TouchableOpacity>
@@ -64,7 +66,6 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.bg,
-    paddingTop: 60,
   },
   topBar: {
     flexDirection: "row",
@@ -113,7 +114,6 @@ const styles = StyleSheet.create({
   },
   cta: {
     paddingHorizontal: 24,
-    paddingBottom: 32,
   },
   ctaBtn: {
     backgroundColor: colors.accent,

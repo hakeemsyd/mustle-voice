@@ -19,12 +19,20 @@ export const QUICK_PROMPT_OPTIONS: QuickPromptOption[] = [
   { label: "Just chat", phrase: "How's it going?" },
 ];
 
+export const GLOBAL_CHAT_PROMPT_OPTIONS: QuickPromptOption[] = [
+  { label: "Next workout", phrase: "What's today's workout?" },
+  { label: "Week's plan", phrase: "Give me a breakdown of my plan for this week" },
+  { label: "Today's nutrition", phrase: "Give me my nutrition summary for today" },
+  { label: "Previous workout", phrase: "What was my previous workout?" },
+];
+
 interface QuickPromptChipsProps {
   onPick: (phrase: string) => void;
   disabled?: boolean;
+  options?: QuickPromptOption[];
 }
 
-export function QuickPromptChips({ onPick, disabled }: QuickPromptChipsProps) {
+export function QuickPromptChips({ onPick, disabled, options = QUICK_PROMPT_OPTIONS }: QuickPromptChipsProps) {
   return (
     <ScrollView
       horizontal
@@ -33,7 +41,7 @@ export function QuickPromptChips({ onPick, disabled }: QuickPromptChipsProps) {
       contentContainerStyle={styles.row}
       keyboardShouldPersistTaps="handled"
     >
-      {QUICK_PROMPT_OPTIONS.map((opt) => (
+      {options.map((opt) => (
         <Pressable
           key={opt.label}
           style={styles.chip}

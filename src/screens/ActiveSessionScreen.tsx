@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
+import { useFocusEffect } from "@react-navigation/native";
 import {
-  Alert,
   Keyboard,
   KeyboardAvoidingView,
   Platform,
@@ -8,35 +8,61 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableWithoutFeedback,
   View,
 } from "react-native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
-import { VoiceOrb } from "../components/VoiceOrb";
-import { FloatingParticles } from "../components/FloatingParticles";
-import { HeroGlow } from "../components/HeroGlow";
-import { RestTimerPanel } from "../components/RestTimerPanel";
 import { useRestRemaining } from "../hooks/useRestRemaining";
-import { SessionCoachCard, type CoachCardState } from "../components/SessionCoachCard";
-import { SessionInputBar } from "../components/SessionInputBar";
-import { SessionControlBar } from "../components/SessionControlBar";
 import { ConfirmSheet } from "../components/ConfirmSheet";
 import { GuideSheet } from "../components/GuideSheet";
-import { SwitchWorkoutSheet } from "../components/SwitchWorkoutSheet";
-import { ManageSessionSheet } from "../components/ManageSessionSheet";
+import { SessionControlsMenu } from "../components/SessionControlsMenu";
 import { PostWorkoutFeedback } from "../components/PostWorkoutFeedback";
-import { formatClock } from "../components/MiniSessionBar";
+import { SessionChatThread } from "../components/session-chat/SessionChatThread";
+import { ChatChipRow, type ChatChip } from "../components/session-chat/ChatChipRow";
+import { CollapsibleSessionCard } from "../components/session-chat/CollapsibleSessionCard";
+import { SessionVoiceInputDock } from "../components/session-chat/SessionVoiceInputDock";
+import { CARDIO_ACTIVITIES } from "../components/SwitchWorkoutSheet";
+import { formatClock } from "../lib/formatClock";
 import { useScreenInsets } from "../hooks/useScreenInsets";
-import { useVoiceSession } from "../hooks/useVoiceSession";
-import { useActiveSessionContext } from "../session/ActiveSessionContext";
-import { colors, fonts } from "../constants/theme";
-import { BookOpenIcon, ChevronDownIcon, PauseIcon, PlayIcon } from "../icons";
-import { describeParsedSet, looksLikeSetReport, parseSetReport } from "../lib/parseSetReport";
+import { useSharedVoiceSession } from "../session/VoiceSessionProvider";
+import { useActiveSessionContext, type SessionTarget } from "../session/ActiveSessionContext";
+import { usePlanAlternatives } from "../hooks/usePlanAlternatives";
+import { getSwapCandidates, type SwapCandidate } from "../session/exerciseSwap";
+import { supabase } from "../lib/supabase";
+import { colors, fonts, sessionColors } from "../constants/theme";
+import { BookOpenIcon, CalendarIcon, PlayIcon } from "../icons";
+import { BackIcon } from "../icons/BackIcon";
+import { CheckIcon } from "../icons/CheckIcon";
+import { DumbbellIcon } from "../icons/DumbbellIcon";
+import { SettingsIcon } from "../icons/SettingsIcon";
+import { StopIcon } from "../icons/StopIcon";
+import { MoreHorizontalIcon } from "../icons/MoreHorizontalIcon";
+import {
+  describeParsedSet,
+  looksLikeSetReport,
+  looksLikeStartSetCommand,
+  parseSetReport,
+} from "../lib/parseSetReport";
 import { buildLiveSessionSnapshot, describeLiveSessionSnapshot } from "../session/liveSessionState";
+import { chooseRestDay } from "../lib/restDay";
+import { titleCase } from "../lib/textFormat";
 import type { RootStackParamList } from "../navigation/types";
 
 type Props = NativeStackScreenProps<RootStackParamList, "ActiveSession">;
+
+type ChipsState =
+  | { kind: "idle" }
+  | { kind: "gear-menu" }
+  | { kind: "change-target" }
+  | { kind: "change-pick"; exerciseRowId: string; exerciseName: string; candidates: SwapCandidate[] }
+  | { kind: "remove-target" }
+  | { kind: "switch-pick" }
+  // Cardio has no Preview screen to route through (it isn't backed by a plan_session_id the
+  // way a strength alternate is), so it gets its own explicit one-more-tap confirmation here
+  // instead — never silently becomes the running session off a single chip pick.
+  | { kind: "switch-confirm-cardio"; activity: string };
 
 export function ActiveSessionScreen({ navigation }: Props) {
   const insets = useScreenInsets();
@@ -45,79 +71,203 @@ export function ActiveSessionScreen({ navigation }: Props) {
   const [draft, setDraft] = useState("");
   const [endConfirmOpen, setEndConfirmOpen] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
-  const [switchOpen, setSwitchOpen] = useState(false);
-  const [manageOpen, setManageOpen] = useState(false);
+  const [inputHint, setInputHint] = useState(false);
+  const [undoVisible, setUndoVisible] = useState(false);
+  const [chatChips, setChatChips] = useState<ChipsState>({ kind: "idle" });
+  const [cardCollapsed, setCardCollapsed] = useState(true);
+  // Mic-first: this screen auto-connects on focus and the whole point is reporting sets by
+  // voice, so it lands on the speak surface rather than an open keyboard composer.
+  const [inputMode, setInputMode] = useState<"mic" | "keyboard">("mic");
+  const [swipeWidth, setSwipeWidth] = useState(0);
+  const [expandedWidth, setExpandedWidth] = useState(0);
+  const [controlsOpen, setControlsOpen] = useState(false);
+  const chipScrollRef = useRef<ScrollView>(null);
+  const expandedScrollRef = useRef<ScrollView>(null);
+  const inputRef = useRef<TextInput>(null);
+  const inputHintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const {
     target, loading, error, focus, exercises, currentExercise, currentExerciseIndex,
     loggedSets, resting, restKey, restTargetSec, restEndAt, restPausedRemainingSec,
     ended, endedStatus, saving, hasLoggedAnySet,
-    coachMessage, coachThinking, elapsedSec, paused,
+    coachThinking, elapsedSec, paused,
     removeQueuedExercise, swapQueuedExercise,
   } = session;
 
   const isCardio = target?.type === "cardio";
-  const restRemaining = useRestRemaining(restEndAt, restPausedRemainingSec);
 
-  // viaVoice=true skips the set_logged coach cue below — a voice-reported set already got the
-  // user's own spoken turn, so the agent naturally replies on its own; only a typed/tapped log
-  // needs a cue to prompt a spoken confirmation, since nobody spoke for that one.
-  const commitSet = (weight: number | null, reps: number, viaVoice = false) => {
-    session.logSet(weight, reps);
-    session.noteSetLogged(describeParsedSet({ weight, reps }));
+  // The exercise strip is a horizontally-paged ScrollView with no scroll-position binding of its
+  // own — confirmed live: finishing the last set of an exercise advances currentExerciseIndex (the
+  // card's own data correctly re-renders "COMPLETED" on the old exercise) but the scroll offset
+  // itself never moves, so the screen keeps showing whatever page the user happened to be
+  // scrolled to until they swipe manually. Both the collapsed strip and the expanded view need
+  // this, since either can be the visible one when the index changes.
+  //
+  // Confirmed live: depending on swipeWidth/expandedWidth here (instead of just reading them at
+  // call time) caused a real infinite render loop — scrollTo() on a paging ScrollView can itself
+  // re-fire onLayout, which unconditionally calls setSwipeWidth/setExpandedWidth even when the
+  // width hasn't actually changed, producing a new render that re-ran this very effect, which
+  // called scrollTo again, forever. Refs break that cycle: the effect now only re-runs when the
+  // exercise actually changes, and reads whatever width is current at that moment.
+  const swipeWidthRef = useRef(0);
+  swipeWidthRef.current = swipeWidth;
+  const expandedWidthRef = useRef(0);
+  expandedWidthRef.current = expandedWidth;
+
+  useEffect(() => {
+    if (isCardio) return;
+    // Confirmed live: a single attempt right when the index changes could silently no-op if the
+    // relevant ScrollView's width hadn't been measured yet at that exact moment (e.g. right after
+    // toggling collapsed/expanded) — nothing retried it afterward, so the screen was left showing
+    // an older exercise, correctly marked "COMPLETED", instead of the one actually current. Only
+    // one of swipeWidth/expandedWidth is ever populated at a time (whichever card state is
+    // actually mounted), so this retries until EITHER succeeds, not both.
+    let cancelled = false;
+    let attempts = 0;
+    const tryScroll = () => {
+      if (cancelled) return;
+      attempts += 1;
+      let scrolled = false;
+      if (swipeWidthRef.current > 0) {
+        chipScrollRef.current?.scrollTo({ x: currentExerciseIndex * swipeWidthRef.current, animated: true });
+        scrolled = true;
+      }
+      if (expandedWidthRef.current > 0) {
+        expandedScrollRef.current?.scrollTo({ x: currentExerciseIndex * expandedWidthRef.current, animated: true });
+        scrolled = true;
+      }
+      if (!scrolled && attempts < 20) setTimeout(tryScroll, 100);
+    };
+    tryScroll();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentExerciseIndex, isCardio]);
+
+  const restRemaining = useRestRemaining(restEndAt, restPausedRemainingSec);
+  const currentSetCount = loggedSets[currentExerciseIndex]?.length ?? 0;
+  const nextExerciseName = exercises[currentExerciseIndex + 1]?.name ?? null;
+  // Plan data only carries a load *scheme* ("%1RM", "RPE 8"), never a number, so the collapsed
+  // row shows the weight actually lifted this exercise once there is one and falls back to the
+  // scheme until then.
+  const lastLoggedWeight = [...(loggedSets[currentExerciseIndex] ?? [])]
+    .reverse()
+    .find((set) => set.weight !== null)?.weight;
+  const currentWeightLabel =
+    lastLoggedWeight != null
+      ? `${lastLoggedWeight} KG`
+      : (currentExercise?.loadScheme ?? "—");
+  const { alternatives: switchAlternatives } = usePlanAlternatives(
+    target?.type === "strength" ? target.planSessionId : undefined,
+  );
+
+  const commitSet = (weight: number | null, reps: number, viaVoice = false, unit?: "seconds") => {
+    session.logSet(weight, reps, unit);
+    session.noteSetLogged(describeParsedSet({ weight, reps, unit }));
     setDraft("");
     if (!viaVoice) triggerCueRef.current?.("set_logged");
+
+    setUndoVisible(true);
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    undoTimerRef.current = setTimeout(() => setUndoVisible(false), 8000);
   };
 
-  // sendContextualUpdate isn't available yet when this closure below is created (it comes back
-  // from the useVoiceSession call this closure is passed into) — a ref lets the closure reach
-  // whatever the latest one is once it exists, instead of only ever seeing the first render's.
   const sendContextRef = useRef<((text: string) => void) | null>(null);
-  // Same story for the proactive-coaching cue trigger, defined further below.
   const triggerCueRef = useRef<((cue: string) => void) | null>(null);
 
   const {
     orbState, isActive, status: voiceStatus, toggle, sendContextualUpdate, sendUserMessage,
-    reconnecting, voiceDropped, idleClosed,
-  } = useVoiceSession(
-    (message) => {
-      if (message.role !== "user" || isCardio || resting) return;
+    reconnecting, voiceDropped, idleClosed, connect, isMuted, toggleMute,
+    setMessageHandler, setSessionConfig,
+  } = useSharedVoiceSession();
+
+  // Claims the shared conversation on focus. Two jobs: open the mic on arrival, and cancel the
+  // pending release the screen we came from (Session Preview) scheduled on its way out, so the
+  // hand-off carries one continuous call rather than a close-then-redial. Deliberately no
+  // release on blur — a running workout keeps voice alive while minimized, and Home's orb is
+  // where you stop it.
+  useFocusEffect(
+    React.useCallback(() => {
+      connect();
+    }, [connect]),
+  );
+
+  useEffect(() => {
+    setMessageHandler((message) => {
+      if (!message.text.startsWith("[[SYSTEM_CUE]]")) {
+        session.appendMessage(message.role === "user" ? "user" : "coach", message.text);
+      }
+      // Checked before the rest guard below: during rest this is the one thing the user can say
+      // that must still act on the session, and it's what makes "let's go / next set / start
+      // set 3" actually clear the timer instead of waiting on a tool call that may never come.
+      if (message.role === "user" && !isCardio && resting && looksLikeStartSetCommand(message.text)) {
+        session.finishRest();
+        try {
+          sendContextRef.current?.(
+            "The user just asked to start the next set, so the app ended their rest early and the " +
+              "timer is now cleared. Rest is over — pick the next set up from here.",
+          );
+        } catch (err) {
+          console.error("[active session] failed to tell coach rest was skipped:", err);
+        }
+        return;
+      }
+      if (message.role !== "user" || isCardio || (resting && restRemaining > 0)) return;
       if (!looksLikeSetReport(message.text)) return;
       const parsed = parseSetReport(message.text);
-      if (!parsed) return;
-      commitSet(parsed.weight, parsed.reps, true);
+      if (!parsed) {
+        // The single biggest source of coach/app drift: the user reports a set, the coach hears
+        // and counts it conversationally, but the local parser can't read the numbers out of it
+        // — and this used to `return` silently. The app stayed on set N while the coach believed
+        // N was done, and the two never reconciled for the rest of the exercise. Telling the
+        // coach nothing was recorded is what keeps the two counts on the same page.
+        try {
+          sendContextRef.current?.(
+            `IMPORTANT: that sounded like a set report, but the app could NOT read a weight and rep ` +
+              `count out of it, so NOTHING was logged. The app is still waiting on set ` +
+              `${currentSetCount + 1}${currentExercise ? ` of ${currentExercise.sets} for ${currentExercise.name}` : ""}. ` +
+              `Do not count that set or move on — ask them once, briefly, for the weight and reps.`,
+          );
+        } catch (err) {
+          console.error("[active session] failed to tell coach a set report failed to parse:", err);
+        }
+        return;
+      }
+      commitSet(parsed.weight, parsed.reps, true, parsed.unit);
       const setNumber = currentSetCount + 1;
-      const loadLabel = parsed.weight !== null ? `${parsed.weight}kg` : "bodyweight";
+      // describeParsedSet is unit-aware ("52s held" vs "60kg × 8 reps") — this used to hardcode
+      // "× N reps" regardless, so a timed hold (Plank, etc.) told the coach a rep count that was
+      // actually a duration, and it would confirm "52 reps" out loud for a 52-second hold.
       try {
         sendContextRef.current?.(
           `The app just logged this set directly from what the user said: ${currentExercise?.name ?? "the current exercise"}, ` +
-            `set ${setNumber}${currentExercise ? ` of ${currentExercise.sets}` : ""}, ${loadLabel} × ${parsed.reps} reps. ` +
+            `set ${setNumber}${currentExercise ? ` of ${currentExercise.sets}` : ""}, ${describeParsedSet(parsed)}. ` +
             `It's already recorded — don't ask what exercise it was, whether they've done it before, or ask them to confirm ` +
-            `any of these details. Acknowledge in one short sentence and move the conversation forward.`,
+            `any of these details, and if they say it was wrong or misheard, call undo_last_set instead of just apologizing ` +
+            `in text. Acknowledge in one short sentence and move the conversation forward.`,
         );
       } catch (err) {
         console.error("[active session] failed to send set-logged context to voice:", err);
       }
-    },
-    {
+    });
+    setSessionConfig({
       userId: session.userId,
       dynamicVariables: {
         user_name: session.userName ?? "there",
         user_id: session.userId ?? "",
         user_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       },
-    },
-  );
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isCardio, resting, restRemaining, currentExercise, currentSetCount, session.userId, session.userName]);
 
   useEffect(() => {
     sendContextRef.current = sendContextualUpdate;
   }, [sendContextualUpdate]);
 
-  // sendUserMessage (unlike sendContextualUpdate) makes the agent actually produce a spoken
-  // reply — the only client call that does — so it's what drives proactive coaching moments
-  // where nobody has spoken (greeting the workout, announcing rest, prompting the next set).
-  // The [[SYSTEM_CUE]] marker tells brain-voice this wasn't really said by the user (see
-  // brain-config.ts) and logs it hidden from the visible transcript.
+  const liveStateWriteRef = useRef<PromiseLike<unknown>>(Promise.resolve());
+
   useEffect(() => {
     triggerCueRef.current = (cue: string) => {
       if (voiceStatus !== "connected") return;
@@ -132,17 +282,6 @@ export function ActiveSessionScreen({ navigation }: Props) {
   const toggleRef = useRef(toggle);
   toggleRef.current = toggle;
 
-  // Pushes the live session state (exercise, set, rest status) into the running voice
-  // conversation on every structural change — this is the coach's only source of ground truth
-  // for what the screen actually shows. Deliberately excludes restEndAt/elapsedSec from the
-  // dependency list — those tick every second and would spam a contextual update per second;
-  // resting/restTargetSec/restPausedRemainingSec already capture every transition worth telling
-  // the coach about.
-  //
-  // Must gate on status === "connected", not isActive — isActive is also true while still
-  // "connecting", before the underlying conversation object exists. Calling
-  // sendContextualUpdate that early throws ("No active conversation. Call startSession()
-  // first.") and crashes the screen — confirmed live.
   useEffect(() => {
     if (voiceStatus !== "connected") return;
     const snapshot = buildLiveSessionSnapshot({
@@ -168,23 +307,79 @@ export function ActiveSessionScreen({ navigation }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [voiceStatus, target, focus, exercises, currentExerciseIndex, loggedSets, resting, restTargetSec, restPausedRemainingSec, paused, ended]);
 
-  // Greets once per session, as soon as both a real session and a connected voice call exist —
-  // whichever arrives second triggers it. Keyed on the target object itself (a fresh one each
-  // session.start()) rather than a boolean, so a brand-new session always re-greets.
+  useEffect(() => {
+    if (!session.userId || !target) return;
+    liveStateWriteRef.current = supabase.from("live_session_state").upsert({
+      user_id: session.userId,
+      state: {
+        target,
+        focus,
+        exercises,
+        currentExerciseIndex,
+        loggedSets,
+        resting,
+        restTargetSec,
+        restEndAt: session.restEndAt,
+        restPausedRemainingSec,
+        ended,
+        paused,
+        elapsedSec,
+      },
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.userId, target, focus, exercises, currentExerciseIndex, loggedSets, resting, restTargetSec, restPausedRemainingSec, paused, ended]);
+
   const greetedSessionRef = useRef<typeof target>(null);
   useEffect(() => {
     if (!target || ended || voiceStatus !== "connected") return;
     if (!isCardio && !currentExercise) return;
     if (greetedSessionRef.current === target) return;
     greetedSessionRef.current = target;
-    triggerCueRef.current?.("session_start");
+    // The coach's first line reads target reps/load from the live_session_state row this same
+    // screen just wrote — confirmed live: firing this cue right after the (un-awaited) upsert let
+    // the read race the write, so on an unlucky first turn the row wasn't there yet and the coach
+    // stated a made-up rep count instead of the plan's real one. Waiting on the same write promise
+    // the effect above just started (settled either way, so a write failure doesn't mute the cue)
+    // guarantees the row exists before the coach is asked to read from it.
+    void liveStateWriteRef.current.then(
+      () => triggerCueRef.current?.("session_start"),
+      () => triggerCueRef.current?.("session_start"),
+    );
   }, [target, ended, voiceStatus, isCardio, currentExercise]);
 
-  // Rest-period proactive cues: a heads-up a few seconds before it ends, a prompt once it
-  // actually hits zero, and — only if they still haven't moved on a while after that — a single
-  // non-repetitive check-in. Guarded per rest period (restKey) so each only ever fires once per
-  // rest, and `restingRef` gives the delayed check-in a live read of whether rest is still going
-  // by the time its timer fires, not the stale value from when it was scheduled.
+  // Rest has to end itself. Nothing called finishRest except the expanded card's Continue
+  // button, so a finished rest sat at 0:00 forever and the next set could never begin.
+  // Deliberately independent of voice status — the timer must advance whether or not a call is
+  // connected.
+  useEffect(() => {
+    if (!resting || restPausedRemainingSec !== null || restRemaining > 0) return;
+    session.finishRest();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resting, restRemaining, restPausedRemainingSec]);
+
+  // The agent had no idea a rest timer was running: `set_logged` told it to say rest had
+  // started, but not how long for or to then stay quiet — so it filled the silence, and every
+  // prompt it made invited a reply, which kept the loop going all through the rest period.
+  // Sent as a contextual update rather than a cue on purpose: a cue goes in as a user turn and
+  // demands a response, which is the opposite of what's wanted here.
+  const restBriefedKeyRef = useRef(-1);
+  useEffect(() => {
+    if (!resting || voiceStatus !== "connected") return;
+    if (restBriefedKeyRef.current === restKey) return;
+    restBriefedKeyRef.current = restKey;
+    const seconds = restPausedRemainingSec ?? restTargetSec;
+    try {
+      sendContextRef.current?.(
+        `The app just started a ${seconds}-second rest timer and is showing it on screen. Do not ` +
+          `speak again until the app tells you rest is over — no check-ins, no "ready when you are", ` +
+          `no asking them to start the next set. The app will tell you the moment rest ends. If the ` +
+          `user speaks to you first, answer them normally, but otherwise stay silent.`,
+      );
+    } catch (err) {
+      console.error("[active session] failed to brief coach on rest start:", err);
+    }
+  }, [resting, restKey, restTargetSec, restPausedRemainingSec, voiceStatus]);
+
   const restCueStateRef = useRef({ key: -1, countdown: false, over: false, silence: false });
   const restingRef = useRef(resting);
   restingRef.current = resting;
@@ -214,14 +409,10 @@ export function ActiveSessionScreen({ navigation }: Props) {
     }
   }, [restRemaining, resting, restKey, voiceStatus]);
 
-  // Opening the screen is what "restored" means — the MiniSessionBar hides again.
   useEffect(() => {
     session.restore();
   }, []);
 
-  // The LiveKit connection can drop on its own (confirmed live: a ping timeout silently ate a
-  // spoken set report). useVoiceSession auto-retries once; these just make that visible instead
-  // of leaving a dead-looking orb with no explanation for why nothing got logged.
   useEffect(() => {
     if (reconnecting) session.announce("Voice connection dropped — reconnecting…");
   }, [reconnecting]);
@@ -234,11 +425,6 @@ export function ActiveSessionScreen({ navigation }: Props) {
     if (idleClosed) session.announce("Ended the call — you'd gone quiet for a while. Tap to talk again.");
   }, [idleClosed]);
 
-  // Minimizing intentionally keeps voice running (handleMinimize) — but any other way this
-  // screen goes away (ending the workout, a forced navigation, a crash-recovery unmount) must
-  // not leave the mic silently listening. `session.minimized` is set true by handleMinimize and
-  // reset to false by clear() (which every true-exit path calls first), so it's the one signal
-  // that reliably tells them apart at unmount time.
   const minimizedRef = useRef(session.minimized);
   minimizedRef.current = session.minimized;
   const isActiveRef = useRef(isActive);
@@ -250,47 +436,20 @@ export function ActiveSessionScreen({ navigation }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Ending a workout must end its voice conversation too, not just leave it running through the
-  // post-workout feedback view — confirmed live: voice stayed connected there with nothing left
-  // to talk about. Minimizing an in-progress session still deliberately keeps voice alive
-  // (handleMinimize); this only fires once the session has actually ended.
   useEffect(() => {
     if (ended && isActiveRef.current) toggleRef.current();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ended]);
 
-  const currentSetCount = loggedSets[currentExerciseIndex]?.length ?? 0;
   const parsedDraft = parseSetReport(draft);
 
-  const coachState: CoachCardState = coachThinking
-    ? "thinking"
-    : isActive && orbState === "listening"
-      ? "listening"
-      : isActive && orbState === "speaking"
-        ? "speaking"
-        : "idle";
-
-  const orbHint = isActive
-    ? orbState === "listening"
-      ? "LISTENING…"
-      : orbState === "processing"
-        ? "THINKING…"
-        : orbState === "speaking"
-          ? "SPEAKING"
-          : "VOICE ON · TAP TO STOP"
-    : resting
-      ? "RESTING · TAP TO TALK"
-      : "TAP TO TALK";
-
-  // One field, two destinations: a parsable set report logs the set; anything
-  // else goes to the coach. Matches the design's single-input model.
   const handleSend = () => {
     const text = draft.trim();
     if (!text) return;
     if (!isCardio && !resting && looksLikeSetReport(text)) {
       const parsed = parseSetReport(text);
       if (parsed) {
-        commitSet(parsed.weight, parsed.reps);
+        commitSet(parsed.weight, parsed.reps, false, parsed.unit);
         return;
       }
     }
@@ -301,35 +460,29 @@ export function ActiveSessionScreen({ navigation }: Props) {
   const handleDoneSet = () => {
     if (resting || !currentExercise) return;
     if (parsedDraft) {
-      commitSet(parsedDraft.weight, parsedDraft.reps);
+      commitSet(parsedDraft.weight, parsedDraft.reps, false, parsedDraft.unit);
       return;
     }
-    Alert.alert(
-      "Log this set?",
-      "Add the weight and reps first — e.g. “60kg 8 reps” — so it's recorded accurately.",
-      [{ text: "OK" }],
-    );
+    inputRef.current?.focus();
+    setInputHint(true);
+    if (inputHintTimerRef.current) clearTimeout(inputHintTimerRef.current);
+    inputHintTimerRef.current = setTimeout(() => setInputHint(false), 4000);
   };
 
-  // Minimize keeps the session running and drops the user back to the app; ending it is a
-  // separate, always-confirmed action.
-  //
-  // goBack(), not navigate("Tabs") — PreWorkoutPreviewScreen reaches here via replace(), so
-  // Tabs is always the screen directly beneath this one. navigate() only pops back to an
-  // existing screen "if" the navigator judges one already present; goBack() is unconditional,
-  // so minimize can never instead push a second Tabs on top of this still-mounted screen —
-  // which is what was actually showing this screen's own header bleeding through Home's top.
+  const handleUndoLastSet = () => {
+    setUndoVisible(false);
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    session.undoLastSet();
+    session.announce("Undone — that set wasn't logged.");
+  };
+
   const handleMinimize = () => {
     session.minimize();
     navigation.goBack();
   };
 
-  // Ending by hand is always a partial strength session — a fully finished one ends itself
-  // from logSet. Cardio has no set count to fall short of, so it saves as completed.
   const confirmEnd = async () => {
     setEndConfirmOpen(false);
-    // Nothing logged means there's no workout_log row to attach feedback to, so asking for
-    // it would throw the answer away. Just back out of the session.
     if (!isCardio && !hasLoggedAnySet) {
       closeOut();
       return;
@@ -339,46 +492,182 @@ export function ActiveSessionScreen({ navigation }: Props) {
 
   const closeOut = () => {
     const workoutLogId = session.workoutLogId;
+    const sessionMessages = session.messages;
     session.clear();
     if (workoutLogId) {
-      navigation.replace("SessionReport", { workoutLogId });
+      navigation.replace("SessionReport", { workoutLogId, sessionMessages });
     } else {
       navigation.goBack();
     }
   };
 
-  const handleSwitchConfirm = (next: Parameters<typeof session.start>[0]) => {
-    setSwitchOpen(false);
-    const switchedFrom = target?.type === "strength" ? target.planSessionId : undefined;
-    session.start({ ...next, switchedFromSessionId: switchedFrom } as typeof next);
+  const handleRestDay = async () => {
+    const deferredPlanSessionId = target?.type === "strength" ? target.planSessionId : null;
+    const userId = session.userId;
+    await session.resolveOutgoingSession();
+    if (userId) await chooseRestDay(userId, deferredPlanSessionId);
+    session.clear();
+    navigation.goBack();
   };
 
+  // Switching used to call session.start() straight from the chip pick — a single tap silently
+  // became a running session with no exercise list shown and no explicit Start Session tap.
+  // Confirmed live (Damion): picking "Lower Body" mid-Upper-Pull immediately opened an active
+  // Back Squat session with nothing previewed. A strength alternate now routes through the real
+  // Preview screen instead — persist the outgoing partial exactly like handleRestDay already
+  // does, clear out of the active session entirely (not start a new one), then let Preview's own
+  // intro/exercise-list/Start Session do what it already does everywhere else in the app.
+  const handleSwitchToPreview = async (planSessionId: string) => {
+    await session.resolveOutgoingSession();
+    session.clear();
+    navigation.replace("PreWorkoutPreview", { planSessionId });
+  };
+
+  const handleSwitchConfirm = (next: SessionTarget) => {
+    const switchedFrom = target?.type === "strength" ? target.planSessionId : undefined;
+    session.start({ ...next, switchedFromSessionId: switchedFrom } as SessionTarget);
+  };
+
+  const resetChips = () => setChatChips({ kind: "idle" });
+
+  const upcomingExercises = exercises.slice(currentExerciseIndex + 1);
+
+  const handleChipPick = async (label: string) => {
+    if (label === "Cancel") {
+      resetChips();
+      return;
+    }
+
+    if (chatChips.kind === "gear-menu") {
+      if (label === "Change Exercise") {
+        session.announce("Which upcoming exercise would you like to change?");
+        setChatChips({ kind: "change-target" });
+      } else if (label === "Remove Exercise") {
+        session.announce("Which upcoming exercise should I remove?");
+        setChatChips({ kind: "remove-target" });
+      } else if (label === "Change Workout") {
+        session.announce("Which workout would you like instead?");
+        setChatChips({ kind: "switch-pick" });
+      }
+      return;
+    }
+
+    if (chatChips.kind === "change-target") {
+      const exercise = upcomingExercises.find((e) => e.name === label);
+      if (!exercise || !session.userId) return;
+      session.announce("One sec — checking safe alternates…");
+      const candidates = await getSwapCandidates(session.userId, exercise.exerciseId);
+      if (candidates.length === 0) {
+        session.announce("No safe alternates found for that one.");
+        resetChips();
+        return;
+      }
+      setChatChips({ kind: "change-pick", exerciseRowId: exercise.id, exerciseName: exercise.name, candidates });
+      return;
+    }
+
+    if (chatChips.kind === "change-pick") {
+      const candidate = chatChips.candidates.find((c) => c.name === label);
+      if (!candidate) return;
+      swapQueuedExercise(chatChips.exerciseRowId, candidate);
+      session.announce(`Swapped ${chatChips.exerciseName} for ${candidate.name}.`);
+      resetChips();
+      return;
+    }
+
+    if (chatChips.kind === "remove-target") {
+      const exercise = upcomingExercises.find((e) => e.name === label);
+      if (!exercise) return;
+      removeQueuedExercise(exercise.id);
+      session.announce(`Removed ${exercise.name} from this session.`);
+      resetChips();
+      return;
+    }
+
+    if (chatChips.kind === "switch-pick") {
+      if (label === "Take a Rest Day") {
+        resetChips();
+        void handleRestDay();
+        return;
+      }
+      const alt = switchAlternatives.find((a) => titleCase(a.focus) === label);
+      if (alt) {
+        resetChips();
+        session.announce(`Switching to ${titleCase(alt.focus)} — pulling up the exercises now.`);
+        void handleSwitchToPreview(alt.planSessionId);
+        return;
+      }
+      if ((CARDIO_ACTIVITIES as readonly string[]).includes(label)) {
+        session.announce(
+          `${label} is a timer-based session — nothing from ${
+            focus ? titleCase(focus) : "today's workout"
+          } is lost, it's saved as-is. Start it now?`,
+        );
+        setChatChips({ kind: "switch-confirm-cardio", activity: label });
+      }
+      return;
+    }
+
+    if (chatChips.kind === "switch-confirm-cardio" && label === "Start") {
+      resetChips();
+      handleSwitchConfirm({ type: "cardio", activity: chatChips.activity });
+    }
+  };
+
+  const chipsForState: ChatChip[] =
+    chatChips.kind === "gear-menu"
+      ? [{ label: "Change Exercise" }, { label: "Remove Exercise" }, { label: "Change Workout" }, { label: "Cancel" }]
+      : chatChips.kind === "change-target" || chatChips.kind === "remove-target"
+        ? upcomingExercises.length === 0
+          ? [{ label: "Cancel" }]
+          : [...upcomingExercises.map((e) => ({ label: e.name })), { label: "Cancel" }]
+        : chatChips.kind === "change-pick"
+          ? [...chatChips.candidates.map((c) => ({ label: c.name })), { label: "Cancel" }]
+          : chatChips.kind === "switch-pick"
+            ? [
+                { label: "Take a Rest Day" },
+                ...switchAlternatives.map((a) => ({ label: titleCase(a.focus) })),
+                ...CARDIO_ACTIVITIES.map((activity) => ({ label: activity })),
+                { label: "Cancel" },
+              ]
+            : chatChips.kind === "switch-confirm-cardio"
+              ? [{ label: "Start", primary: true }, { label: "Cancel" }]
+              : [];
+
   const showBars = !loading && !error && !ended && (isCardio || exercises.length > 0);
+  const cardBackground = resting ? sessionColors.rest : sessionColors.active;
 
   return (
     <KeyboardAvoidingView
       style={[styles.screen, { paddingBottom: insets.bottom }]}
       behavior={Platform.OS === "ios" ? "padding" : "height"}
     >
+      {/* One mono label, no big exercise title — the yellow card below already names the
+          current exercise, and repeating it in the header was the design's own reason for
+          dropping it. Both side slots are the same fixed width so the label stays centred. */}
       <View style={[styles.header, { paddingTop: insets.top }]}>
-        <Pressable style={styles.closeBtn} onPress={handleMinimize} hitSlop={8}>
-          <ChevronDownIcon size={18} color={colors.text} />
-        </Pressable>
-        <View style={styles.headerCenter}>
-          <Text style={styles.sessionLabel}>ACTIVE SESSION</Text>
-          <Text style={styles.exerciseNameHeader} numberOfLines={1}>
-            {isCardio
-              ? (target?.type === "cardio" ? target.activity : "").toUpperCase()
-              : (ended ? focus ?? "" : currentExercise?.name ?? focus ?? "").toUpperCase()}
-          </Text>
-        </View>
-        {!isCardio && currentExercise && !ended ? (
-          <Pressable style={styles.closeBtn} onPress={() => setGuideOpen(true)} hitSlop={8}>
-            <BookOpenIcon size={15} color={colors.text} />
+        <View style={styles.headerSide}>
+          <Pressable onPress={handleMinimize} hitSlop={12}>
+            <BackIcon size={22} color="rgba(255,255,255,0.7)" />
           </Pressable>
-        ) : (
-          <View style={styles.headerSpacer} />
-        )}
+        </View>
+        <Text style={styles.headerLabel}>ACTIVE WORKOUT</Text>
+        <View style={[styles.headerSide, styles.headerSideRight]}>
+          {!isCardio && currentExercise && !ended && (
+            <>
+              <Pressable style={styles.iconBtn} onPress={() => setGuideOpen(true)} hitSlop={8}>
+                <BookOpenIcon size={15} color={colors.text} />
+              </Pressable>
+              <Pressable
+                style={styles.iconBtn}
+                onPress={() => navigation.navigate("Calendar", { initialScope: "today" })}
+                hitSlop={8}
+              >
+                <CalendarIcon size={15} color={colors.text} />
+              </Pressable>
+            </>
+          )}
+        </View>
       </View>
 
       {loading ? (
@@ -422,103 +711,321 @@ export function ActiveSessionScreen({ navigation }: Props) {
         </ScrollView>
       ) : (
         <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
-        <View style={styles.body}>
-          <View style={styles.hero}>
-            <FloatingParticles />
-            <HeroGlow />
-            <Pressable style={styles.orbBtn} onPress={toggle} hitSlop={12}>
-              <VoiceOrb state={orbState} size={115} />
-            </Pressable>
-            <Text style={styles.orbHint}>{orbHint}</Text>
+          <View style={styles.body}>
+            <SessionChatThread messages={session.messages} typing={coachThinking} />
           </View>
-
-          <View style={styles.coachZone}>
-            <SessionCoachCard state={coachState} message={coachMessage} />
-          </View>
-
-          <View style={styles.targetZone}>
-            {isCardio ? (
-              <View style={styles.targetCard}>
-                <Text style={styles.targetSetLabel}>ELAPSED</Text>
-                <Text style={styles.targetValue}>{formatClock(elapsedSec)}</Text>
-                <Pressable
-                  style={styles.pauseBtn}
-                  onPress={() => session.setPaused(!paused)}
-                >
-                  {paused ? (
-                    <PlayIcon size={13} color={colors.text} />
-                  ) : (
-                    <PauseIcon size={13} color={colors.text} />
-                  )}
-                  <Text style={styles.pauseText}>{paused ? "Resume" : "Pause"}</Text>
-                </Pressable>
-              </View>
-            ) : resting && currentExercise ? (
-              <RestTimerPanel
-                key={restKey}
-                remaining={restRemaining}
-                targetSec={restTargetSec}
-                paused={restPausedRemainingSec !== null}
-                onExtend={session.extendRest}
-                onTogglePause={session.toggleRestPause}
-                nextSet={{
-                  exerciseName: currentExercise.name,
-                  setNumber: currentSetCount + 1,
-                  detail: [currentExercise.repScheme, currentExercise.loadScheme].filter(Boolean).join(" · "),
-                }}
-                onContinue={session.finishRest}
-              />
-            ) : currentExercise ? (
-              <View style={styles.targetCard}>
-                <Text style={styles.targetSetLabel}>
-                  SET {currentSetCount + 1} OF {currentExercise.sets}
-                </Text>
-                <Text style={styles.targetValue}>{currentExercise.repScheme}</Text>
-                <Text style={styles.targetSub}>
-                  {currentExercise.loadScheme ? `TARGET REPS · ${currentExercise.loadScheme}` : "TARGET REPS"}
-                </Text>
-              </View>
-            ) : null}
-          </View>
-
-          {!isCardio && currentExercise && (
-            <View style={styles.statsRow}>
-              <View style={styles.statItem}>
-                <Text style={styles.statLabel}>SETS LOGGED</Text>
-                <Text style={styles.statValue}>
-                  {currentSetCount}/{currentExercise.sets}
-                </Text>
-              </View>
-              <View style={styles.statDivider} />
-              <View style={styles.statItem}>
-                <Text style={styles.statLabel}>REST TARGET</Text>
-                <Text style={styles.statValue}>{restTargetSec}s</Text>
-              </View>
-              <View style={styles.statDivider} />
-              <View style={styles.statItem}>
-                <Text style={styles.statLabel}>LOAD</Text>
-                <Text style={styles.statValue}>{currentExercise.loadScheme ?? "—"}</Text>
-              </View>
-            </View>
-          )}
-        </View>
         </TouchableWithoutFeedback>
       )}
 
       {showBars && (
         <>
-          <SessionInputBar
+          {undoVisible && (
+            <Pressable style={styles.undoPill} onPress={handleUndoLastSet}>
+              <Text style={styles.undoPillText}>Wrong? Undo last set</Text>
+            </Pressable>
+          )}
+
+          <CollapsibleSessionCard
+            collapsed={cardCollapsed}
+            collapsedHeight={60}
+            expandedHeight={284}
+            backgroundColor={cardBackground}
+            onPress={() => setCardCollapsed((c) => !c)}
+          >
+            {cardCollapsed && (
+              <View style={styles.collapsedRow}>
+                {/* One page per exercise, paged by the strip's own width so a swipe moves
+                    cleanly from one to the next. Only the current page carries the
+                    label/value readout; the others are inert previews. */}
+                <ScrollView
+                  ref={chipScrollRef}
+                  horizontal
+                  pagingEnabled
+                  showsHorizontalScrollIndicator={false}
+                  style={styles.chipSwipe}
+                  onLayout={(e) => setSwipeWidth(e.nativeEvent.layout.width)}
+                >
+                  {isCardio ? (
+                    <View style={[styles.chipSlide, swipeWidth ? { width: swipeWidth } : null]}>
+                      <View style={styles.chipInfoRow}>
+                        <View style={styles.chipInfoColExercise}>
+                          <Text style={styles.chipInfoLabelTag}>CARDIO</Text>
+                          <Text style={styles.chipInfoValue} numberOfLines={1}>
+                            {(target?.type === "cardio" ? target.activity : "Cardio").toUpperCase()}
+                          </Text>
+                        </View>
+                        <View style={styles.chipDivider} />
+                        <View style={styles.chipInfoCol}>
+                          <Text style={styles.chipInfoLabel}>ELAPSED</Text>
+                          <Text style={styles.chipInfoValueSmall}>{formatClock(elapsedSec)}</Text>
+                        </View>
+                      </View>
+                    </View>
+                  ) : (
+                    exercises.map((exercise, i) => {
+                      const slideWidth = swipeWidth ? { width: swipeWidth } : null;
+
+                      if (i === currentExerciseIndex) {
+                        return (
+                          <Pressable
+                            key={exercise.id}
+                            style={[styles.chipSlide, slideWidth]}
+                            onPress={() => setCardCollapsed(false)}
+                          >
+                            {resting ? (
+                              <View style={styles.chipRestRow}>
+                                <Text style={styles.chipRestCounter}>{formatClock(restRemaining)}</Text>
+                                <View style={styles.chipDivider} />
+                                <View style={styles.chipRestNextGroup}>
+                                  <Text style={styles.chipInfoLabelTag}>NEXT</Text>
+                                  <Text style={styles.chipInfoValue} numberOfLines={1}>
+                                    {currentSetCount >= (exercise.sets ?? 0) && nextExerciseName
+                                      ? nextExerciseName.toUpperCase()
+                                      : `SET ${currentSetCount + 1}`}
+                                  </Text>
+                                </View>
+                              </View>
+                            ) : (
+                              <View style={styles.chipInfoRow}>
+                                <View style={styles.chipInfoColExercise}>
+                                  <Text style={styles.chipInfoLabelTag}>EXERCISE</Text>
+                                  <Text style={styles.chipInfoValue} numberOfLines={1}>
+                                    {exercise.name.toUpperCase()}
+                                  </Text>
+                                </View>
+                                <View style={styles.chipDivider} />
+                                <View style={styles.chipInfoCol}>
+                                  <Text style={styles.chipInfoLabel}>SET</Text>
+                                  <Text style={styles.chipInfoValueSmall}>
+                                    {Math.min(currentSetCount + 1, exercise.sets ?? 1)}/{exercise.sets ?? 1}
+                                  </Text>
+                                </View>
+                                <View style={styles.chipDivider} />
+                                <View style={styles.chipInfoCol}>
+                                  <Text style={styles.chipInfoLabel}>REPS</Text>
+                                  <Text style={styles.chipInfoValueSmall}>{exercise.repScheme ?? "—"}</Text>
+                                </View>
+                                <View style={styles.chipDivider} />
+                                <View style={styles.chipInfoCol}>
+                                  <Text style={styles.chipInfoLabel}>WEIGHT</Text>
+                                  <Text style={styles.chipInfoValueSmall}>{currentWeightLabel}</Text>
+                                </View>
+                              </View>
+                            )}
+                          </Pressable>
+                        );
+                      }
+
+                      const done = i < currentExerciseIndex;
+                      return (
+                        <View
+                          key={exercise.id}
+                          style={[styles.chipSlide, slideWidth, done && styles.chipSlideCompleted]}
+                        >
+                          <Text style={[styles.chipTag, done ? styles.chipTagCompleted : styles.chipTagUpcoming]}>
+                            {done ? "COMPLETED" : "UPCOMING"}
+                          </Text>
+                          <View style={styles.chipSlideRow}>
+                            <Text style={styles.chipExercise} numberOfLines={1}>
+                              {exercise.name.toUpperCase()}
+                            </Text>
+                            {exercise.repScheme && (
+                              <>
+                                <View style={styles.chipDivider} />
+                                <Text style={styles.chipMeta} numberOfLines={1}>
+                                  {exercise.sets} × {exercise.repScheme}
+                                </Text>
+                              </>
+                            )}
+                          </View>
+                        </View>
+                      );
+                    })
+                  )}
+                </ScrollView>
+
+                {/* One control, matching the design — opens the same change/remove/switch
+                    menu the old gear icon did. */}
+                <Pressable
+                  style={styles.chipControlBtn}
+                  onPress={() => setControlsOpen(true)}
+                  hitSlop={8}
+                >
+                  <MoreHorizontalIcon size={16} color="#0A0A0A" />
+                </Pressable>
+              </View>
+            )}
+
+            {!cardCollapsed && (
+              <View style={styles.expandedInner}>
+                {/* Same paged strip as the collapsed row, laid out as full slides — swipe back
+                    through what's done and forward through what's coming. Only the current
+                    slide carries the live readout and collapses the card on tap. */}
+                <ScrollView
+                  ref={expandedScrollRef}
+                  horizontal
+                  pagingEnabled
+                  showsHorizontalScrollIndicator={false}
+                  style={styles.expandedSwipe}
+                  onLayout={(e) => setExpandedWidth(e.nativeEvent.layout.width)}
+                >
+                  {isCardio ? (
+                    <View style={[styles.expandedSlide, expandedWidth ? { width: expandedWidth } : null]}>
+                      <Text style={styles.exerciseName}>
+                        {(target?.type === "cardio" ? target.activity : "Cardio").toUpperCase()}
+                      </Text>
+                      <View style={styles.targetCard}>
+                        <Text style={styles.targetSetLabel}>ELAPSED</Text>
+                        <Text style={styles.targetValue}>{formatClock(elapsedSec)}</Text>
+                      </View>
+                    </View>
+                  ) : (
+                    exercises.map((exercise, i) => {
+                      const slideWidth = expandedWidth ? { width: expandedWidth } : null;
+
+                      if (i !== currentExerciseIndex) {
+                        const done = i < currentExerciseIndex;
+                        return (
+                          <View
+                            key={`exp-${exercise.id}`}
+                            style={[styles.expandedSlide, slideWidth, done && styles.expandedSlideCompleted]}
+                          >
+                            <Text style={[styles.chipTag, done ? styles.chipTagCompleted : styles.chipTagUpcoming]}>
+                              {done ? "COMPLETED" : "UPCOMING"}
+                            </Text>
+                            <Text style={styles.exerciseName}>{exercise.name.toUpperCase()}</Text>
+                            {exercise.repScheme && (
+                              <Text style={styles.targetSub}>
+                                {exercise.sets} × {exercise.repScheme}
+                              </Text>
+                            )}
+                          </View>
+                        );
+                      }
+
+                      return (
+                        <Pressable
+                          key={`exp-${exercise.id}`}
+                          style={[styles.expandedSlide, slideWidth]}
+                          onPress={() => setCardCollapsed(true)}
+                        >
+                          <Text style={styles.exerciseName}>{exercise.name.toUpperCase()}</Text>
+                          <View style={styles.targetCard}>
+                            {resting ? (
+                              <>
+                                <Text style={styles.targetSetLabel}>RESTING</Text>
+                                {/* Counter centred with +10s pinned to the card's right edge —
+                                    a three-slot row, so the number stays optically centred
+                                    however wide the button is. */}
+                                <View style={styles.restCounterRow}>
+                                  <View style={styles.restCounterSpacer} />
+                                  <Text style={styles.targetValue}>{formatClock(restRemaining)}</Text>
+                                  <View style={styles.restCounterAction}>
+                                    <Pressable
+                                      style={styles.restAddBtn}
+                                      onPress={() => session.extendRest(10, "manual")}
+                                      hitSlop={8}
+                                    >
+                                      <Text style={styles.restAddText}>+10s</Text>
+                                    </Pressable>
+                                  </View>
+                                </View>
+                                <Text style={styles.nextSetChip}>
+                                  {currentSetCount >= (exercise.sets ?? 0) && nextExerciseName
+                                    ? `Next: ${nextExerciseName}`
+                                    : `Next: Set ${currentSetCount + 1}`}
+                                </Text>
+                                <View style={styles.targetWeight}>
+                                  <DumbbellIcon size={14} color="#0A0A0A" />
+                                  <Text style={styles.targetWeightText}>{currentWeightLabel}</Text>
+                                </View>
+                              </>
+                            ) : (
+                              <>
+                                <Text style={styles.targetSetLabel}>
+                                  SET {Math.min(currentSetCount + 1, exercise.sets ?? 1)} OF {exercise.sets ?? 1}
+                                </Text>
+                                <Text style={styles.targetValue}>{exercise.repScheme ?? "—"}</Text>
+                                <Text style={styles.targetSub}>TARGET REPS</Text>
+                                <View style={styles.targetWeight}>
+                                  <DumbbellIcon size={14} color="#0A0A0A" />
+                                  <Text style={styles.targetWeightText}>{currentWeightLabel}</Text>
+                                </View>
+                              </>
+                            )}
+                          </View>
+                        </Pressable>
+                      );
+                    })
+                  )}
+                </ScrollView>
+
+                <View style={styles.controlsRow}>
+                  <View style={styles.controlsRowPrimary}>
+                    {resting && !isCardio ? (
+                      <Pressable style={styles.doneBtnSlim} onPress={session.finishRest}>
+                        <PlayIcon size={13} color="#FFFFFF" />
+                        <Text style={[styles.doneBtnText, styles.doneBtnTextRest]}>
+                          Start Set {currentSetCount + 1}
+                        </Text>
+                      </Pressable>
+                    ) : (
+                      <Pressable
+                        style={[styles.doneBtnSlim, isCardio && styles.doneBtnSlimDisabled]}
+                        onPress={handleDoneSet}
+                        disabled={isCardio}
+                      >
+                        <CheckIcon size={14} color={sessionColors.active} />
+                        <Text style={styles.doneBtnText}>Set done</Text>
+                      </Pressable>
+                    )}
+                    <Pressable style={styles.workoutDoneBtn} onPress={() => setEndConfirmOpen(true)}>
+                      <StopIcon size={11} color="#0A0A0A" />
+                      <Text style={styles.workoutDoneText}>Workout done</Text>
+                    </Pressable>
+                  </View>
+                  <Pressable
+                    style={styles.iconGhostBtn}
+                    onPress={() => {
+                      session.announce("What would you like to change?");
+                      setChatChips({ kind: "gear-menu" });
+                    }}
+                    hitSlop={8}
+                  >
+                    <SettingsIcon size={14} color="#0A0A0A" />
+                  </Pressable>
+                </View>
+              </View>
+            )}
+
+          </CollapsibleSessionCard>
+
+          {chatChips.kind !== "idle" && <ChatChipRow chips={chipsForState} onPick={handleChipPick} />}
+
+          <View style={[styles.inputDock, { paddingBottom: Math.max(insets.bottom, 12) }]}>
+          <SessionVoiceInputDock
+            ref={inputRef}
             value={draft}
             onChangeText={setDraft}
             onSend={handleSend}
-            parsePreview={!isCardio && parsedDraft ? describeParsedSet(parsedDraft) : null}
+            mode={inputMode}
+            onModeChange={setInputMode}
+            isVoiceActive={isActive}
+            onToggleVoice={toggle}
+            orbState={orbState}
+            voiceStatus={voiceStatus}
+            reconnecting={reconnecting}
+            muted={isMuted}
+            onToggleMute={toggleMute}
+            parsePreview={
+              !isCardio && parsedDraft
+                ? describeParsedSet(parsedDraft)
+                : inputHint
+                  ? 'Type weight and reps here — e.g. "60kg 8 reps"'
+                  : null
+            }
           />
-          <SessionControlBar
-            onDoneTap={handleDoneSet}
-            doneEnabled={!resting && !isCardio}
-            onEndTap={() => setEndConfirmOpen(true)}
-            onManageTap={() => setManageOpen(true)}
-          />
+          </View>
         </>
       )}
 
@@ -539,6 +1046,19 @@ export function ActiveSessionScreen({ navigation }: Props) {
         onConfirm={confirmEnd}
       />
 
+      <SessionControlsMenu
+        open={controlsOpen}
+        onClose={() => setControlsOpen(false)}
+        onSetDone={!isCardio && !resting ? handleDoneSet : undefined}
+        onStartSet={!isCardio && resting ? session.finishRest : undefined}
+        startSetLabel={`Start set ${currentSetCount + 1}`}
+        onWorkoutDone={() => setEndConfirmOpen(true)}
+        onManageWorkout={() => {
+          session.announce("What would you like to change?");
+          setChatChips({ kind: "gear-menu" });
+        }}
+      />
+
       <GuideSheet
         open={guideOpen}
         onClose={() => setGuideOpen(false)}
@@ -546,33 +1066,6 @@ export function ActiveSessionScreen({ navigation }: Props) {
         exerciseName={currentExercise?.name ?? null}
         repScheme={currentExercise?.repScheme}
         loadScheme={currentExercise?.loadScheme ?? undefined}
-      />
-
-      <ManageSessionSheet
-        open={manageOpen}
-        onClose={() => setManageOpen(false)}
-        userId={session.userId}
-        isCardio={isCardio}
-        exercises={exercises}
-        currentExerciseIndex={currentExerciseIndex}
-        onRemove={removeQueuedExercise}
-        onSwap={swapQueuedExercise}
-        onSwitchWorkout={() => {
-          setManageOpen(false);
-          setSwitchOpen(true);
-        }}
-      />
-
-      <SwitchWorkoutSheet
-        open={switchOpen}
-        onClose={() => setSwitchOpen(false)}
-        currentPlanSessionId={target?.type === "strength" ? target.planSessionId : undefined}
-        confirmDescription={
-          hasLoggedAnySet
-            ? "The sets you've already logged in this session will be discarded — nothing has been saved yet."
-            : "Nothing's been logged yet, so nothing is lost."
-        }
-        onConfirm={handleSwitchConfirm}
       />
     </KeyboardAvoidingView>
   );
@@ -588,40 +1081,356 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: 20,
-    paddingBottom: 4,
+    paddingBottom: 14,
   },
-  closeBtn: {
+  // 74px each side — wide enough for the two icon buttons on the right, and matched on the
+  // left so the centre label is optically centred rather than pushed off by them.
+  headerSide: {
+    width: 74,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  headerSideRight: {
+    justifyContent: "flex-end",
+    gap: 6,
+  },
+  headerLabel: {
+    fontFamily: fonts.monoBold,
+    fontSize: 11,
+    letterSpacing: 1.54,
+    color: colors.muted,
+  },
+  iconBtn: {
     width: 34,
     height: 34,
     borderRadius: 17,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: colors.surfaceDeep,
+    backgroundColor: colors.surface,
     borderWidth: 1,
     borderColor: colors.border,
   },
-  headerSpacer: {
-    width: 34,
-  },
-  headerCenter: {
-    flex: 1,
-    alignItems: "center",
-    gap: 2,
-  },
-  sessionLabel: {
-    fontFamily: fonts.monoBold,
-    fontSize: 10,
-    letterSpacing: 1.4,
-    color: colors.muted,
-  },
-  exerciseNameHeader: {
-    fontFamily: fonts.display,
-    fontSize: 18,
-    letterSpacing: 0.4,
-    color: colors.text,
-  },
   body: {
     flex: 1,
+  },
+
+  // ── Expanded card ── literal black-on-yellow, same reasoning as the collapsed row.
+  expandedInner: {
+    flex: 1,
+    justifyContent: "space-between",
+    paddingTop: 20,
+    paddingHorizontal: 18,
+    paddingBottom: 16,
+  },
+  expandedSwipe: {
+    flex: 1,
+    minHeight: 0,
+    width: "100%",
+  },
+  expandedSlide: {
+    height: "100%",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 2,
+  },
+  expandedSlideCompleted: {
+    opacity: 0.55,
+  },
+  exerciseName: {
+    fontFamily: fonts.display,
+    fontSize: 18,
+    letterSpacing: 0.72,
+    lineHeight: 19,
+    textAlign: "center",
+    color: "#0A0A0A",
+  },
+  // Full width, not shrink-to-fit: the rest row's +10s button has to be able to reach the
+  // card's real right edge, which it can't if this column is only as wide as its widest line.
+  targetCard: {
+    width: "100%",
+    alignItems: "center",
+    gap: 6,
+    paddingTop: 4,
+    paddingBottom: 8,
+  },
+  targetSetLabel: {
+    fontFamily: fonts.mono,
+    fontSize: 11,
+    letterSpacing: 1.1,
+    color: "#0A0A0A",
+  },
+  targetValue: {
+    fontFamily: fonts.display,
+    fontSize: 56,
+    lineHeight: 56,
+    color: "#0A0A0A",
+  },
+  targetSub: {
+    fontFamily: fonts.body,
+    fontSize: 12.5,
+    color: "#0A0A0A",
+  },
+  targetWeight: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginTop: 4,
+  },
+  targetWeightText: {
+    fontFamily: fonts.bodyBold,
+    fontSize: 14,
+    color: "#0A0A0A",
+  },
+  restCounterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    width: "100%",
+  },
+  restCounterSpacer: {
+    flex: 1,
+  },
+  restCounterAction: {
+    flex: 1,
+    alignItems: "flex-end",
+  },
+  restAddBtn: {
+    height: 30,
+    paddingHorizontal: 12,
+    borderRadius: 15,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "rgba(0,0,0,0.12)",
+  },
+  restAddText: {
+    fontFamily: fonts.bodyBold,
+    fontSize: 12,
+    color: "rgba(0,0,0,0.65)",
+  },
+  nextSetChip: {
+    overflow: "hidden",
+    fontFamily: fonts.bodyBold,
+    fontSize: 11.5,
+    letterSpacing: 0.23,
+    color: "#FFFFFF",
+    backgroundColor: "#0A0A0A",
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+  },
+  controlsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    width: "100%",
+    paddingTop: 12,
+    marginTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: "rgba(0,0,0,0.08)",
+  },
+  controlsRowPrimary: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    minWidth: 0,
+  },
+  // Black pill, not lime — a lime button would disappear into the card itself.
+  doneBtnSlim: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    height: 34,
+    paddingHorizontal: 16,
+    borderRadius: 999,
+    backgroundColor: "#0A0A0A",
+  },
+  doneBtnSlimDisabled: {
+    opacity: 0.35,
+  },
+  doneBtnText: {
+    fontFamily: fonts.bodyBold,
+    fontSize: 12.5,
+    letterSpacing: 0.25,
+    color: sessionColors.active,
+  },
+  doneBtnTextRest: {
+    color: "#FFFFFF",
+  },
+  workoutDoneBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    height: 34,
+    paddingHorizontal: 14,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "rgba(0,0,0,0.22)",
+  },
+  workoutDoneText: {
+    fontFamily: fonts.bodyBold,
+    fontSize: 12.5,
+    letterSpacing: 0.25,
+    color: "#0A0A0A",
+  },
+  iconGhostBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "rgba(0,0,0,0.12)",
+  },
+
+  // ── Collapsed card row ── one page per exercise plus a single control, all literal
+  // black-on-yellow colours since this card is the screen's one light surface.
+  collapsedRow: {
+    height: "100%",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    paddingLeft: 16,
+    paddingRight: 10,
+  },
+  chipSwipe: {
+    flex: 1,
+    minWidth: 0,
+    height: "100%",
+  },
+  chipSlide: {
+    height: "100%",
+    justifyContent: "center",
+    alignItems: "flex-start",
+    gap: 3,
+  },
+  chipSlideCompleted: {
+    opacity: 0.55,
+  },
+  chipSlideRow: {
+    width: "100%",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  chipInfoRow: {
+    width: "100%",
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 10,
+  },
+  chipInfoCol: {
+    gap: 4,
+  },
+  // Only the exercise column may shrink and ellipsize — its length is the unpredictable one,
+  // and Set/Reps/Weight must never be the columns that get truncated.
+  chipInfoColExercise: {
+    flexShrink: 1,
+    minWidth: 0,
+    gap: 4,
+  },
+  chipInfoLabel: {
+    fontFamily: fonts.bodyBold,
+    fontSize: 10,
+    letterSpacing: 0.6,
+    color: "rgba(0,0,0,0.5)",
+  },
+  chipInfoLabelTag: {
+    overflow: "hidden",
+    alignSelf: "flex-start",
+    fontFamily: fonts.bodyBold,
+    fontSize: 10,
+    letterSpacing: 0.6,
+    color: sessionColors.active,
+    backgroundColor: "#0A0A0A",
+    borderRadius: 999,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+  },
+  chipInfoValue: {
+    fontFamily: fonts.display,
+    fontSize: 14,
+    letterSpacing: 0.42,
+    color: "#0A0A0A",
+  },
+  // Set/Reps/Weight share DM Sans rather than the display face: Bebas Neue's glyph metrics
+  // read as sitting higher than the neighbouring values even inside a fixed-height box.
+  chipInfoValueSmall: {
+    fontFamily: fonts.bodySemiBold,
+    fontSize: 12.5,
+    color: "#0A0A0A",
+  },
+  chipDivider: {
+    width: 1,
+    height: 14,
+    backgroundColor: "rgba(0,0,0,0.12)",
+  },
+  chipRestRow: {
+    width: "100%",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  chipRestCounter: {
+    fontFamily: fonts.display,
+    fontSize: 26,
+    letterSpacing: 0.5,
+    color: "#0A0A0A",
+  },
+  chipRestNextGroup: {
+    flexShrink: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  chipTag: {
+    overflow: "hidden",
+    alignSelf: "flex-start",
+    fontFamily: fonts.bodyBold,
+    fontSize: 9,
+    letterSpacing: 0.54,
+    borderRadius: 999,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+  },
+  chipTagUpcoming: {
+    backgroundColor: "rgba(0,0,0,0.1)",
+    color: "rgba(0,0,0,0.6)",
+  },
+  chipTagCompleted: {
+    backgroundColor: "rgba(0,0,0,0.06)",
+    color: "rgba(0,0,0,0.45)",
+  },
+  chipExercise: {
+    flexShrink: 1,
+    fontFamily: fonts.display,
+    fontSize: 14,
+    letterSpacing: 0.42,
+    color: "#0A0A0A",
+  },
+  chipMeta: {
+    fontFamily: fonts.bodySemiBold,
+    fontSize: 12.5,
+    color: "rgba(0,0,0,0.78)",
+  },
+  chipControlBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "rgba(0,0,0,0.12)",
+  },
+  // The dock had no padding of its own, so the input pill ran off both screen edges and sat
+  // over the home indicator.
+  inputDock: {
+    paddingTop: 10,
+    paddingHorizontal: 20,
+    borderTopWidth: 1,
+    borderTopColor: colors.borderSubtle,
   },
   centerFill: {
     flex: 1,
@@ -635,99 +1444,194 @@ const styles = StyleSheet.create({
     color: colors.muted,
     textAlign: "center",
   },
-  hero: {
-    alignItems: "center",
-    justifyContent: "center",
-    paddingTop: 4,
-    height: 250,
-  },
-  orbBtn: {
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  orbHint: {
-    marginTop: 14,
-    fontFamily: fonts.monoBold,
-    fontSize: 10,
-    letterSpacing: 1.6,
-    color: colors.muted,
-  },
-  coachZone: {
-    paddingHorizontal: 16,
-  },
-  targetZone: {
-    flex: 1,
-    justifyContent: "center",
-    paddingHorizontal: 16,
-  },
-  targetCard: {
-    alignItems: "center",
-    gap: 6,
-  },
-  targetSetLabel: {
-    fontFamily: fonts.monoBold,
-    fontSize: 11,
-    letterSpacing: 1.6,
-    color: colors.muted,
-  },
-  targetValue: {
-    fontFamily: fonts.display,
-    fontSize: 68,
-    letterSpacing: 1,
-    color: colors.text,
-  },
-  targetSub: {
-    fontFamily: fonts.monoBold,
-    fontSize: 10,
-    letterSpacing: 1.2,
-    color: colors.muted,
-  },
-  pauseBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 7,
-    marginTop: 10,
-    paddingVertical: 10,
-    paddingHorizontal: 18,
-    borderRadius: 12,
+  undoPill: {
+    alignSelf: "center",
+    marginBottom: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+    borderRadius: 14,
     backgroundColor: colors.surfaceDeep,
     borderWidth: 1,
     borderColor: colors.border,
   },
-  pauseText: {
+  undoPillText: {
     fontFamily: fonts.bodySemiBold,
-    fontSize: 13,
-    color: colors.text,
+    fontSize: 12,
+    color: colors.accent,
   },
-  statsRow: {
+  cardHeaderRow: {
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 16,
-    paddingTop: 14,
-    borderTopWidth: 1,
-    borderTopColor: colors.borderSubtle,
+    gap: 12,
+    height: 68,
+    paddingHorizontal: 20,
   },
-  statItem: {
+  cardHeaderText: {
     flex: 1,
-    alignItems: "center",
-    gap: 4,
+    gap: 1,
   },
-  statLabel: {
+  cardEyebrow: {
     fontFamily: fonts.monoBold,
-    fontSize: 9,
-    letterSpacing: 1.1,
-    color: colors.muted,
+    fontSize: 10,
+    letterSpacing: 1.2,
+    color: sessionColors.activeOn,
+    opacity: 0.65,
   },
-  statValue: {
+  cardTitle: {
     fontFamily: fonts.display,
     fontSize: 18,
     letterSpacing: 0.4,
-    color: colors.text,
+    color: sessionColors.activeOn,
+    textTransform: "uppercase",
   },
-  statDivider: {
+  gearBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(10,10,10,0.1)",
+  },
+  timelineScroll: {
+    flexGrow: 0,
+    flexShrink: 0,
+  },
+  timelineRow: {
+    flexDirection: "row",
+    gap: 6,
+    paddingHorizontal: 20,
+    paddingBottom: 10,
+  },
+  timelinePill: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: "rgba(10,10,10,0.08)",
+  },
+  timelinePillDone: {
+    backgroundColor: "rgba(10,10,10,0.16)",
+  },
+  timelinePillCurrent: {
+    backgroundColor: sessionColors.activeOn,
+  },
+  timelinePillText: {
+    fontFamily: fonts.bodySemiBold,
+    fontSize: 11,
+    color: sessionColors.activeOn,
+    opacity: 0.7,
+  },
+  timelinePillTextCurrent: {
+    color: colors.accent,
+    opacity: 1,
+  },
+  cardExpandedBody: {
+    paddingHorizontal: 20,
+    paddingBottom: 20,
+    gap: 14,
+  },
+  cardTargetBlock: {
+    alignItems: "center",
+    gap: 4,
+  },
+  cardTargetLabel: {
+    fontFamily: fonts.monoBold,
+    fontSize: 11,
+    letterSpacing: 1.6,
+    color: sessionColors.activeOn,
+    opacity: 0.65,
+  },
+  cardTargetValue: {
+    fontFamily: fonts.display,
+    fontSize: 44,
+    letterSpacing: 1,
+    color: sessionColors.activeOn,
+  },
+  cardTargetSub: {
+    fontFamily: fonts.monoBold,
+    fontSize: 10,
+    letterSpacing: 1.2,
+    color: sessionColors.activeOn,
+    opacity: 0.65,
+  },
+  cardPauseBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    marginTop: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    backgroundColor: "rgba(10,10,10,0.1)",
+  },
+  cardPauseText: {
+    fontFamily: fonts.bodySemiBold,
+    fontSize: 13,
+    color: sessionColors.activeOn,
+  },
+  cardStatsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: "rgba(10,10,10,0.1)",
+  },
+  cardStatItem: {
+    flex: 1,
+    alignItems: "center",
+    gap: 3,
+  },
+  cardStatLabel: {
+    fontFamily: fonts.monoBold,
+    fontSize: 9,
+    letterSpacing: 1.1,
+    color: sessionColors.activeOn,
+    opacity: 0.65,
+  },
+  cardStatValue: {
+    fontFamily: fonts.display,
+    fontSize: 16,
+    letterSpacing: 0.4,
+    color: sessionColors.activeOn,
+  },
+  cardStatDivider: {
     width: 1,
-    height: 26,
-    backgroundColor: colors.borderSubtle,
+    height: 22,
+    backgroundColor: "rgba(10,10,10,0.12)",
+  },
+  cardActionRow: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  cardActionBtn: {
+    flex: 1,
+    height: 46,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: sessionColors.activeOn,
+  },
+  cardActionBtnDisabled: {
+    opacity: 0.4,
+  },
+  cardActionText: {
+    fontFamily: fonts.display,
+    fontSize: 14,
+    letterSpacing: 0.6,
+    color: colors.accent,
+  },
+  cardEndBtn: {
+    width: 64,
+    height: 46,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(10,10,10,0.1)",
+  },
+  cardEndText: {
+    fontFamily: fonts.bodySemiBold,
+    fontSize: 12,
+    letterSpacing: 0.4,
+    color: sessionColors.activeOn,
   },
   feedbackScroll: {
     paddingBottom: 24,

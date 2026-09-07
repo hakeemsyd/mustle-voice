@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { supabase } from "../lib/supabase";
 import { resolveTodaySession, type PlanSessionRow, type WorkoutLogRow } from "../lib/resolveTodaySession";
 import { addDays, localDateKey, startOfWeek } from "../lib/calendarDate";
+import { titleCase } from "../lib/textFormat";
 
 // A flexible split's exact rest days aren't stored anywhere — only the weekly cadence
 // (days_per_week) is — so this assumes the ordinary real-world reading of "N days a week":
@@ -36,6 +37,9 @@ export interface TodayCalendarData {
   loading: boolean;
   session: { planSessionId: string; focus: string; exercises: TodayExercise[] } | null;
   isRestDay: boolean;
+  /** True only when today is a rest day because the user explicitly chose it — distinct from
+   *  isRestDay, which is also true when the plan's own rotation just has nothing due. */
+  isChosenRestDay: boolean;
   completedToday: boolean;
   /** The session actually completed today, if any — independent of `session`/`isRestDay`, which
    *  only describe what's still due. Without this, finishing today's only session made
@@ -48,7 +52,11 @@ export interface TodayCalendarData {
 }
 
 async function fetchPlanAndLogs(userId: string) {
-  const [{ data: plan }, { data: logs }] = await Promise.all([
+  // rest_day rows are always written for "today" at write time (see src/lib/restDay.ts), never
+  // a future date, so a 90-day-back window covers every caller (today/week/month/day-detail)
+  // without needing a per-caller date range the way logs' own query doesn't have either.
+  const ninetyDaysAgo = localDateKey(new Date(Date.now() - 90 * 86_400_000));
+  const [{ data: plan }, { data: logs }, { data: restDays }] = await Promise.all([
     supabase
       .from("training_plan")
       .select("plan_session(id, day_order, weekday, focus, plan_exercise(ord, sets, rep_scheme, load_scheme, exercise(name)))")
@@ -61,10 +69,12 @@ async function fetchPlanAndLogs(userId: string) {
       .eq("user_id", userId)
       .order("at", { ascending: false })
       .limit(30),
+    supabase.from("rest_day").select("date").eq("user_id", userId).gte("date", ninetyDaysAgo),
   ]);
   return {
     sessions: (plan?.plan_session ?? []) as unknown as FullPlanSession[],
     logs: (logs ?? []) as WorkoutLogRow[],
+    restDayDates: new Set(((restDays ?? []) as any[]).map((r) => r.date as string)),
   };
 }
 
@@ -73,6 +83,7 @@ export function useTodayCalendar(): TodayCalendarData {
     loading: true,
     session: null,
     isRestDay: false,
+    isChosenRestDay: false,
     completedToday: false,
     completedWorkout: null,
     mealsLoggedToday: 0,
@@ -95,14 +106,15 @@ export function useTodayCalendar(): TodayCalendarData {
       const startOfDay = new Date();
       startOfDay.setHours(0, 0, 0, 0);
 
-      const [{ sessions, logs }, foodRes] = await Promise.all([
+      const [{ sessions, logs, restDayDates }, foodRes] = await Promise.all([
         fetchPlanAndLogs(userId),
         supabase.from("food_log").select("id").eq("user_id", userId).gte("at", startOfDay.toISOString()),
       ]);
       if (cancelled) return;
 
-      const today = resolveTodaySession(sessions, logs);
+      const today = resolveTodaySession(sessions, logs, new Date(), restDayDates);
       const todayKey = localDateKey(new Date());
+      const isChosenRestDay = restDayDates.has(todayKey);
       // Found independent of `today`/resolveTodaySession on purpose: for a flexible rotation,
       // resolveTodaySession deliberately returns null once today's slot is already completed
       // (correct — nothing further is due), so completion can't be read off `today.id` the way
@@ -132,6 +144,7 @@ export function useTodayCalendar(): TodayCalendarData {
               }
             : null,
         isRestDay: !today && !completedLog,
+        isChosenRestDay,
         completedToday: !!completedLog,
         completedWorkout: completedLog?.id
           ? { workoutLogId: completedLog.id, focus: completedSession?.focus ?? null }
@@ -186,7 +199,7 @@ export function useWeekCalendar(weekStart: Date): WeekCalendarData {
 
       const start = new Date(`${weekStartKey}T00:00:00`);
       const end = addDays(start, 7);
-      const [{ sessions, logs: allRecentLogs }, workoutRes] = await Promise.all([
+      const [{ sessions, logs: allRecentLogs, restDayDates }, workoutRes] = await Promise.all([
         fetchPlanAndLogs(userId),
         supabase
           .from("workout_log")
@@ -204,7 +217,7 @@ export function useWeekCalendar(weekStart: Date): WeekCalendarData {
       const todayDate = new Date(`${todayKey}T00:00:00`);
 
       const rotation = sessions.slice().sort((a, b) => a.day_order - b.day_order);
-      const dueToday = resolveTodaySession(sessions, allRecentLogs);
+      const dueToday = resolveTodaySession(sessions, allRecentLogs, new Date(), restDayDates);
 
       const daysPerWeek = rotation.length;
 
@@ -411,10 +424,6 @@ const EMPTY_DAY_DETAIL: Omit<DayDetail, "isPast" | "isToday" | "isFuture" | "ref
   plannedSessionId: null,
 };
 
-function titleCaseArea(area: string): string {
-  return area.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-}
-
 export function useDayDetail(dateKey: string | null): DayDetail {
   const [state, setState] = useState<Omit<DayDetail, "isPast" | "isToday" | "isFuture" | "refetch">>(
     EMPTY_DAY_DETAIL,
@@ -443,8 +452,13 @@ export function useDayDetail(dateKey: string | null): DayDetail {
       const isToday = dateKey === todayKey;
       const isFuture = dateKey > todayKey;
 
-      const [{ sessions, logs: recentLogs }, { data: workouts }, { data: food }, { data: injuries }, { data: nutritionTarget }] =
-        await Promise.all([
+      const [
+        { sessions, logs: recentLogs, restDayDates },
+        { data: workouts },
+        { data: food },
+        { data: injuries },
+        { data: nutritionTarget },
+      ] = await Promise.all([
           fetchPlanAndLogs(userId),
           supabase
             .from("workout_log")
@@ -484,7 +498,7 @@ export function useDayDetail(dateKey: string | null): DayDetail {
         plannedFocus = pinned.focus;
         plannedSessionId = pinned.id;
       } else if (isToday) {
-        const due = resolveTodaySession(sessions, recentLogs);
+        const due = resolveTodaySession(sessions, recentLogs, new Date(), restDayDates);
         if (due) {
           plannedFocus = due.focus;
           plannedSessionId = due.id;
@@ -551,7 +565,7 @@ export function useDayDetail(dateKey: string | null): DayDetail {
         meals: (food ?? []).map((f: any) => ({ description: f.description, calories: f.calories ?? 0 })),
         injuryNotes: (injuries ?? []).map((row: any) => ({
           id: row.id,
-          summary: row.note ? `${titleCaseArea(row.area)} — ${row.note}` : `${titleCaseArea(row.area)} flagged`,
+          summary: row.note ? `${titleCase(row.area)} — ${row.note}` : `${titleCase(row.area)} flagged`,
         })),
         macros,
         plannedFocus,

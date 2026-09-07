@@ -1,5 +1,6 @@
 import { supabase } from './supabase';
 import { heightToCm, weightToKg } from './units';
+import { isAppleHealthAvailable, readHealthSnapshot } from './appleHealth';
 import type { OnboardingState } from '../onboarding/useOnboardingState';
 
 function logIfError(label: string, error: { message: string } | null) {
@@ -34,6 +35,31 @@ export async function syncOnboarding(userId: string, state: OnboardingState) {
   if (weightKg !== null) {
     const { error } = await supabase.from('weight_log').insert({ user_id: userId, weight_kg: weightKg });
     logIfError('weight_log insert', error);
+  }
+
+  // Permission was already granted on ScreenHealthKit itself — this is the one place that
+  // actually reads it, same as every other structured fact onboarding captures. Only the weight
+  // sample is persisted for now: it has an obvious home (the same weight_log a manual entry
+  // writes to). Steps/sleep/heart-rate/workout data is real and read successfully, but where it
+  // should live (a new table? folded into the live readiness computation without persisting at
+  // all?) is a schema decision that hasn't been made yet — flagged rather than guessed at here.
+  // A user's own manually-entered onboarding weight always wins if both exist; this only fires
+  // when they skipped that question or Health has a genuinely more recent reading.
+  if (state.healthKitConnected) {
+    try {
+      const available = await isAppleHealthAvailable();
+      if (available) {
+        const snapshot = await readHealthSnapshot();
+        if (snapshot.weightKg !== null && weightKg === null) {
+          const { error } = await supabase
+            .from('weight_log')
+            .insert({ user_id: userId, weight_kg: snapshot.weightKg });
+          logIfError('weight_log insert (Apple Health)', error);
+        }
+      }
+    } catch (err) {
+      console.error('[onboardingSync] Apple Health read failed:', err);
+    }
   }
 
   if (state.injuries.length > 0) {

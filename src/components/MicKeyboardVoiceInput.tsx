@@ -338,7 +338,15 @@ export const MicKeyboardVoiceInput = ({
 
       <View style={styles.rowStack}>
         <Animated.View
-          style={[styles.keyboardRow, keyboardRowStyle]}
+          // Both rows are absolutely positioned on top of each other and crossfade over 240ms —
+          // without an explicit z-index, RN paints them in JSX order regardless of which one is
+          // actually live, so for most of that crossfade the fading-OUT row still sits visually
+          // (and interactively, since a low-opacity view is still hit-testable) on top of the one
+          // that just became active. Confirmed: this is what read as "the toggle needs multiple
+          // taps" — the first tap landed on the still-topmost outgoing row, and the mic row's own
+          // screen position (centered) differs from the keyboard row's (toggle glued left), so a
+          // frustrated second tap in the same spot often didn't land on anything useful either.
+          style={[styles.keyboardRow, keyboardRowStyle, { zIndex: mode === "keyboard" ? 1 : 0 }]}
           pointerEvents={mode === "keyboard" ? "auto" : "none"}
         >
           <View style={styles.inputBar}>
@@ -374,7 +382,7 @@ export const MicKeyboardVoiceInput = ({
         </Animated.View>
 
         <Animated.View
-          style={[styles.toggleRow, micRowStyle]}
+          style={[styles.toggleRow, micRowStyle, { zIndex: mode === "mic" ? 1 : 0 }]}
           pointerEvents={mode === "mic" ? "auto" : "none"}
         >
           <View style={styles.toggleRowSpacer} />

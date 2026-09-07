@@ -6,8 +6,9 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { useSessionReport } from "../hooks/useSessionReport";
 import { formatDuration } from "../lib/sessionReport";
 import { useScreenInsets } from "../hooks/useScreenInsets";
+import { SessionChatThread } from "../components/session-chat/SessionChatThread";
 import { colors, fonts } from "../constants/theme";
-import { CheckIcon, CopyIcon, FlameIcon, ShareIcon, XIcon } from "../icons";
+import { CheckIcon, ChevronDownIcon, CopyIcon, FlameIcon, ShareIcon, XIcon } from "../icons";
 import type { RootStackParamList } from "../navigation/types";
 
 type Props = NativeStackScreenProps<RootStackParamList, "SessionReport">;
@@ -16,6 +17,8 @@ export function SessionReportScreen({ route, navigation }: Props) {
   const insets = useScreenInsets();
   const { loading, error, report } = useSessionReport(route.params.workoutLogId);
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
+  const [chatOpen, setChatOpen] = useState(false);
+  const sessionMessages = route.params.sessionMessages ?? [];
 
   // navigate("Tabs") can push a fresh Tabs instance on top of this modal instead of popping
   // back to the existing one — popToTop unwinds the whole stack unambiguously.
@@ -76,7 +79,7 @@ export function SessionReportScreen({ route, navigation }: Props) {
                 </Text>
                 {report.streakDays > 0 && (
                   <View style={styles.streakPill}>
-                    <FlameIcon size={12} color={colors.accent} />
+                    <FlameIcon size={11} color={colors.accent} />
                     <Text style={styles.streakPillText}>
                       {report.streakDays} day{report.streakDays === 1 ? "" : "s"} streak
                     </Text>
@@ -85,7 +88,16 @@ export function SessionReportScreen({ route, navigation }: Props) {
               </View>
             </View>
 
-            <Section label="Coach's Take">
+            <View style={styles.section}>
+              <View style={styles.debriefHead}>
+                <View style={styles.coachAvatar}>
+                  <Text style={styles.coachAvatarText}>M</Text>
+                </View>
+                <View>
+                  <Text style={styles.coachName}>Muscle</Text>
+                  <Text style={[styles.sectionLabel, styles.debriefSectionLabel]}>Post-Session Debrief</Text>
+                </View>
+              </View>
               <Text style={styles.debriefText}>{report.debrief.summary}</Text>
               {report.debrief.whatWorked.length > 0 && (
                 <AnalysisRow label="What worked" items={report.debrief.whatWorked} />
@@ -96,7 +108,7 @@ export function SessionReportScreen({ route, navigation }: Props) {
               {report.debrief.injuryCheck && (
                 <AnalysisRow label="Injury check" items={[report.debrief.injuryCheck]} />
               )}
-            </Section>
+            </View>
 
             <Section label="Session Stats">
               <View style={styles.statGrid}>
@@ -185,6 +197,24 @@ export function SessionReportScreen({ route, navigation }: Props) {
                     No nutrition targets set yet — tell your coach your goals to see this here.
                   </Text>
                 </View>
+              </Section>
+            )}
+
+            {sessionMessages.length > 0 && (
+              <Section label="Chat History">
+                <Pressable style={styles.chatToggle} onPress={() => setChatOpen((v) => !v)}>
+                  <Text style={styles.chatToggleText}>
+                    {chatOpen ? "Hide" : "Show"} {sessionMessages.length} message{sessionMessages.length === 1 ? "" : "s"}
+                  </Text>
+                  <View style={chatOpen ? styles.chatToggleIconFlipped : undefined}>
+                    <ChevronDownIcon size={14} color={colors.muted} />
+                  </View>
+                </Pressable>
+                {chatOpen && (
+                  <View style={styles.chatThreadWrap}>
+                    <SessionChatThread messages={sessionMessages} />
+                  </View>
+                )}
               </Section>
             )}
           </ScrollView>
@@ -326,7 +356,7 @@ const styles = StyleSheet.create({
   partialTagText: {
     fontFamily: fonts.monoBold,
     fontSize: 9,
-    letterSpacing: 0.6,
+    letterSpacing: 0.72,
     color: colors.text,
   },
   closeBtn: {
@@ -353,10 +383,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  scoreNum: { fontFamily: fonts.display, fontSize: 28, color: colors.accent, lineHeight: 30 },
-  scoreLabel: { fontFamily: fonts.monoBold, fontSize: 8, letterSpacing: 1, color: colors.accent, opacity: 0.75 },
+  scoreNum: { fontFamily: fonts.display, fontSize: 30, color: colors.accent, lineHeight: 30 },
+  scoreLabel: { fontFamily: fonts.monoBold, fontSize: 8, letterSpacing: 0.8, color: colors.accent, opacity: 0.75 },
   heroMeta: { flex: 1, gap: 4 },
-  heroTitle: { fontFamily: fonts.display, fontSize: 26, color: colors.text, letterSpacing: 0.3 },
+  heroTitle: { fontFamily: fonts.display, fontSize: 26, color: colors.text, letterSpacing: 0.52 },
   heroSub: { fontFamily: fonts.body, fontSize: 12, color: colors.muted },
   streakPill: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 2 },
   streakPillText: { fontFamily: fonts.bodySemiBold, fontSize: 11, color: colors.accent },
@@ -369,13 +399,26 @@ const styles = StyleSheet.create({
     color: colors.muted,
   },
 
+  debriefHead: { flexDirection: "row", alignItems: "center", gap: 10 },
+  coachAvatar: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: colors.accent,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  coachAvatarText: { fontFamily: fonts.display, fontSize: 15, color: colors.accentOn },
+  coachName: { fontFamily: fonts.bodySemiBold, fontSize: 13.5, color: colors.text },
+  debriefSectionLabel: { marginTop: 1 },
+
   debriefText: { fontFamily: fonts.body, fontSize: 14, lineHeight: 21, color: colors.text },
 
   analysisRow: { gap: 3, marginTop: 4 },
   analysisLabel: {
     fontFamily: fonts.bodyBold,
     fontSize: 10,
-    letterSpacing: 0.5,
+    letterSpacing: 0.6,
     color: colors.accent,
     textTransform: "uppercase",
   },
@@ -396,11 +439,11 @@ const styles = StyleSheet.create({
   statChipLabel: {
     fontFamily: fonts.bodyBold,
     fontSize: 10,
-    letterSpacing: 0.4,
+    letterSpacing: 0.6,
     textTransform: "uppercase",
     color: colors.muted,
   },
-  statChipValue: { fontFamily: fonts.display, fontSize: 19, color: colors.text },
+  statChipValue: { fontFamily: fonts.display, fontSize: 20, color: colors.text },
   statChipDelta: { fontFamily: fonts.bodySemiBold, fontSize: 10.5, color: colors.muted },
   deltaPositive: { color: colors.accent },
   deltaNegative: { color: colors.danger },
@@ -416,7 +459,7 @@ const styles = StyleSheet.create({
   tableHeadCell: {
     fontFamily: fonts.bodyBold,
     fontSize: 9.5,
-    letterSpacing: 0.4,
+    letterSpacing: 0.76,
     textTransform: "uppercase",
     color: colors.muted,
   },
@@ -431,13 +474,14 @@ const styles = StyleSheet.create({
   tableCellMuted: { color: colors.muted },
   colExercise: { flex: 1.6 },
   colSet: { flex: 0.6 },
-  colValue: { flex: 0.8, textAlign: "right" },
+  colValue: { flex: 0.8 },
 
   blueprintCard: {
     gap: 10,
-    padding: 14,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
     borderRadius: 14,
-    backgroundColor: "rgba(255,255,255,0.04)",
+    backgroundColor: "rgba(255,255,255,0.05)",
     borderLeftWidth: 2,
     borderLeftColor: colors.accent,
   },
@@ -446,20 +490,21 @@ const styles = StyleSheet.create({
   blueprintText: { flex: 1, fontFamily: fonts.body, fontSize: 13, lineHeight: 19, color: colors.text },
 
   scoreBreakdown: {
-    gap: 12,
-    padding: 14,
+    gap: 10,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
     borderRadius: 14,
     backgroundColor: colors.surface,
     borderWidth: 1,
     borderColor: colors.border,
   },
   scoreBarRow: { flexDirection: "row", alignItems: "center", gap: 10 },
-  scoreBarLabel: { width: 76, fontFamily: fonts.body, fontSize: 11.5, color: colors.muted },
+  scoreBarLabel: { width: 64, fontFamily: fonts.body, fontSize: 11.5, color: colors.muted },
   scoreBarTrack: { flex: 1, height: 5, borderRadius: 4, backgroundColor: colors.border, overflow: "hidden" },
   scoreBarFill: { height: "100%", borderRadius: 4, backgroundColor: colors.accent },
-  scoreBarValue: { width: 34, textAlign: "right", fontFamily: fonts.mono, fontSize: 11, color: colors.text },
+  scoreBarValue: { width: 32, textAlign: "right", fontFamily: fonts.mono, fontSize: 11, color: colors.text },
 
-  nutritionCard: { gap: 12, padding: 14, borderRadius: 14, backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border },
+  nutritionCard: { gap: 12, paddingVertical: 14, paddingHorizontal: 16, borderRadius: 14, backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border },
   nutritionRow: { gap: 5 },
   nutritionRowHead: { flexDirection: "row", justifyContent: "space-between" },
   nutritionRowLabel: { fontFamily: fonts.bodySemiBold, fontSize: 12, color: colors.text },
@@ -469,6 +514,29 @@ const styles = StyleSheet.create({
 
   emptyCard: { padding: 14, borderRadius: 14, backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border },
   emptyText: { fontFamily: fonts.body, fontSize: 13, lineHeight: 19, color: colors.muted },
+
+  chatToggle: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  chatToggleText: { fontFamily: fonts.bodySemiBold, fontSize: 13, color: colors.text },
+  chatToggleIconFlipped: { transform: [{ rotate: "180deg" }] },
+  chatThreadWrap: {
+    height: 320,
+    marginTop: 10,
+    borderRadius: 14,
+    backgroundColor: colors.surfaceDeep,
+    borderWidth: 1,
+    borderColor: colors.border,
+    overflow: "hidden",
+  },
 
   footer: {
     paddingHorizontal: 20,
@@ -485,13 +553,13 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     gap: 6,
-    height: 42,
+    height: 40,
     borderRadius: 10,
     backgroundColor: colors.surfaceDeep,
     borderWidth: 1,
     borderColor: colors.border,
   },
-  actionBtnText: { fontFamily: fonts.bodySemiBold, fontSize: 12.5, color: colors.text },
+  actionBtnText: { fontFamily: fonts.bodySemiBold, fontSize: 12, color: colors.text },
   doneBtn: {
     height: 52,
     borderRadius: 12,
@@ -499,5 +567,5 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     backgroundColor: colors.text,
   },
-  doneBtnText: { fontFamily: fonts.display, fontSize: 18, letterSpacing: 0.5, color: colors.bg },
+  doneBtnText: { fontFamily: fonts.display, fontSize: 18, letterSpacing: 0.9, color: colors.bg },
 });

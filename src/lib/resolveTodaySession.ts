@@ -21,6 +21,12 @@ function sameLocalDay(a: Date, b: Date): boolean {
   );
 }
 
+// YYYY-MM-DD in the device's own local time — matches how rest_day.date rows are written
+// (src/lib/restDay.ts) and read back.
+export function localDateKey(date: Date): string {
+  return new Intl.DateTimeFormat('en-CA').format(date);
+}
+
 /**
  * Which plan session, if any, is "today's" one.
  *
@@ -36,8 +42,10 @@ export function resolveTodaySession<T extends PlanSessionRow>(
   sessions: T[],
   logs: WorkoutLogRow[],
   now: Date = new Date(),
+  restDayDates: Set<string> = new Set(),
 ): T | null {
   if (sessions.length === 0) return null;
+  if (restDayDates.has(localDateKey(now))) return null;
 
   const scheduled = sessions.find((s) => s.weekday === now.getDay());
   if (scheduled) return scheduled;

@@ -62,7 +62,7 @@ export function MonthGrid({ monthDate, onMonthChange, onSelectDay, dayCellStyle,
           onPress={() => onMonthChange(new Date(monthDate.getFullYear(), monthDate.getMonth() - 1, 1))}
         >
           <View style={{ transform: [{ rotate: "180deg" }] }}>
-            <ChevronRightIcon size={13} color={colors.muted} />
+            <ChevronRightIcon size={15} color={colors.muted} />
           </View>
         </Pressable>
         <Text style={styles.monthLabel}>{monthLabel}</Text>
@@ -70,7 +70,7 @@ export function MonthGrid({ monthDate, onMonthChange, onSelectDay, dayCellStyle,
           style={styles.navBtn}
           onPress={() => onMonthChange(new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 1))}
         >
-          <ChevronRightIcon size={13} color={colors.muted} />
+          <ChevronRightIcon size={15} color={colors.muted} />
         </Pressable>
       </View>
 
@@ -107,7 +107,14 @@ export function MonthGrid({ monthDate, onMonthChange, onSelectDay, dayCellStyle,
 
 const styles = StyleSheet.create({
   wrap: {},
-  monthBar: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingBottom: 14 },
+  monthBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingTop: 4,
+    paddingHorizontal: 2,
+    paddingBottom: 14,
+  },
   navBtn: {
     width: 26,
     height: 26,

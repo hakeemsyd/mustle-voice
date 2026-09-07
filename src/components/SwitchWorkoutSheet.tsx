@@ -3,8 +3,9 @@ import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, View
 
 import { colors, fonts } from "../constants/theme";
 import { useScreenInsets } from "../hooks/useScreenInsets";
-import { usePlanAlternatives } from "../hooks/usePlanAlternatives";
+import { usePlanAlternatives, type PlanAlternativeExercise } from "../hooks/usePlanAlternatives";
 import { XIcon } from "../icons/XIcon";
+import { titleCase } from "../lib/textFormat";
 import type { SessionTarget } from "../session/ActiveSessionContext";
 
 export const CARDIO_ACTIVITIES = ["Run", "Bike", "Hike", "Walk"] as const;
@@ -17,9 +18,19 @@ interface Props {
   confirmDescription: string;
   currentPlanSessionId?: string;
   onConfirm: (target: SessionTarget) => void;
+  /** Take today as a rest day instead of switching to another session — deliberately a
+   *  separate callback from onConfirm since it doesn't produce a SessionTarget to start. */
+  onRestDay: () => void;
+  onProceedToChat?: () => void;
 }
 
-type Step = "confirm" | "pick";
+type Step = "confirm" | "pick" | "preview";
+
+interface PreviewTarget {
+  target: SessionTarget;
+  label: string;
+  exercises: PlanAlternativeExercise[];
+}
 
 export function SwitchWorkoutSheet({
   open,
@@ -27,19 +38,39 @@ export function SwitchWorkoutSheet({
   confirmDescription,
   currentPlanSessionId,
   onConfirm,
+  onRestDay,
+  onProceedToChat,
 }: Props) {
   const insets = useScreenInsets();
   const [step, setStep] = useState<Step>("confirm");
+  const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
   const { alternatives, loading } = usePlanAlternatives(currentPlanSessionId);
 
   const close = () => {
     setStep("confirm");
+    setPreviewTarget(null);
     onClose();
   };
 
   const pick = (target: SessionTarget) => {
     setStep("confirm");
+    setPreviewTarget(null);
     onConfirm(target);
+  };
+
+  const openPreview = (alt: { planSessionId: string; focus: string; exercises: PlanAlternativeExercise[] }) => {
+    setPreviewTarget({
+      target: { type: "strength", planSessionId: alt.planSessionId },
+      label: alt.focus,
+      exercises: alt.exercises,
+    });
+    setStep("preview");
+  };
+
+  const takeRestDay = () => {
+    setStep("confirm");
+    setPreviewTarget(null);
+    onRestDay();
   };
 
   return (
@@ -61,20 +92,31 @@ export function SwitchWorkoutSheet({
               <Text style={styles.eyebrow}>SWITCH WORKOUT</Text>
               <Text style={styles.title}>CANCEL THIS SESSION?</Text>
               <Text style={styles.description}>{confirmDescription}</Text>
-              <Pressable style={styles.confirmBtn} onPress={() => setStep("pick")}>
+              <Pressable
+                style={styles.confirmBtn}
+                onPress={() => (onProceedToChat ? onProceedToChat() : setStep("pick"))}
+              >
                 <Text style={styles.confirmText}>Yes, switch workout</Text>
               </Pressable>
               <Pressable style={styles.cancelBtn} onPress={close}>
                 <Text style={styles.cancelText}>Keep current plan</Text>
               </Pressable>
             </View>
-          ) : (
+          ) : step === "pick" ? (
             <View style={styles.wrap}>
               <Text style={styles.eyebrow}>SWITCH WORKOUT</Text>
               <Text style={styles.title}>PICK A NEW SESSION</Text>
 
               <ScrollView style={styles.pickScroll} contentContainerStyle={styles.pickContent}>
-                <Text style={styles.groupLabel}>FROM YOUR PLAN</Text>
+                <Pressable style={styles.restDayCard} onPress={takeRestDay}>
+                  <View style={styles.typeCardText}>
+                    <Text style={styles.restDayTitle}>TAKE A REST DAY</Text>
+                    <Text style={styles.typeCardSub}>Skip today — nothing else on your plan changes.</Text>
+                  </View>
+                  <Text style={styles.typeCardArrow}>→</Text>
+                </Pressable>
+
+                <Text style={[styles.groupLabel, styles.groupLabelSpaced]}>FROM YOUR PLAN</Text>
                 {loading ? (
                   <ActivityIndicator color={colors.accent} style={styles.loader} />
                 ) : alternatives.length === 0 ? (
@@ -83,13 +125,9 @@ export function SwitchWorkoutSheet({
                   </Text>
                 ) : (
                   alternatives.map((alt) => (
-                    <Pressable
-                      key={alt.planSessionId}
-                      style={styles.typeCard}
-                      onPress={() => pick({ type: "strength", planSessionId: alt.planSessionId })}
-                    >
+                    <Pressable key={alt.planSessionId} style={styles.typeCard} onPress={() => openPreview(alt)}>
                       <View style={styles.typeCardText}>
-                        <Text style={styles.typeCardTitle}>{alt.focus.toUpperCase()}</Text>
+                        <Text style={styles.typeCardTitle}>{titleCase(alt.focus)}</Text>
                         <Text style={styles.typeCardSub}>{alt.exerciseCount} exercises</Text>
                       </View>
                       <Text style={styles.typeCardArrow}>→</Text>
@@ -111,7 +149,34 @@ export function SwitchWorkoutSheet({
                 </View>
               </ScrollView>
             </View>
-          )}
+          ) : previewTarget ? (
+            <View style={styles.wrap}>
+              <Text style={styles.eyebrow}>SWITCH WORKOUT</Text>
+              <Text style={styles.title}>{titleCase(previewTarget.label)}</Text>
+
+              <ScrollView style={styles.pickScroll} contentContainerStyle={styles.pickContent}>
+                <Text style={styles.groupLabel}>EXERCISES</Text>
+                {previewTarget.exercises.map((exercise, i) => (
+                  <View key={`${exercise.name}-${i}`} style={styles.previewRow}>
+                    <Text style={styles.previewIndex}>{String(i + 1).padStart(2, "0")}</Text>
+                    <Text style={styles.previewName} numberOfLines={1}>
+                      {exercise.name}
+                    </Text>
+                    <Text style={styles.previewMeta}>
+                      {exercise.sets} × {exercise.repScheme}
+                    </Text>
+                  </View>
+                ))}
+              </ScrollView>
+
+              <Pressable style={styles.confirmBtn} onPress={() => pick(previewTarget.target)}>
+                <Text style={styles.confirmText}>Start This Instead</Text>
+              </Pressable>
+              <Pressable style={styles.cancelBtn} onPress={() => setStep("pick")}>
+                <Text style={styles.cancelText}>Back</Text>
+              </Pressable>
+            </View>
+          ) : null}
         </Pressable>
       </Pressable>
     </Modal>
@@ -166,6 +231,7 @@ const styles = StyleSheet.create({
     fontSize: 24,
     letterSpacing: 0.4,
     color: colors.text,
+    textTransform: "uppercase",
   },
   description: {
     fontFamily: fonts.body,
@@ -232,6 +298,7 @@ const styles = StyleSheet.create({
     fontSize: 16,
     letterSpacing: 0.3,
     color: colors.text,
+    textTransform: "uppercase",
   },
   typeCardSub: {
     fontFamily: fonts.body,
@@ -242,6 +309,49 @@ const styles = StyleSheet.create({
     fontFamily: fonts.body,
     fontSize: 15,
     color: colors.muted,
+  },
+  restDayCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingVertical: 13,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    backgroundColor: colors.accentDim,
+    borderWidth: 1,
+    borderColor: colors.accentBorder,
+  },
+  restDayTitle: {
+    fontFamily: fonts.display,
+    fontSize: 16,
+    letterSpacing: 0.3,
+    color: colors.accent,
+  },
+  previewRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingVertical: 10,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+  },
+  previewIndex: {
+    width: 18,
+    fontFamily: fonts.bodySemiBold,
+    fontSize: 11,
+    color: colors.muted,
+  },
+  previewName: {
+    flex: 1,
+    fontFamily: fonts.bodySemiBold,
+    fontSize: 13.5,
+    color: colors.text,
+  },
+  previewMeta: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: colors.muted,
+    textAlign: "right",
   },
   cardioChips: {
     flexDirection: "row",

@@ -2,6 +2,7 @@ import React from "react";
 import { Modal, Pressable, StyleSheet, Text, View } from "react-native";
 import { colors, fonts } from "../constants/theme";
 import { useScreenInsets } from "../hooks/useScreenInsets";
+import { FlagIcon } from "../icons/FlagIcon";
 
 interface Props {
   open: boolean;
@@ -35,6 +36,14 @@ export function ConfirmSheet({
         >
           <View style={styles.handleWrap}>
             <View style={styles.handle} />
+          </View>
+          <View
+            style={[
+              styles.iconBadge,
+              destructive ? styles.iconBadgeDestructive : styles.iconBadgeDefault,
+            ]}
+          >
+            <FlagIcon size={24} color={destructive ? colors.danger : colors.accent} />
           </View>
           <Text style={styles.title}>{title}</Text>
           <Text style={styles.description}>{description}</Text>
@@ -80,6 +89,21 @@ const styles = StyleSheet.create({
     height: 4,
     borderRadius: 2,
     backgroundColor: "rgba(255,255,255,0.18)",
+  },
+  iconBadge: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    alignItems: "center",
+    justifyContent: "center",
+    alignSelf: "center",
+    marginBottom: 4,
+  },
+  iconBadgeDefault: {
+    backgroundColor: colors.accentDim,
+  },
+  iconBadgeDestructive: {
+    backgroundColor: "rgba(255,68,68,0.12)",
   },
   title: {
     fontFamily: fonts.display,

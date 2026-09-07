@@ -1,6 +1,6 @@
 import { Fragment, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import Svg, { Circle, Path } from "react-native-svg";
+import Svg, { Circle, Ellipse, Path } from "react-native-svg";
 import { colors, fonts } from "../constants/theme";
 import type { BodyView } from "../lib/injuryZones";
 
@@ -83,7 +83,7 @@ export function BodyZoneMap({ flagged, onSelect }: BodyZoneMapProps) {
       </View>
 
       <Svg viewBox="0 0 208 400" style={styles.svg}>
-        <Circle cx={104} cy={26} r={22} stroke="rgba(255,255,255,0.2)" strokeWidth={1.5} fill="none" />
+        <Ellipse cx={104} cy={26} rx={22} ry={24} stroke="rgba(255,255,255,0.2)" strokeWidth={1.5} fill="none" />
         <Path d="M94 50 L94 68 M114 50 L114 68" stroke="rgba(255,255,255,0.12)" strokeWidth={1.5} strokeLinecap="round" fill="none" />
         <Path d="M64 74 L60 172 L78 188 L104 194 L130 188 L148 172 L144 74" stroke="rgba(255,255,255,0.2)" strokeWidth={1.5} strokeLinejoin="round" fill="none" />
         <Path d="M64 74 L44 120 L26 178 L18 198" stroke="rgba(255,255,255,0.18)" strokeWidth={1.5} strokeLinecap="round" fill="none" />
@@ -97,7 +97,7 @@ export function BodyZoneMap({ flagged, onSelect }: BodyZoneMapProps) {
             <Fragment key={zone.id}>
               <Path
                 d={zone.d}
-                fill={flag ? "rgba(200,241,53,0.18)" : "rgba(255,255,255,0.05)"}
+                fill={flag ? "rgba(200,241,53,0.3)" : "rgba(255,255,255,0.05)"}
                 stroke={flag ? "#C8F135" : "rgba(255,255,255,0.14)"}
                 strokeWidth={flag ? 1.5 : 1}
                 onPress={flag ? () => onSelect(flag) : undefined}
@@ -117,21 +117,23 @@ const styles = StyleSheet.create({
   wrap: { alignItems: "center", gap: 12 },
   viewToggle: {
     flexDirection: "row",
-    backgroundColor: colors.surfaceDeep,
-    borderRadius: 100,
+    backgroundColor: "rgba(255,255,255,0.04)",
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 8,
     padding: 3,
     gap: 2,
   },
-  viewBtn: { paddingVertical: 6, paddingHorizontal: 16, borderRadius: 100 },
+  viewBtn: { paddingVertical: 5, paddingHorizontal: 22, borderRadius: 5 },
   viewBtnActive: { backgroundColor: colors.accentDim },
   viewBtnText: {
-    fontFamily: fonts.bodySemiBold,
-    fontSize: 10,
-    letterSpacing: 0.8,
-    color: colors.muted,
+    fontFamily: fonts.display,
+    fontSize: 11,
+    letterSpacing: 0.66,
+    color: "rgba(255,255,255,0.3)",
   },
   viewBtnTextActive: { color: colors.accent },
-  svg: { width: "72%", aspectRatio: 208 / 400 },
+  svg: { width: "48%", aspectRatio: 208 / 400 },
   empty: {
     fontFamily: fonts.body,
     fontSize: 12,

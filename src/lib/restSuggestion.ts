@@ -31,17 +31,42 @@ export function estimateRestSeconds(repScheme: string | null): number {
   return 60;
 }
 
-export function suggestRestSeconds(reps: number, repScheme: string, setsDone: number, totalSets: number): number {
+export type RestSuggestionReason = 'on_target' | 'missed_reps' | 'exceeded_reps' | 'fatigue_addon';
+
+export interface RestSuggestion {
+  seconds: number;
+  /** Why the target came out where it did — surfaced in the UI so an auto-adapted rest target
+   *  never looks like it silently changed for no reason. */
+  reason: RestSuggestionReason;
+}
+
+export function suggestRestSeconds(
+  reps: number,
+  repScheme: string,
+  setsDone: number,
+  totalSets: number,
+): RestSuggestion {
   const target = targetRepsFrom(repScheme);
-  if (target === null) return DEFAULT_REST_SEC;
+  if (target === null) return { seconds: DEFAULT_REST_SEC, reason: 'on_target' };
 
   let rest = DEFAULT_REST_SEC;
-  if (reps < target - 2) rest += 45;
-  else if (reps < target) rest += 20;
-  else if (reps > target + 2) rest -= 20;
+  let reason: RestSuggestionReason = 'on_target';
+  if (reps < target - 2) {
+    rest += 45;
+    reason = 'missed_reps';
+  } else if (reps < target) {
+    rest += 20;
+    reason = 'missed_reps';
+  } else if (reps > target + 2) {
+    rest -= 20;
+    reason = 'exceeded_reps';
+  }
 
   // Later sets in a run accumulate fatigue, so the back half gets a little more.
-  if (totalSets > 1 && setsDone / totalSets > 0.5) rest += 15;
+  if (totalSets > 1 && setsDone / totalSets > 0.5) {
+    rest += 15;
+    if (reason === 'on_target') reason = 'fatigue_addon';
+  }
 
-  return Math.min(180, Math.max(45, rest));
+  return { seconds: Math.min(180, Math.max(45, rest)), reason };
 }

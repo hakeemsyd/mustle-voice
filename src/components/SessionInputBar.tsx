@@ -13,45 +13,48 @@ interface SessionInputBarProps {
   parsePreview?: string | null;
 }
 
-// Text-only chat bar (neutral) — the session-acting controls live in
-// SessionControlBar below it, matching the design's "one bar to talk, one bar
-// to act" split. Mic dictates into this same field rather than being a
-// separate voice path.
-export const SessionInputBar = ({ value, onChangeText, onSend, parsePreview }: SessionInputBarProps) => {
-  const [focused, setFocused] = useState(false);
-  const canSend = value.trim().length > 0;
+// Text-only chat bar, wrapped by SessionVoiceInputDock alongside the mic/keyboard
+// mode toggle. Forwards the ref to the underlying TextInput so "Set done" (when
+// nothing parseable is drafted yet) can focus this field directly instead of
+// showing a dead-end alert.
+export const SessionInputBar = React.forwardRef<TextInput, SessionInputBarProps>(
+  ({ value, onChangeText, onSend, parsePreview }, ref) => {
+    const [focused, setFocused] = useState(false);
+    const canSend = value.trim().length > 0;
 
-  return (
-    <View style={styles.wrap}>
-      {parsePreview ? <Text style={styles.preview}>{parsePreview}</Text> : null}
+    return (
+      <View style={styles.wrap}>
+        {parsePreview ? <Text style={styles.preview}>{parsePreview}</Text> : null}
 
-      <View style={styles.bar}>
-        <View style={[styles.fieldWrap, focused && styles.fieldWrapFocused]}>
-          <TextInput
-            value={value}
-            // A whitespace-only draft would hide the placeholder while `canSend` (which
-            // trims) keeps the send button hidden — the field reads as broken. Collapse it
-            // back to empty so that state can't happen.
-            onChangeText={(text) => onChangeText(text.trim().length === 0 ? "" : text)}
-            placeholder="Report your set, or ask your coach…"
-            placeholderTextColor={colors.muted}
-            style={styles.field}
-            onFocus={() => setFocused(true)}
-            onBlur={() => setFocused(false)}
-            onSubmitEditing={onSend}
-            multiline
-          />
+        <View style={styles.bar}>
+          <View style={[styles.fieldWrap, focused && styles.fieldWrapFocused]}>
+            <TextInput
+              ref={ref}
+              value={value}
+              // A whitespace-only draft would hide the placeholder while `canSend` (which
+              // trims) keeps the send button hidden — the field reads as broken. Collapse it
+              // back to empty so that state can't happen.
+              onChangeText={(text) => onChangeText(text.trim().length === 0 ? "" : text)}
+              placeholder="Report your set, or ask your coach…"
+              placeholderTextColor={colors.muted}
+              style={styles.field}
+              onFocus={() => setFocused(true)}
+              onBlur={() => setFocused(false)}
+              onSubmitEditing={onSend}
+              multiline
+            />
+          </View>
+
+          {canSend && (
+            <Pressable style={[styles.actionBtn, styles.actionBtnAccent]} onPress={onSend} hitSlop={6}>
+              <ArrowUpIcon size={18} color={colors.accentOn} />
+            </Pressable>
+          )}
         </View>
-
-        {canSend && (
-          <Pressable style={[styles.actionBtn, styles.actionBtnAccent]} onPress={onSend} hitSlop={6}>
-            <ArrowUpIcon size={18} color={colors.accentOn} />
-          </Pressable>
-        )}
       </View>
-    </View>
-  );
-};
+    );
+  },
+);
 
 const styles = StyleSheet.create({
   wrap: {

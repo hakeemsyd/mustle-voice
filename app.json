@@ -20,7 +20,7 @@
       "usesAppleSignIn": true,
       "infoPlist": {
         "NSMicrophoneUsageDescription": "Mustle needs microphone access to hear your voice coaching requests.",
-        "NSCameraUsageDescription": "Mustle does not use the camera. This permission is required by the voice (WebRTC) library and the camera is never accessed."
+        "NSPhotoLibraryUsageDescription": "Mustle uses your photo library to let you show your coach a photo — of a meal, your form, or your progress."
       }
     },
     "android": {
@@ -58,6 +58,21 @@
         "@react-native-google-signin/google-signin",
         {
           "iosUrlScheme": "com.googleusercontent.apps.421703647517-95geinli07j49llb1lts4ms4prc06e4v"
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "cameraPermission": "Mustle uses your camera to let you show your coach a photo — of a meal, your form, or your progress.",
+          "photosPermission": "Mustle uses your photo library to let you show your coach a photo — of a meal, your form, or your progress."
+        }
+      ],
+      [
+        "@kingstinct/react-native-healthkit",
+        {
+          "NSHealthShareUsageDescription": "Mustle reads your weight, workouts, sleep and activity from Health so your coach can adjust your plan and recovery guidance — nothing is shared without your permission.",
+          "NSHealthUpdateUsageDescription": false,
+          "background": false
         }
       ]
     ]

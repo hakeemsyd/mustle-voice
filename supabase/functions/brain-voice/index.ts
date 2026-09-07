@@ -10,6 +10,9 @@ import {
 import { buildContextBlock } from '../_shared/brain-context.ts';
 import { createHandlers } from '../_shared/brain-handlers.ts';
 import { VOICE_TOOLS } from '../_shared/brain-tools.ts';
+import { buildLiveSessionSnapshot, describeLiveSessionSnapshot, LIVE_STATE_MAX_AGE_MS } from '../_shared/live-session-format.ts';
+import { resolveTurnText } from '../_shared/system-cue.ts';
+import { verbalizeUnitsForSpeech } from '../_shared/verbalize-for-speech.ts';
 
 const callModel = createCallModel(VOICE_TOOLS);
 
@@ -29,7 +32,9 @@ const NO_IDENTITY_REPLY =
 const VOICE_ERROR_REPLY = "I'm having trouble reaching your plan right now — let's try again in a moment.";
 
 function sanitizeForSpeech(text: string): string {
-  return text.replace(/\s*[—–]\s*/g, ', ');
+  return verbalizeUnitsForSpeech(text)
+    .replace(/\[\[SYSTEM_CUE\]\]\s*\S*/gi, '')
+    .replace(/\s*[—–]\s*/g, ', ');
 }
 
 // Both userId and timezone travel in via the same MUSTLE_CONTEXT marker, embedded in the
@@ -58,7 +63,7 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
   const handlers = createHandlers(supabase, userId, timezone);
 
   const askedAt = new Date();
-  const [{ data: history, error: historyError }, contextBlock] = await Promise.all([
+  const [{ data: history, error: historyError }, contextBlock, { data: liveRow }] = await Promise.all([
     supabase
       .from('message')
       .select('role,content,blocks')
@@ -67,12 +72,18 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
       .order('role', { ascending: true })
       .limit(MESSAGE_HISTORY_LIMIT),
     buildContextBlock(supabase, userId, timezone),
+    supabase.from('live_session_state').select('state, updated_at').eq('user_id', userId).maybeSingle(),
   ]);
   if (historyError) throw new Error(`message fetch: ${historyError.message}`);
 
+  const isLiveStateFresh = !!liveRow && Date.now() - new Date(liveRow.updated_at).getTime() < LIVE_STATE_MAX_AGE_MS;
+  const liveSnapshot = isLiveStateFresh ? buildLiveSessionSnapshot(liveRow!.state) : null;
+  const liveBlock = liveSnapshot ? describeLiveSessionSnapshot(liveSnapshot) : null;
+  const fullContextBlock = liveBlock ? `${contextBlock}\n\n${liveBlock}` : contextBlock;
+
   const priorMessages = replayHistory((history ?? []).reverse());
-  const turnMessages = [...priorMessages, { role: 'user', content: userText }];
-  const systemPrompt = buildSystemPrompt((history ?? []).length > 0, contextBlock);
+  const turnMessages = [...priorMessages, { role: 'user', content: resolveTurnText(userText) }];
+  const systemPrompt = buildSystemPrompt((history ?? []).length > 0, fullContextBlock, 'voice');
 
   return { supabase, handlers, turnMessages, systemPrompt, askedAt };
 }

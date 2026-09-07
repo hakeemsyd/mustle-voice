@@ -24,6 +24,24 @@ export const orbColors = {
   speaking: colors.accent,
 } as const;
 
+export const sessionColors = {
+  active: '#F2C744',
+  activeOn: '#0A0A0A',
+  rest: '#F2503D',
+  restOn: '#0A0A0A',
+} as const;
+
+export const lightCard = {
+  bg: '#FFFFFF',
+  border: 'rgba(10,10,10,0.08)',
+  text: '#0A0A0A',
+  muted: 'rgba(10,10,10,0.55)',
+  pillBg: 'rgba(200,241,53,0.35)',
+  pillText: '#4a5c00',
+  dividerBg: 'rgba(10,10,10,0.06)',
+  surface: 'rgba(10,10,10,0.03)',
+} as const;
+
 export const radius = {
   sm: 6, md: 8, lg: 10, xl: 14, '2xl': 18, '3xl': 22, '4xl': 26,
 } as const;

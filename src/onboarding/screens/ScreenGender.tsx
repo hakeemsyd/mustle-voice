@@ -9,6 +9,7 @@ import { FemaleIcon, MaleIcon, PreferNotToSayIcon } from "../../icons";
 
 import { colors, fonts } from "../../constants/theme";
 import { BackIcon } from "../../icons/BackIcon";
+import { useScreenInsets } from "../../hooks/useScreenInsets";
 
 type Gender = "male" | "female" | "prefer_not_to_say";
 
@@ -55,6 +56,7 @@ const OPTIONS = [
 
 export const ScreenGender = ({ onNext, onBack }: Props) => {
   const [selected, setSelected] = useState<Gender | null>(null);
+  const insets = useScreenInsets();
 
   const visibleProgress = useSharedValue(0);
   useEffect(() => {
@@ -74,7 +76,7 @@ export const ScreenGender = ({ onNext, onBack }: Props) => {
   };
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, { paddingTop: insets.top + 8 }]}>
       <View style={styles.topBar}>
         <TouchableOpacity style={styles.topBarSpacer} activeOpacity={0.7} onPress={onBack}>
           <BackIcon />
@@ -115,7 +117,6 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.bg,
-    paddingTop: 60,
   },
 
   topBar: {

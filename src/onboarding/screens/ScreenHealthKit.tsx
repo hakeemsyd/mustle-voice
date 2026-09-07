@@ -1,32 +1,39 @@
 import React, { useState } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { Alert, Pressable, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import Svg, { Path } from "react-native-svg";
 
 import { ProgressDots } from "../ProgressDots";
 import { BackIcon } from "../../icons/BackIcon";
 import { colors, fonts } from "../../constants/theme";
+import { isAppleHealthAvailable, requestAppleHealthPermission } from "../../lib/appleHealth";
 
 interface ScreenHealthKitProps {
   onNext: (connected: boolean) => void;
   onBack: () => void;
 }
 
+// Read-only for v1 (2026-09-05 decision) — copy describes what the app actually does with each
+// data type, not an aspirational superset. Previously claimed "auto-log every session TO Apple
+// Health" and real-time heart rate tracking, neither of which this build does — the first is a
+// write-back feature deliberately out of scope (see appleHealth.ts's own header comment), and
+// live in-workout heart rate needs a paired-Watch workout session this app doesn't integrate
+// with, not just a periodic read of the last recorded sample.
 const DATA_POINTS = [
   {
     icon: "🏋️",
     label: "Workouts",
-    desc: "Auto-log every session to Apple Health",
+    desc: "See activity you've logged elsewhere, like an Apple Watch run",
   },
   {
     icon: "❤️",
     label: "Heart Rate",
-    desc: "Track effort and recovery in real time",
+    desc: "Your latest reading, for recovery context",
   },
   {
     icon: "⚖️",
-    label: "Body Data",
-    desc: "Sync weight, body fat & measurements",
+    label: "Body Weight",
+    desc: "Pulled in automatically from a synced scale",
   },
   {
     icon: "😴",
@@ -36,16 +43,34 @@ const DATA_POINTS = [
   {
     icon: "👣",
     label: "Activity",
-    desc: "Steps and movement on your rest days",
+    desc: "Steps and calories burned on your rest days",
   },
 ];
 
 export const ScreenHealthKit = ({ onNext, onBack }: ScreenHealthKitProps) => {
   const [connecting, setConnecting] = useState(false);
 
-  const handleConnect = () => {
+  const handleConnect = async () => {
     setConnecting(true);
-    setTimeout(() => onNext(true), 900);
+    try {
+      const available = await isAppleHealthAvailable();
+      if (!available) {
+        Alert.alert("Health isn't available", "This device doesn't support Apple Health.");
+        setConnecting(false);
+        return;
+      }
+      // The real native permission sheet — the one thing that can't be faked or previewed in
+      // this repo. iOS shows it once per install; a second tap after a prior grant/deny just
+      // returns that same decision silently, by OS design, not a bug in this call.
+      const granted = await requestAppleHealthPermission();
+      onNext(granted);
+    } catch (err) {
+      console.error("[onboarding] Apple Health connect failed:", err);
+      Alert.alert("Couldn't connect", "Something went wrong connecting to Apple Health — you can try again later from Settings.");
+      onNext(false);
+    } finally {
+      setConnecting(false);
+    }
   };
 
   return (

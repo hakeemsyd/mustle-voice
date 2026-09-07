@@ -5,7 +5,7 @@ import { useNavigation } from "@react-navigation/native";
 import { BottomSheet } from "../components/BottomSheet";
 import { SvgLineChart } from "../components/SvgLineChart";
 import { BodyZoneMap, type FlaggedZone } from "../components/BodyZoneMap";
-import { FloatingParticles } from "../components/FloatingParticles";
+import { FloatingParticles, type ParticleConfig } from "../components/FloatingParticles";
 import { HeroGlow } from "../components/HeroGlow";
 import { useBodyData } from "../hooks/useBodyData";
 import { colors, fonts } from "../constants/theme";
@@ -17,13 +17,17 @@ import {
   TrendingDownIcon,
   TrendingUpIcon,
 } from "../icons";
+import { titleCase } from "../lib/textFormat";
 
 const CHECKIN_ICON_COLOR = "rgba(251,180,60,0.85)";
 
-function titleCase(value: string | null): string {
-  if (!value) return "—";
-  return value.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-}
+// Reference's Body screen reuses Home's hero CSS classes but seeds them with its own,
+// sparser particle set (3 vs Home's 8) — matched verbatim from BodyScreen.tsx's inline array.
+const BODY_PARTICLES: ParticleConfig[] = [
+  { left: "18%", size: 2, duration: 3600, delay: 0 },
+  { left: "48%", size: 3, duration: 4100, delay: 700 },
+  { left: "76%", size: 2, duration: 3900, delay: 1400 },
+];
 
 function kgToLb(kg: number): number {
   return Math.round(kg * 2.20462 * 10) / 10;
@@ -100,7 +104,7 @@ export function BodyScreen() {
         <ScrollView contentContainerStyle={styles.content} onScrollBeginDrag={() => refetch()}>
           {/* 1. Coach check-in hero — reuses Home's particle/glow/caption treatment */}
           <View style={styles.hero}>
-            <FloatingParticles />
+            <FloatingParticles particles={BODY_PARTICLES} />
             <HeroGlow />
             <View style={styles.heroTop}>
               <View style={styles.captionIconRow}>{checkin.icon}</View>
@@ -303,8 +307,8 @@ export function BodyScreen() {
                   ["Weight", profile.weightKg ? `${kgToLb(profile.weightKg)} lb` : "—"],
                   ["Injuries", profile.injuriesLabel],
                 ] as const
-              ).map(([k, v]) => (
-                <View key={k} style={styles.profileRow}>
+              ).map(([k, v], i, arr) => (
+                <View key={k} style={[styles.profileRow, i === arr.length - 1 && styles.profileRowLast]}>
                   <Text style={styles.profileRowKey}>{k.toUpperCase()}</Text>
                   <Text style={styles.profileRowVal}>{v}</Text>
                 </View>
@@ -321,12 +325,12 @@ export function BodyScreen() {
 
       <BottomSheet visible={infoOpen} onClose={() => setInfoOpen(false)}>
         <View style={styles.detailBody}>
-          <Text style={styles.detailTitle}>How this is calculated</Text>
-          <Text style={styles.detailNote}>
+          <Text style={styles.infoTitle}>How this is calculated</Text>
+          <Text style={styles.infoText}>
             Weight comes from whatever you've told your coach directly — we don't have a wearable or smart-scale
             connection yet, so every reading here is conversational.
           </Text>
-          <Text style={styles.detailNote}>
+          <Text style={styles.infoText}>
             The trend badge compares your most recent reading to the one from about 7 days earlier.
           </Text>
         </View>
@@ -365,9 +369,15 @@ const styles = StyleSheet.create({
 
   rule: { height: 1, backgroundColor: colors.accentDim, marginHorizontal: 22 },
 
-  hero: { alignItems: "center", paddingTop: 24, paddingBottom: 8, minHeight: 190, overflow: "hidden" },
+  hero: { alignItems: "center", paddingTop: 24, paddingBottom: 8, minHeight: 200, overflow: "hidden" },
   heroTop: { alignItems: "center", gap: 6, paddingHorizontal: 32 },
-  captionIconRow: { marginBottom: 2 },
+  captionIconRow: {
+    marginBottom: 2,
+    shadowColor: "#FBB43C",
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.35,
+    shadowRadius: 6,
+  },
   captionGreeting: {
     fontFamily: fonts.bodyMedium,
     fontSize: 11,
@@ -508,11 +518,11 @@ const styles = StyleSheet.create({
   sourceDot: { width: 5, height: 5, borderRadius: 2.5 },
   sourceBadgeText: { fontFamily: fonts.bodyMedium, fontSize: 10, color: "rgba(255,255,255,0.4)" },
 
-  stateWrap: { alignItems: "center", gap: 8, paddingVertical: 20 },
+  stateWrap: { alignItems: "center", gap: 12, paddingVertical: 28, paddingHorizontal: 10 },
   stateTitle: { fontFamily: fonts.bodySemiBold, fontSize: 13, color: "rgba(255,255,255,0.65)" },
   stateSub: { fontFamily: fonts.body, fontSize: 12, color: "rgba(255,255,255,0.35)", textAlign: "center", lineHeight: 18 },
 
-  flaggedList: { gap: 8, marginTop: 12 },
+  flaggedList: { gap: 6, marginTop: 12 },
   flaggedRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -520,13 +530,13 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surface,
     borderWidth: 1,
     borderColor: colors.border,
-    borderRadius: 12,
-    paddingVertical: 12,
-    paddingHorizontal: 14,
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
   },
-  flaggedDot: { width: 7, height: 7, borderRadius: 3.5, backgroundColor: colors.accent },
-  flaggedLabel: { flex: 1, fontFamily: fonts.bodyMedium, fontSize: 13, color: colors.text },
-  flaggedArrow: { fontFamily: fonts.body, fontSize: 13, color: colors.accent },
+  flaggedDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.accent },
+  flaggedLabel: { flex: 1, fontFamily: fonts.bodySemiBold, fontSize: 13, color: colors.text },
+  flaggedArrow: { fontFamily: fonts.body, fontSize: 12, color: "rgba(255,255,255,0.18)" },
 
   profileCard: { flexDirection: "column" },
   profileRow: {
@@ -537,6 +547,7 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: colors.borderSubtle,
   },
+  profileRowLast: { borderBottomWidth: 0 },
   profileRowKey: { fontFamily: fonts.display, fontSize: 12, letterSpacing: 0.8, color: "rgba(255,255,255,0.35)", width: 88 },
   profileRowVal: { flex: 1, fontFamily: fonts.body, fontSize: 13, color: colors.text },
 
@@ -553,7 +564,17 @@ const styles = StyleSheet.create({
   updateBtnText: { fontFamily: fonts.bodySemiBold, fontSize: 13, color: colors.accent },
 
   detailBody: { paddingHorizontal: 20, gap: 10 },
-  detailTitle: { fontFamily: fonts.bodySemiBold, fontSize: 15, color: colors.text },
+  infoTitle: { fontFamily: fonts.display, fontSize: 13, letterSpacing: 0.65, color: colors.text, textTransform: "uppercase" },
+  infoText: { fontFamily: fonts.body, fontSize: 12, lineHeight: 18, color: "rgba(255,255,255,0.55)" },
+  detailTitle: { fontFamily: fonts.display, fontSize: 24, color: colors.text },
   detailMeta: { fontFamily: fonts.body, fontSize: 11, color: colors.muted },
-  detailNote: { fontFamily: fonts.body, fontSize: 13, lineHeight: 19, color: "rgba(255,255,255,0.75)" },
+  detailNote: {
+    fontFamily: fonts.body,
+    fontSize: 13,
+    lineHeight: 20.8,
+    color: "rgba(255,255,255,0.65)",
+    borderLeftWidth: 2,
+    borderLeftColor: colors.accentBorder,
+    paddingLeft: 12,
+  },
 });

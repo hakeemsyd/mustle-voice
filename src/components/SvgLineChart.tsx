@@ -48,7 +48,7 @@ export function SvgLineChart({ values, color = colors.accent, height = 120, labe
         {showAverage && (
           <>
             <Line x1={PAD_X} y1={avgY} x2={VIEW_W - PAD_X} y2={avgY} stroke="rgba(255,255,255,0.25)" strokeWidth={1} strokeDasharray="3,3" />
-            <SvgText x={VIEW_W - PAD_X} y={avgY - 4} textAnchor="end" fontSize={8} fill="rgba(255,255,255,0.35)">
+            <SvgText x={VIEW_W - PAD_X} y={avgY - 4} textAnchor="end" fontSize={9} fill="rgba(255,255,255,0.35)">
               AVG {Math.round(average)}
             </SvgText>
           </>
@@ -57,12 +57,12 @@ export function SvgLineChart({ values, color = colors.accent, height = 120, labe
         {values.map((v, i) => {
           const { x, y } = toXY(v, i);
           const isLast = i === n - 1;
-          return <Circle key={i} cx={x} cy={y} r={isLast ? 4.5 : 2.5} fill={isLast ? color : "rgba(255,255,255,0.35)"} />;
+          return <Circle key={i} cx={x} cy={y} r={isLast ? 4.5 : 3} fill={isLast ? color : "rgba(255,255,255,0.35)"} />;
         })}
         {labels?.map((label, i) => {
           const { x } = toXY(values[i], i);
           return (
-            <SvgText key={i} x={x} y={VIEW_H - 6} textAnchor="middle" fontSize={8} fill="rgba(255,255,255,0.3)">
+            <SvgText key={i} x={x} y={VIEW_H - 6} textAnchor="middle" fontSize={10} fill="rgba(255,255,255,0.3)">
               {label}
             </SvgText>
           );

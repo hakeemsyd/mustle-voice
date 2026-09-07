@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../lib/supabase';
 import { callBrain } from '../lib/brain';
-import { resolveTodaySession } from '../lib/resolveTodaySession';
+import { resolveTodaySession, localDateKey } from '../lib/resolveTodaySession';
+import { titleCase } from '../lib/textFormat';
 import { setCachedDisplayName } from '../lib/profileStore';
 import { isPlanPending, clearPlanPending } from '../lib/planStatus';
 import { MACRO_META, type MacroTarget } from '../screens/homeFormat';
@@ -12,6 +13,9 @@ export interface TodaySession {
   planSessionId?: string;
   name?: string;
   exerciseCountLabel?: string;
+  /** True only when the user explicitly chose today as a rest day (Switch Workout, or asking
+   *  the coach) — distinct from hasSession:false as a byproduct of the plan's own rotation. */
+  isRestDay?: boolean;
 }
 
 export interface HomeData {
@@ -72,14 +76,17 @@ function dateKey(d: Date): string {
   return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 }
 
-function computeStreak(logTimestamps: string[]): number {
+// A chosen rest day holds the streak rather than breaking it (a deliberate skip isn't a missed
+// day) or incrementing it (it wasn't a workout either) — restDayKeys uses the same local
+// YYYY-MM-DD convention as rest_day.date (see localDateKey), logTimestamps' own dateKey format.
+function computeStreak(logTimestamps: string[], restDayKeys: Set<string>): number {
   const days = new Set(logTimestamps.map((at) => dateKey(new Date(at))));
   const cursor = new Date();
-  if (!days.has(dateKey(cursor))) cursor.setDate(cursor.getDate() - 1);
+  if (!days.has(dateKey(cursor)) && !restDayKeys.has(localDateKey(cursor))) cursor.setDate(cursor.getDate() - 1);
 
   let streak = 0;
-  while (days.has(dateKey(cursor))) {
-    streak += 1;
+  while (days.has(dateKey(cursor)) || restDayKeys.has(localDateKey(cursor))) {
+    if (days.has(dateKey(cursor))) streak += 1;
     cursor.setDate(cursor.getDate() - 1);
   }
   return streak;
@@ -108,16 +115,33 @@ const HOME_CACHE_KEY = 'home_data_cache_v1';
 // history. Since this screen already computes the correct due session deterministically for the
 // session chip below the greeting, handing the model that same fact directly removes the failure
 // entirely — there's no tool call, no history, and no other session for it to reach for instead.
-function buildGreetingPrompt(sessionToday: { focus: string | null; exerciseNames: string[] } | null): string {
+function buildGreetingPrompt(
+  sessionToday: { focus: string | null; exerciseNames: string[] } | null,
+  nutrition: { caloriesLeft: number; proteinLeft: number } | null,
+): string {
+  const nutritionNote = nutrition
+    ? ` You also know today's nutrition: ${nutrition.caloriesLeft} calories and ${nutrition.proteinLeft}g protein ` +
+      `left — feel free to reference this instead of the workout if it's more relevant right now (e.g. it's a ` +
+      `rest day, or they haven't logged a meal yet today).`
+    : '';
+  const questionNote =
+    ' End with one short, specific question about how they\'re doing today (energy, hunger, soreness, ' +
+    'how yesterday\'s session felt) — never a purely one-way statement.';
+
   if (!sessionToday) {
-    return "Say hello for the first time today — not a reply to a question, and not generic small talk. Today is a rest day (or there's nothing due) — one short, motivating line about that or progress toward my goal.";
+    return (
+      "Say hello for the first time today — not a reply to a question, and not generic small talk. Today " +
+      "is a rest day (or there's nothing due) — one short, motivating line about that, progress toward my " +
+      `goal, or nutrition/recovery.${nutritionNote}${questionNote}`
+    );
   }
   const exercises = sessionToday.exerciseNames.length > 0 ? sessionToday.exerciseNames.join(', ') : 'the exercises in it';
   return (
     `Say hello for the first time today — not a reply to a question, and not generic small talk. ` +
     `Today's due session is "${sessionToday.focus}": ${exercises}. One short, motivating line that names ` +
     `this exact session and nothing else — do not call read_state, do not mention any other session from ` +
-    `earlier in this conversation, and do not invent a day number or exercises not listed here.`
+    `earlier in this conversation, and do not invent a day number or exercises not listed here.` +
+    `${nutritionNote}${questionNote}`
   );
 }
 
@@ -216,7 +240,9 @@ export function useHomeData(): HomeData {
       const startOfDay = new Date();
       startOfDay.setHours(0, 0, 0, 0);
 
-      const [profileRes, planRes, nutritionRes, foodRes, messageRes, workoutRes] = await Promise.all([
+      const ninetyDaysAgo = new Date(Date.now() - 90 * 86_400_000);
+
+      const [profileRes, planRes, nutritionRes, foodRes, messageRes, workoutRes, restDayRes] = await Promise.all([
         settled('profile', supabase.from('profile').select('display_name').eq('user_id', userId).maybeSingle()),
         settled(
           'plan',
@@ -262,16 +288,23 @@ export function useHomeData(): HomeData {
             .order('at', { ascending: false })
             .limit(60),
         ),
+        settled(
+          'rest_day',
+          supabase.from('rest_day').select('date').eq('user_id', userId).gte('date', localDateKey(ninetyDaysAgo)),
+        ),
       ]);
       if (cancelled) return;
 
       console.log(`[home] all queries done in ${Date.now() - overallStarted}ms`);
       for (const [label, res] of [
         ['profile', profileRes], ['plan', planRes], ['nutrition', nutritionRes],
-        ['food', foodRes], ['message', messageRes], ['workout', workoutRes],
+        ['food', foodRes], ['message', messageRes], ['workout', workoutRes], ['rest_day', restDayRes],
       ] as const) {
         if (res.error) console.warn(`[home] ${label} error:`, res.error.message ?? res.error);
       }
+
+      const restDayDates = new Set(((restDayRes.data ?? []) as any[]).map((r) => r.date as string));
+      const todayKey = localDateKey(new Date());
 
       const plan = planRes.data;
       const hasPlan = !!plan;
@@ -281,18 +314,23 @@ export function useHomeData(): HomeData {
         const sessionToday = resolveTodaySession(
           (plan.plan_session ?? []) as any[],
           (workoutRes.data ?? []) as any[],
+          new Date(),
+          restDayDates,
         );
         todaySession = sessionToday
           ? {
               hasSession: true,
               planSessionId: sessionToday.id,
-              name: sessionToday.focus?.toUpperCase() ?? 'TRAINING',
+              name: titleCase(sessionToday.focus) === '—' ? 'Training' : titleCase(sessionToday.focus),
               exerciseCountLabel: `${sessionToday.plan_exercise?.length ?? 0} exercises`,
             }
-          : { hasSession: false };
+          : { hasSession: false, isRestDay: restDayDates.has(todayKey) };
         greetingSession = sessionToday
           ? {
-              focus: sessionToday.focus ?? null,
+              // Humanized before it reaches the prompt, not just before it reaches a label. The
+              // raw value went straight into the greeting instruction, so the coach repeated it
+              // verbatim and Home read "Time to hit upper_push".
+              focus: sessionToday.focus ? titleCase(sessionToday.focus) : null,
               exerciseNames: (sessionToday.plan_exercise ?? [])
                 .slice()
                 .sort((a: any, b: any) => a.ord - b.ord)
@@ -343,7 +381,25 @@ export function useHomeData(): HomeData {
       } else {
         greetingInFlightRef.current = true;
         try {
-          const generated = await callBrain(userId, buildGreetingPrompt(greetingSession), 'text', true);
+          const proteinMacro = macros?.find((m) => m.key === 'protein');
+          const caloriesMacro = macros?.find((m) => m.key === 'calories');
+          const nutritionForGreeting =
+            proteinMacro && caloriesMacro
+              ? {
+                  caloriesLeft: Math.max(0, caloriesMacro.goal - caloriesMacro.current),
+                  proteinLeft: Math.max(0, proteinMacro.goal - proteinMacro.current),
+                }
+              : null;
+          const generated = await callBrain(
+            userId,
+            buildGreetingPrompt(greetingSession, nutritionForGreeting),
+            'text',
+            true,
+            undefined,
+            undefined,
+            undefined,
+            true,
+          );
           coachMessage = sanitizeCoachMessage(generated.reply);
         } catch (err) {
           console.warn('[home] daily greeting generation failed:', err);
@@ -355,7 +411,7 @@ export function useHomeData(): HomeData {
 
       if (cancelled) return;
 
-      const streakDays = computeStreak((workoutRes.data ?? []).map((row: any) => row.at));
+      const streakDays = computeStreak((workoutRes.data ?? []).map((row: any) => row.at), restDayDates);
       const userName = profileRes.data?.display_name ?? null;
       if (!profileRes.error) setCachedDisplayName(userId, userName);
       const loadError = planRes.error ? "Couldn't load your plan." : null;

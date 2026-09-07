@@ -87,6 +87,24 @@ export const BRAIN_TOOLS = [
     },
   },
   {
+    name: 'estimate_body_fat_goal',
+    description:
+      'Compute the target bodyweight for a stated body-fat-percentage goal (e.g. "get me to 15% ' +
+      'body fat"), holding lean mass constant. Uses the latest weight on file — if none exists, ' +
+      'ask for their current weight first. Requires a current body-fat % — if the user hasn\'t ' +
+      'given one, ask for it or a reasonable estimate instead of guessing yourself. Never state a ' +
+      'body-fat target, target weight, or fat-mass-to-lose number in a reply unless this tool ' +
+      'returned it — never compute this arithmetic yourself.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        current_body_fat_pct: { type: 'number' },
+        target_body_fat_pct: { type: 'number' },
+      },
+      required: ['current_body_fat_pct', 'target_body_fat_pct'],
+    },
+  },
+  {
     name: 'update_nutrition_targets',
     description:
       'Recompute calorie/macro targets after a goal change (e.g. "I’m cutting now"). Call this together with update_training_plan whenever the goal changes.',
@@ -121,18 +139,48 @@ export const BRAIN_TOOLS = [
     description:
       'Silently record a brand NEW meal the user hasn\'t already logged. Never use this to correct ' +
       'or add to a meal that read_state already shows as logged today — call update_food on that ' +
-      'record instead, or this will create a duplicate.',
+      'record instead, or this will create a duplicate. If this returns status "likely_correction", ' +
+      'it means a recently-logged meal reads as similar text and NOTHING was saved. Ask the user ' +
+      'directly: is this a correction to that earlier meal, or a genuinely separate one (a second ' +
+      'serving, a repeat meal)? If they confirm it\'s separate, call log_food again with the SAME ' +
+      'description and confirmed_new_meal set to true — that is the only way to actually save it; ' +
+      'calling it again without that flag will just be flagged as a likely correction a second time. ' +
+      'There is no separate nutrition-lookup step — you must estimate calories/protein_g/carbs_g/' +
+      'fat_g yourself from the description using your own food-knowledge before calling this, even ' +
+      'when the user gave no quantities (assume a typical single-serving size and say so isn\'t ' +
+      'required, just estimate). Confirmed live: calling this with the macro fields omitted silently ' +
+      'saves a meal with zero nutrition value, which the Fuel screen and Home\'s macro totals then ' +
+      'both read as truly zero — never leave them blank to avoid guessing.',
     input_schema: {
       type: 'object',
       properties: {
         description: { type: 'string' },
-        calories: { type: 'number' },
-        protein_g: { type: 'number' },
-        carbs_g: { type: 'number' },
-        fat_g: { type: 'number' },
+        calories: {
+          type: 'number',
+          description: 'Your best realistic estimate — never omit even for a vaguely-described meal.',
+        },
+        protein_g: {
+          type: 'number',
+          description: 'Grams, your best realistic estimate — never omit even for a vaguely-described meal.',
+        },
+        carbs_g: {
+          type: 'number',
+          description: 'Grams, your best realistic estimate — never omit even for a vaguely-described meal.',
+        },
+        fat_g: {
+          type: 'number',
+          description: 'Grams, your best realistic estimate — never omit even for a vaguely-described meal.',
+        },
         modality: { type: 'string', enum: ['voice', 'text', 'image', 'file', 'live_photo'] },
+        confirmed_new_meal: {
+          type: 'boolean',
+          description:
+            'Only set true after the user has explicitly confirmed this is a separate meal from ' +
+            'the similar one already logged, not a correction to it. Never set this on a first ' +
+            'attempt — only after a prior call returned "likely_correction" and you asked.',
+        },
       },
-      required: ['description'],
+      required: ['description', 'calories', 'protein_g', 'carbs_g', 'fat_g'],
     },
   },
   {
@@ -158,6 +206,13 @@ export const BRAIN_TOOLS = [
             'Leave false/omitted to get a preview of the change with nothing saved. Set true only after ' +
             'the user explicitly agreed to the previewed values in their most recent message.',
         },
+        confirm_token: {
+          type: 'string',
+          description:
+            'Required alongside confirm:true — the exact confirm_token string the preview call ' +
+            '(confirm omitted/false) just returned. A stale, missing, or invented token is rejected ' +
+            'and returns a fresh preview instead of saving anything.',
+        },
       },
       required: ['id'],
     },
@@ -179,13 +234,26 @@ export const BRAIN_TOOLS = [
             'Leave false/omitted to preview what would be deleted with nothing removed. Set true only ' +
             'after the user explicitly agreed to remove it in their most recent message.',
         },
+        confirm_token: {
+          type: 'string',
+          description:
+            'Required alongside confirm:true — the exact confirm_token string the preview call just ' +
+            'returned. A stale, missing, or invented token is rejected and returns a fresh preview ' +
+            'instead of deleting anything.',
+        },
       },
       required: ['id'],
     },
   },
   {
     name: 'log_workout',
-    description: 'Silently record a completed workout.',
+    description:
+      'Silently record a completed workout — not for an in-app active session (that logs sets ' +
+      'client-side on its own; use skip_exercise/add_set/end_workout for those). Never invent or ' +
+      'default sets/reps/load — if the user didn\'t state a value, omit that field or ask, don\'t ' +
+      'guess. Call this WITHOUT confirm first — it returns a preview of what would be logged, ' +
+      'nothing is saved yet. Only call it again with confirm:true after the user has explicitly ' +
+      'agreed to that exact preview in their next message.',
     input_schema: {
       type: 'object',
       properties: {
@@ -204,6 +272,19 @@ export const BRAIN_TOOLS = [
           },
         },
         note: { type: 'string' },
+        confirm: {
+          type: 'boolean',
+          description:
+            'Leave false/omitted to get a preview with nothing saved. Set true only after the user ' +
+            'explicitly agreed to the previewed exercises in their most recent message.',
+        },
+        confirm_token: {
+          type: 'string',
+          description:
+            'Required alongside confirm:true — the exact confirm_token string the preview call just ' +
+            'returned. A stale, missing, or invented token is rejected and returns a fresh preview ' +
+            'instead of saving anything.',
+        },
       },
       required: ['exercises_done'],
     },
@@ -237,8 +318,61 @@ export const BRAIN_TOOLS = [
   {
     name: 'open_todays_workout',
     description:
-      "Open today's scheduled session in the app so the user can review and start it — use for requests like \"take me to my workout\" or \"let's start\". Returns no_session if today is a rest day or there's no active plan; tell the user that instead of navigating.",
+      "Open today's scheduled session in the app so the user can review it and tap Start themselves " +
+      '— use for "take me to my workout" or "show me today\'s workout". Does NOT start the workout ' +
+      '— for "let\'s start"/"begin the workout" use start_todays_workout instead. Returns no_session ' +
+      "if today is a rest day or there's no active plan; tell the user that instead of navigating.",
     input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'start_todays_workout',
+    description:
+      "Actually START today's scheduled session right now — launches the live in-app workout " +
+      'screen with the timer and set-tracking running. Use only when the user has clearly ' +
+      'confirmed they want to begin working out this moment ("let\'s start", "begin the workout", ' +
+      '"yes, start it"), not for merely wanting to see/review it (use open_todays_workout for ' +
+      'that). Call this WITHOUT confirm first — it returns a preview of which session would start ' +
+      'and launches nothing. Only call it again with confirm:true once the user has explicitly ' +
+      "agreed in their next message. Returns no_session if today is a rest day or there's no " +
+      'active plan, or already_active if a session is already running.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        confirm: {
+          type: 'boolean',
+          description: 'Leave false/omitted to preview which session would start with nothing launched. Set true only after explicit agreement in their next message.',
+        },
+        confirm_token: {
+          type: 'string',
+          description:
+            'Required alongside confirm:true — the exact confirm_token string the preview call just ' +
+            'returned. A stale, missing, or invented token is rejected and returns a fresh preview ' +
+            'instead of starting anything.',
+        },
+      },
+    },
+  },
+  {
+    name: 'reschedule_today',
+    description:
+      "Move today off as a rest day without touching the rest of the plan — use for \"let's skip " +
+      'today"/"push today back"/"I need a rest day" instead of update_training_plan, which would ' +
+      'replace the entire plan. Call this WITHOUT confirm first — it returns a preview of what ' +
+      'would become due tomorrow instead, with nothing saved. Only call it again with confirm:true ' +
+      "after the user has explicitly agreed in their next message.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        confirm: { type: 'boolean', description: 'Leave false/omitted to preview; true only after explicit agreement.' },
+        confirm_token: {
+          type: 'string',
+          description:
+            'Required alongside confirm:true — the exact confirm_token string the preview call just ' +
+            'returned. A stale, missing, or invented token is rejected and returns a fresh preview ' +
+            'instead of rescheduling anything.',
+        },
+      },
+    },
   },
   {
     name: 'show_plan_breakdown',
@@ -277,6 +411,12 @@ export const BRAIN_TOOLS = [
     input_schema: { type: 'object', properties: {} },
   },
   {
+    name: 'show_previous_workout',
+    description:
+      "Show the user's most recently logged workout as a structured recap card (sets done vs target, top set, duration) instead of describing it in text. Use for phrases like \"what was my last workout\" or \"previous session\". If nothing has ever been logged, say so plainly instead of inventing one.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
     name: 'swap_exercise',
     description:
       "Swap an upcoming exercise in the user's active in-app session for a same-muscle-group, injury-safe alternative from the catalog (e.g. \"swap out face pulls, my shoulder's bothering me\"). Only works while a session is actually running and the exercise hasn't started yet.",
@@ -291,7 +431,7 @@ export const BRAIN_TOOLS = [
   {
     name: 'skip_exercise',
     description:
-      "Skip the current exercise in the user's active in-app workout session and move to the next one, without logging a set for it. Only works while a session is actually running in the app.",
+      "Move on from the current exercise in the user's active in-app workout session to the next one, without logging a set for it. Call this for explicit \"skip\"/\"next exercise\" wording, AND for phrases that name a different, later exercise in the session instead of the current one — e.g. \"let's start dumbbell press\" or \"let's do overhead press now\" while bench press is still current — confirmed live: agreeing to that verbally without calling this leaves the app still showing the old exercise as current, out of sync with what you just said. Only works while a session is actually running in the app, and only advances to the exercise that's actually next in this session — never to an arbitrary exercise the user names that isn't queued up.",
     input_schema: { type: 'object', properties: {} },
   },
   {
@@ -301,13 +441,36 @@ export const BRAIN_TOOLS = [
     input_schema: { type: 'object', properties: {} },
   },
   {
+    name: 'undo_last_set',
+    description:
+      "Remove the most recently logged set in the user's active in-app workout session — use when " +
+      'they say the last one was wrong, misheard, or shouldn\'t have been logged (e.g. "that\'s ' +
+      'wrong, undo that" or "I didn\'t say that"). Only undoes the single most recent set; only ' +
+      'works while a session is actually running and a set was just logged.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
     name: 'end_workout',
     description:
-      "End the user's currently active in-app workout session and generate its report. Only works while a session is actually running in the app — if you're not sure one is, ask before calling this.",
+      "End the user's currently active in-app workout session and generate its report. Only works while a session is actually running in the app — if you're not sure one is, ask before calling this. " +
+      'Call this WITHOUT confirm first — it returns a preview of what would be saved and ends nothing. ' +
+      'Only call it again with confirm:true and the exact confirm_token the preview returned, once the ' +
+      'user has explicitly agreed to end it now.',
     input_schema: {
       type: 'object',
       properties: {
         completed: { type: 'boolean', description: 'true if they finished as planned, false if cutting it short' },
+        confirm: {
+          type: 'boolean',
+          description: 'Leave false/omitted to preview what would happen with nothing ended. Set true only after explicit agreement in their next message.',
+        },
+        confirm_token: {
+          type: 'string',
+          description:
+            'Required alongside confirm:true — the exact confirm_token string the preview call just ' +
+            'returned. A stale, missing, or invented token is rejected and returns a fresh preview ' +
+            'instead of ending anything.',
+        },
       },
       required: ['completed'],
     },
@@ -353,5 +516,6 @@ const CARD_ONLY_TOOLS = new Set([
   'show_progress_report',
   'show_readiness',
   'show_top_lifts',
+  'show_previous_workout',
 ]);
 export const VOICE_TOOLS = BRAIN_TOOLS.filter((tool) => !CARD_ONLY_TOOLS.has(tool.name));

@@ -25,7 +25,7 @@ export function BottomSheet({ visible, onClose, heightVariant = 'half', children
           <Pressable style={styles.closeBtn} onPress={onClose} hitSlop={8}>
             <XIcon size={15} color={colors.muted} />
           </Pressable>
-          <View style={styles.content}>{children}</View>
+          <View style={[styles.content, heightVariant === 'full' && styles.contentFill]}>{children}</View>
         </View>
       </View>
     </Modal>
@@ -63,5 +63,6 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
     zIndex: 2,
   },
-  content: { flex: 1, paddingBottom: 32 },
+  content: { paddingBottom: 32 },
+  contentFill: { flex: 1 },
 });

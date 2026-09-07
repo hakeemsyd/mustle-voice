@@ -1,10 +1,17 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
 
+export interface PlanAlternativeExercise {
+  name: string;
+  sets: number;
+  repScheme: string;
+}
+
 export interface PlanAlternative {
   planSessionId: string;
   focus: string;
   exerciseCount: number;
+  exercises: PlanAlternativeExercise[];
 }
 
 /**
@@ -32,7 +39,9 @@ export function usePlanAlternatives(excludePlanSessionId?: string) {
 
       const { data } = await supabase
         .from('training_plan')
-        .select('id, plan_session(id, day_order, focus, session_type, plan_exercise(id))')
+        .select(
+          'id, plan_session(id, day_order, focus, session_type, plan_exercise(id, ord, sets, rep_scheme, exercise:exercise_id(name)))',
+        )
         .eq('user_id', userId)
         .eq('status', 'active')
         .maybeSingle();
@@ -42,11 +51,23 @@ export function usePlanAlternatives(excludePlanSessionId?: string) {
       const rows = ((data?.plan_session ?? []) as any[])
         .filter((s) => s.id !== excludePlanSessionId && (s.session_type ?? 'strength') === 'strength')
         .sort((a, b) => a.day_order - b.day_order)
-        .map((s) => ({
-          planSessionId: s.id as string,
-          focus: (s.focus as string | null) ?? 'Training',
-          exerciseCount: (s.plan_exercise ?? []).length,
-        }));
+        .map((s) => {
+          const planExercise = (s.plan_exercise ?? []) as any[];
+          const exercises: PlanAlternativeExercise[] = planExercise
+            .slice()
+            .sort((a, b) => a.ord - b.ord)
+            .map((e) => ({
+              name: (Array.isArray(e.exercise) ? e.exercise[0] : e.exercise)?.name ?? 'Exercise',
+              sets: e.sets,
+              repScheme: e.rep_scheme,
+            }));
+          return {
+            planSessionId: s.id as string,
+            focus: (s.focus as string | null) ?? 'Training',
+            exerciseCount: exercises.length,
+            exercises,
+          };
+        });
 
       setAlternatives(rows);
       setLoading(false);
