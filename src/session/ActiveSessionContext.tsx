@@ -518,7 +518,12 @@ export function ActiveSessionProvider({
       const exercise = exercises[currentExerciseIndex];
       if (!exercise || loggingRef.current) return;
 
-      const dedupeKey = `${exercise.id}:${weight ?? 'bodyweight'}:${reps}`;
+      // Set-indexed so a genuine repeat of the same weight/reps (routine in straight-set
+      // training, e.g. three sets of "135 for 8") isn't mistaken for the SDK re-emitting the
+      // identical event — confirmed live: without the set index, reporting the same numbers
+      // twice in a row silently dropped the second, real set.
+      const setIndex = loggedSets[currentExerciseIndex]?.length ?? 0;
+      const dedupeKey = `${exercise.id}:${setIndex}:${weight ?? 'bodyweight'}:${reps}`;
       const now = Date.now();
       const recent = recentSetRef.current;
       if (recent && recent.key === dedupeKey && now - recent.at < DUPLICATE_SET_WINDOW_MS) {
@@ -715,6 +720,15 @@ export function ActiveSessionProvider({
       lastSetSnapshotRef.current = null;
       setEnded(true);
       setEndedStatus(status);
+      // Deleted here, not deferred to clear() — confirmed live: clear() only runs once the
+      // post-workout feedback screen is submitted or skipped, and the header back button can
+      // leave that screen without ever calling it, so the row (and the "workout in progress"
+      // impression it gives the coach) could survive indefinitely after the user considers the
+      // workout over. The write effect still upserts state.ended=true right after this, but
+      // deleting outright removes any live_session_state block for the coach to read at all,
+      // which is the one signal brain-voice actually checks (see live-session-format.ts).
+      const endingUserId = userIdRef.current;
+      if (endingUserId) void supabase.from("live_session_state").delete().eq("user_id", endingUserId);
       await writeWorkoutLog(loggedSets, status);
     },
     [loggedSets, writeWorkoutLog],

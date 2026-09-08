@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { callBrain, COACH_UNREACHABLE_MESSAGE, type ChatCard } from '../lib/brain';
 import { uploadChatFile, uploadChatImage } from '../lib/chatAttachments';
+import { stripNonSpeechArtifacts } from '../lib/elevenLabsVoice';
 
 export interface ChatMessage {
   id: string;
@@ -72,10 +73,13 @@ export function useHomeChat(userId: string | null) {
   // so a conversation reads as one thread whether it was typed or spoken.
   const appendLocal = useCallback((role: 'user' | 'assistant', text: string) => {
     // The SDK emits the occasional contentless turn — silence it heard as speech, an interim
-    // transcript that resolved to nothing. Those were landing in the feed as empty/"…"-only
-    // rows, which read as messages the user never sent.
-    if (!/[\p{L}\p{N}]/u.test(text)) return;
-    setTranscript((prev) => [...prev, { id: `local-${Date.now()}-${role}`, role, text, at: new Date().toISOString() }]);
+    // transcript that resolved to nothing, or (confirmed live) a bracketed non-speech
+    // annotation like "[Silence]" instead of returning empty. stripNonSpeechArtifacts strips
+    // that annotation first so a genuinely silent turn still drops here instead of landing in
+    // the feed as a message nobody sent.
+    const cleaned = stripNonSpeechArtifacts(text);
+    if (!cleaned) return;
+    setTranscript((prev) => [...prev, { id: `local-${Date.now()}-${role}`, role, text: cleaned, at: new Date().toISOString() }]);
   }, []);
 
   const latestRequestRef = useRef(0);

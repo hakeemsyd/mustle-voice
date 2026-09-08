@@ -17,7 +17,7 @@ const sanitizeForSpeech = (text: string): string => text.replace(/[—–]/g, ',
 // (e.g. "[clicking]", "(background noise)") instead of returning empty — strip those out so
 // they never get used as real answer text, and treat what's left as no answer if nothing
 // alphabetic survives.
-const stripNonSpeechArtifacts = (text: string): string => {
+export const stripNonSpeechArtifacts = (text: string): string => {
   const cleaned = text.replace(/[[(][^\])]*[\])]/g, '').replace(/\s+/g, ' ').trim();
   return /[a-zA-Z]/.test(cleaned) ? cleaned : '';
 };

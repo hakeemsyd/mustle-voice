@@ -93,8 +93,6 @@ function getMealIcon(
   return UtensilsIcon;
 }
 
-type MealTab = "upcoming" | "logged";
-
 function EmptyRing({ text }: { text: string }) {
   return (
     <View style={styles.emptyRingWrap}>
@@ -132,10 +130,6 @@ export function FuelScreen() {
     canGoToNextDay,
     todayKey,
   } = useFuelData();
-  // Defaults to "logged", not the reference's "upcoming" — Upcoming Meals
-  // has no suggestion engine behind it in this app (see the empty-state
-  // copy below), so defaulting there would always land on an empty tab.
-  const [mealTab, setMealTab] = useState<MealTab>("logged");
   const [selectedEntry, setSelectedEntry] = useState<FoodLogEntry | null>(null);
   const [datePickerOpen, setDatePickerOpen] = useState(false);
   const [pickerMonth, setPickerMonth] = useState(() => new Date());
@@ -241,111 +235,68 @@ export function FuelScreen() {
             </View>
           )}
 
-          <View style={styles.tabBar}>
-            <Pressable
-              style={[
-                styles.tabBtn,
-                mealTab === "upcoming" && styles.tabBtnActive,
-              ]}
-              onPress={() => setMealTab("upcoming")}
-            >
-              <Text
-                style={[
-                  styles.tabBtnText,
-                  mealTab === "upcoming" && styles.tabBtnTextActive,
-                ]}
-              >
-                Upcoming Meals
-              </Text>
+          <View style={styles.dateNavRow}>
+            <Pressable style={styles.dateNavBtn} onPress={goToPreviousDay} hitSlop={6}>
+              <View style={{ transform: [{ rotate: "180deg" }] }}>
+                <ChevronRightIcon size={16} color={colors.text} />
+              </View>
+            </Pressable>
+            <Pressable style={styles.dateLabelBtn} onPress={() => setDatePickerOpen(true)}>
+              <CalendarIcon size={13} color={colors.text} />
+              <Text style={styles.dateLabelText}>{formatLoggedDateLabel(loggedDate, todayKey)}</Text>
             </Pressable>
             <Pressable
-              style={[
-                styles.tabBtn,
-                mealTab === "logged" && styles.tabBtnActive,
-              ]}
-              onPress={() => setMealTab("logged")}
+              style={[styles.dateNavBtn, !canGoToNextDay && styles.dateNavBtnDisabled]}
+              onPress={goToNextDay}
+              disabled={!canGoToNextDay}
+              hitSlop={6}
             >
-              <Text
-                style={[
-                  styles.tabBtnText,
-                  mealTab === "logged" && styles.tabBtnTextActive,
-                ]}
-              >
-                Meals Logged
-              </Text>
+              <ChevronRightIcon size={16} color={canGoToNextDay ? colors.text : colors.muted} />
             </Pressable>
           </View>
 
-          {mealTab === "upcoming" ? (
+          {loggedLoading ? (
+            <ActivityIndicator color={colors.accent} style={styles.tabPanelEmptyText} />
+          ) : loggedEntries.length === 0 ? (
             <Text style={[styles.emptyText, styles.tabPanelEmptyText]}>
-              Not enough data yet — log a few meals to get suggestions
+              {loggedDate === todayKey
+                ? "Nothing logged yet — tell your coach what you ate."
+                : "No meals logged that day."}
             </Text>
           ) : (
-            <>
-              <View style={styles.dateNavRow}>
-                <Pressable style={styles.dateNavBtn} onPress={goToPreviousDay} hitSlop={6}>
-                  <View style={{ transform: [{ rotate: "180deg" }] }}>
-                    <ChevronRightIcon size={16} color={colors.text} />
-                  </View>
-                </Pressable>
-                <Pressable style={styles.dateLabelBtn} onPress={() => setDatePickerOpen(true)}>
-                  <CalendarIcon size={13} color={colors.text} />
-                  <Text style={styles.dateLabelText}>{formatLoggedDateLabel(loggedDate, todayKey)}</Text>
-                </Pressable>
-                <Pressable
-                  style={[styles.dateNavBtn, !canGoToNextDay && styles.dateNavBtnDisabled]}
-                  onPress={goToNextDay}
-                  disabled={!canGoToNextDay}
-                  hitSlop={6}
-                >
-                  <ChevronRightIcon size={16} color={canGoToNextDay ? colors.text : colors.muted} />
-                </Pressable>
-              </View>
-
-              {loggedLoading ? (
-                <ActivityIndicator color={colors.accent} style={styles.tabPanelEmptyText} />
-              ) : loggedEntries.length === 0 ? (
-                <Text style={[styles.emptyText, styles.tabPanelEmptyText]}>
-                  {loggedDate === todayKey
-                    ? "Nothing logged yet — tell your coach what you ate."
-                    : "No meals logged that day."}
-                </Text>
-              ) : (
-                <View style={styles.logList}>
-                  {loggedEntries.map((entry) => {
-                    const badge = MEAL_BADGE[inferMealBucket(entry.at)];
-                    const MealIcon = getMealIcon(entry.description);
-                    return (
-                      <Pressable
-                        key={entry.id}
-                        style={styles.logRow}
-                        onPress={() => setSelectedEntry(entry)}
-                      >
-                        <View style={styles.logIconTile}>
-                          <MealIcon size={20} color={colors.accent} />
-                        </View>
-                        <View style={styles.logRowMain}>
-                          <Text style={styles.logDescription}>
-                            {entry.description}
-                          </Text>
-                          <View style={styles.logRowType}>
-                            <badge.Icon size={11} color={colors.text} />
-                            <Text style={styles.logRowTypeText}>{badge.label}</Text>
-                          </View>
-                          <Text style={styles.logMacros}>
-                            {entry.proteinG}g protein · {entry.carbsG}g carbs ·{" "}
-                            {entry.fatG}g fat
-                          </Text>
-                          <Text style={styles.logMeta}>
-                            {formatTime(entry.at)} · {entry.calories} kcal
-                          </Text>
-                        </View>
-                      </Pressable>
-                    );
-                  })}
-                </View>
-              )}
-            </>
+            <View style={styles.logList}>
+              {loggedEntries.map((entry) => {
+                const badge = MEAL_BADGE[inferMealBucket(entry.at)];
+                const MealIcon = getMealIcon(entry.description);
+                return (
+                  <Pressable
+                    key={entry.id}
+                    style={styles.logRow}
+                    onPress={() => setSelectedEntry(entry)}
+                  >
+                    <View style={styles.logIconTile}>
+                      <MealIcon size={20} color={colors.accent} />
+                    </View>
+                    <View style={styles.logRowMain}>
+                      <Text style={styles.logDescription}>
+                        {entry.description}
+                      </Text>
+                      <View style={styles.logRowType}>
+                        <badge.Icon size={11} color={colors.text} />
+                        <Text style={styles.logRowTypeText}>{badge.label}</Text>
+                      </View>
+                      <Text style={styles.logMacros}>
+                        {entry.proteinG}g protein · {entry.carbsG}g carbs ·{" "}
+                        {entry.fatG}g fat
+                      </Text>
+                      <Text style={styles.logMeta}>
+                        {formatTime(entry.at)} · {entry.calories} kcal
+                      </Text>
+                    </View>
+                  </Pressable>
+                );
+              })}
+            </View>
           )}
 
           <View style={{ height: 24 }} />
@@ -512,30 +463,6 @@ const styles = StyleSheet.create({
     marginTop: -8,
   },
 
-  tabBar: {
-    flexDirection: "row",
-    gap: 4,
-    backgroundColor: colors.surfaceDeep,
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: 100,
-    padding: 3,
-    marginTop: 16,
-  },
-  tabBtn: {
-    flex: 1,
-    height: 34,
-    borderRadius: 100,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  tabBtnActive: { backgroundColor: colors.accent },
-  tabBtnText: {
-    fontFamily: fonts.bodySemiBold,
-    fontSize: 11.5,
-    color: colors.muted,
-  },
-  tabBtnTextActive: { color: colors.bg },
 
   logList: { gap: 8, marginTop: 14 },
   logRow: {

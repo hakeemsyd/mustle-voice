@@ -47,6 +47,7 @@ import {
 } from "../lib/parseSetReport";
 import { buildLiveSessionSnapshot, describeLiveSessionSnapshot } from "../session/liveSessionState";
 import { chooseRestDay } from "../lib/restDay";
+import { targetRepsFrom } from "../lib/restSuggestion";
 import { titleCase } from "../lib/textFormat";
 import type { RootStackParamList } from "../navigation/types";
 
@@ -166,7 +167,12 @@ export function ActiveSessionScreen({ navigation }: Props) {
     session.logSet(weight, reps, unit);
     session.noteSetLogged(describeParsedSet({ weight, reps, unit }));
     setDraft("");
-    if (!viaVoice) triggerCueRef.current?.("set_logged");
+    // Recorded, not fired here — the "set_logged" cue needs the live_session_state write for
+    // THIS set to land first (see the effect below), and that write hasn't even been scheduled
+    // yet this synchronously, logSet's state update hasn't committed. viaVoice sets are
+    // deliberately excluded: the coach already knows about those from its own inline context
+    // update a few lines up in the message handler.
+    pendingSetCueRef.current = viaVoice ? "skip" : "fire";
 
     setUndoVisible(true);
     if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
@@ -175,6 +181,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
 
   const sendContextRef = useRef<((text: string) => void) | null>(null);
   const triggerCueRef = useRef<((cue: string) => void) | null>(null);
+  const pendingSetCueRef = useRef<"fire" | "skip" | null>(null);
 
   const {
     orbState, isActive, status: voiceStatus, toggle, sendContextualUpdate, sendUserMessage,
@@ -308,7 +315,11 @@ export function ActiveSessionScreen({ navigation }: Props) {
   }, [voiceStatus, target, focus, exercises, currentExerciseIndex, loggedSets, resting, restTargetSec, restPausedRemainingSec, paused, ended]);
 
   useEffect(() => {
-    if (!session.userId || !target) return;
+    // Once ended, session.endSession() has already deleted this row outright (see
+    // ActiveSessionContext.tsx) so the coach sees no session at all rather than a stale one —
+    // re-upserting here on the very same ended:false→true transition would race that delete and
+    // could leave the row behind again, exactly the bug this was meant to close.
+    if (!session.userId || !target || ended) return;
     liveStateWriteRef.current = supabase.from("live_session_state").upsert({
       user_id: session.userId,
       state: {
@@ -346,6 +357,27 @@ export function ActiveSessionScreen({ navigation }: Props) {
       () => triggerCueRef.current?.("session_start"),
     );
   }, [target, ended, voiceStatus, isCardio, currentExercise]);
+
+  // Same race as session_start, just tighter: commitSet fires synchronously, before logSet's own
+  // state update has even committed, let alone before the write effect above has re-run for the
+  // new loggedSets/resting values — so "set_logged" can't just await liveStateWriteRef.current
+  // right there. Deferring the trigger into its own effect, declared after the write effect,
+  // means both react to the same loggedSets change in the same commit: the write effect (earlier
+  // in source order) reassigns liveStateWriteRef.current first, then this one reads the fresh
+  // promise, same guarantee session_start already has.
+  const totalSetsLogged = loggedSets.reduce((n, sets) => n + sets.length, 0);
+  const lastSetCueCountRef = useRef(totalSetsLogged);
+  useEffect(() => {
+    if (totalSetsLogged === lastSetCueCountRef.current) return;
+    lastSetCueCountRef.current = totalSetsLogged;
+    const pending = pendingSetCueRef.current;
+    pendingSetCueRef.current = null;
+    if (pending !== "fire") return;
+    void liveStateWriteRef.current.then(
+      () => triggerCueRef.current?.("set_logged"),
+      () => triggerCueRef.current?.("set_logged"),
+    );
+  }, [totalSetsLogged]);
 
   // Rest has to end itself. Nothing called finishRest except the expanded card's Continue
   // button, so a finished rest sat at 0:00 forever and the next set could never begin.
@@ -395,7 +427,12 @@ export function ActiveSessionScreen({ navigation }: Props) {
     if (state.key !== restKey) return;
     if (restRemaining <= 0 && !state.over) {
       state.over = true;
-      triggerCueRef.current?.("rest_over");
+      // Same live_session_state race as set_logged/session_start — the coach reads the next
+      // exercise/set number off this row when told rest is over.
+      void liveStateWriteRef.current.then(
+        () => triggerCueRef.current?.("rest_over"),
+        () => triggerCueRef.current?.("rest_over"),
+      );
       setTimeout(() => {
         const s = restCueStateRef.current;
         if (s.key === restKey && !s.silence && restingRef.current) {
@@ -405,7 +442,10 @@ export function ActiveSessionScreen({ navigation }: Props) {
       }, 20_000);
     } else if (restRemaining > 0 && restRemaining <= 10 && !state.countdown) {
       state.countdown = true;
-      triggerCueRef.current?.("rest_final_countdown");
+      void liveStateWriteRef.current.then(
+        () => triggerCueRef.current?.("rest_final_countdown"),
+        () => triggerCueRef.current?.("rest_final_countdown"),
+      );
     }
   }, [restRemaining, resting, restKey, voiceStatus]);
 
@@ -461,6 +501,16 @@ export function ActiveSessionScreen({ navigation }: Props) {
     if (resting || !currentExercise) return;
     if (parsedDraft) {
       commitSet(parsedDraft.weight, parsedDraft.reps, false, parsedDraft.unit);
+      return;
+    }
+    // Tapped straight from the menu with nothing typed — confirmed live: this used to silently
+    // no-op (just focus the input), which read as the button doing nothing at all. Falls back to
+    // the exercise's own target reps and whatever weight was last logged for it this session
+    // (null/bodyweight if this is the first set) so the tap always records something real,
+    // instead of only working when the user has already typed a report.
+    const fallbackReps = targetRepsFrom(currentExercise.repScheme);
+    if (fallbackReps != null) {
+      commitSet(lastLoggedWeight ?? null, fallbackReps, false);
       return;
     }
     inputRef.current?.focus();

@@ -5,6 +5,7 @@ import { setAudioModeAsync } from 'expo-audio';
 import { subscribeToAudioInterruptions } from '../../modules/mustle-audio-session';
 import { supabase } from '../lib/supabase';
 import { setCachedDisplayName } from '../lib/profileStore';
+import { stripNonSpeechArtifacts } from '../lib/elevenLabsVoice';
 import type { OrbState } from '../components/VoiceOrb';
 
 export interface SpokenMessage {
@@ -114,15 +115,18 @@ export function useVoiceSession(
     onError: (message) => console.error('[voice] error:', message),
     onMessage: ({ message, role }) => {
       // The SDK emits the occasional contentless turn — room noise heard as speech, or an
-      // interim transcript that resolved to nothing. Dropped at the source for two reasons:
-      // they were landing in the visible thread as messages nobody sent, and a contentless
-      // *user* turn was resetting the silence timeout below — so a conversation nobody was
-      // actually taking part in never timed out, and the agent went on filling the silence
-      // ("Still here. What do you need?") indefinitely.
-      if (!/[\p{L}\p{N}]/u.test(message)) return;
+      // interim transcript that resolved to nothing. scribe_v1 doesn't always return empty for
+      // these though — confirmed live, it sometimes hands back a bracketed non-speech annotation
+      // like "[Silence]" or "(background noise)" instead, which the old letters-only check let
+      // through as if it were real speech: it reached the coach as a genuine turn, which then
+      // read the marker back out loud. stripNonSpeechArtifacts (already proven for onboarding's
+      // STT, see elevenLabsVoice.ts) strips those annotations first, so only text a person
+      // actually said either resets the silence timeout below or reaches the coach.
+      const cleaned = stripNonSpeechArtifacts(message);
+      if (!cleaned) return;
       if (role === 'user') {
         lastUserActivityRef.current = Date.now();
-        if (isStopCommand(message)) {
+        if (isStopCommand(cleaned)) {
           intentionalEndRef.current = true;
           Promise.resolve(endSession())
             .then(() => setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }))
@@ -130,7 +134,7 @@ export function useVoiceSession(
           return;
         }
       }
-      onSpokenMessage?.({ role, text: message });
+      onSpokenMessage?.({ role, text: cleaned });
     },
     // The LiveKit transport can drop on its own (ping timeout, network blip) mid-conversation —
     // confirmed live: a dropped connection silently ate a spoken set report with zero feedback,

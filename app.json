@@ -71,7 +71,7 @@
         "@kingstinct/react-native-healthkit",
         {
           "NSHealthShareUsageDescription": "Mustle reads your weight, workouts, sleep and activity from Health so your coach can adjust your plan and recovery guidance — nothing is shared without your permission.",
-          "NSHealthUpdateUsageDescription": false,
+          "NSHealthUpdateUsageDescription": "Mustle does not currently save any data back to Health.",
           "background": false
         }
       ]
