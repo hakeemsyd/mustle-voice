@@ -3,15 +3,16 @@ import { supabase } from "../lib/supabase";
 import { resolveTodaySession, type PlanSessionRow, type WorkoutLogRow } from "../lib/resolveTodaySession";
 import { addDays, localDateKey, startOfWeek } from "../lib/calendarDate";
 import { titleCase } from "../lib/textFormat";
+import type { FoodLogEntry } from "./useFuelData";
 
 // A flexible split's exact rest days aren't stored anywhere — only the weekly cadence
 // (days_per_week) is — so this assumes the ordinary real-world reading of "N days a week":
 // consecutive weekdays starting Monday, rest on whatever's left at the end of the week (e.g.
 // 5/week = Mon-Fri on, Sat-Sun off). `dow` is JS's 0=Sun..6=Sat.
-function isTrainingSlot(dow: number, daysPerWeek: number): boolean {
+const isTrainingSlot = (dow: number, daysPerWeek: number): boolean => {
   const mondayIndex = (dow + 6) % 7; // Mon=0 .. Sun=6
   return mondayIndex < daysPerWeek;
-}
+};
 
 interface PlanExerciseRow {
   ord: number;
@@ -48,10 +49,14 @@ export interface TodayCalendarData {
    *  confirmed live. */
   completedWorkout: { workoutLogId: string; focus: string | null } | null;
   mealsLoggedToday: number;
+  /** Real logged meals, not a suggested/planned concept — same source Fuel screen reads, just
+   *  scoped to today so the day's Meals section shows what actually happened rather than a
+   *  fabricated recommendation. */
+  mealsToday: FoodLogEntry[];
   refetch: () => void;
 }
 
-async function fetchPlanAndLogs(userId: string) {
+const fetchPlanAndLogs = async (userId: string) => {
   // rest_day rows are always written for "today" at write time (see src/lib/restDay.ts), never
   // a future date, so a 90-day-back window covers every caller (today/week/month/day-detail)
   // without needing a per-caller date range the way logs' own query doesn't have either.
@@ -76,9 +81,9 @@ async function fetchPlanAndLogs(userId: string) {
     logs: (logs ?? []) as WorkoutLogRow[],
     restDayDates: new Set(((restDays ?? []) as any[]).map((r) => r.date as string)),
   };
-}
+};
 
-export function useTodayCalendar(): TodayCalendarData {
+export const useTodayCalendar = (): TodayCalendarData => {
   const [state, setState] = useState<Omit<TodayCalendarData, "refetch">>({
     loading: true,
     session: null,
@@ -87,6 +92,7 @@ export function useTodayCalendar(): TodayCalendarData {
     completedToday: false,
     completedWorkout: null,
     mealsLoggedToday: 0,
+    mealsToday: [],
   });
   const [refetchSignal, setRefetchSignal] = useState(0);
   const refetch = useCallback(() => setRefetchSignal((n) => n + 1), []);
@@ -108,7 +114,12 @@ export function useTodayCalendar(): TodayCalendarData {
 
       const [{ sessions, logs, restDayDates }, foodRes] = await Promise.all([
         fetchPlanAndLogs(userId),
-        supabase.from("food_log").select("id").eq("user_id", userId).gte("at", startOfDay.toISOString()),
+        supabase
+          .from("food_log")
+          .select("id, description, calories, protein_g, carbs_g, fat_g, at")
+          .eq("user_id", userId)
+          .gte("at", startOfDay.toISOString())
+          .order("at", { ascending: true }),
       ]);
       if (cancelled) return;
 
@@ -150,6 +161,15 @@ export function useTodayCalendar(): TodayCalendarData {
           ? { workoutLogId: completedLog.id, focus: completedSession?.focus ?? null }
           : null,
         mealsLoggedToday: foodRes.data?.length ?? 0,
+        mealsToday: (foodRes.data ?? []).map((row: any) => ({
+          id: row.id,
+          description: row.description,
+          calories: row.calories ?? 0,
+          proteinG: row.protein_g ?? 0,
+          carbsG: row.carbs_g ?? 0,
+          fatG: row.fat_g ?? 0,
+          at: row.at,
+        })),
       });
     })();
     return () => {
@@ -158,7 +178,7 @@ export function useTodayCalendar(): TodayCalendarData {
   }, [refetchSignal]);
 
   return { ...state, refetch };
-}
+};
 
 export interface WeekDay {
   date: Date;
@@ -167,6 +187,10 @@ export interface WeekDay {
   focus: string | null;
   isPinnedRest: boolean;
   status: "completed" | "partial" | "missed" | "upcoming" | "rest";
+  /** Real logged meal count for the day — no sleep-hours companion (the reference shows
+   *  "N meals · Xh sleep"), since that would need a per-day historical HealthKit query, more
+   *  work than this pass covers; a real meal count alone beats a fabricated sleep figure. */
+  mealsCount: number;
 }
 
 export interface WeekCalendarData {
@@ -177,7 +201,7 @@ export interface WeekCalendarData {
 
 const WEEKDAY_LABELS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 
-export function useWeekCalendar(weekStart: Date): WeekCalendarData {
+export const useWeekCalendar = (weekStart: Date): WeekCalendarData => {
   const [loading, setLoading] = useState(true);
   const [days, setDays] = useState<WeekDay[]>([]);
   const [refetchSignal, setRefetchSignal] = useState(0);
@@ -199,7 +223,7 @@ export function useWeekCalendar(weekStart: Date): WeekCalendarData {
 
       const start = new Date(`${weekStartKey}T00:00:00`);
       const end = addDays(start, 7);
-      const [{ sessions, logs: allRecentLogs, restDayDates }, workoutRes] = await Promise.all([
+      const [{ sessions, logs: allRecentLogs, restDayDates }, workoutRes, foodRes] = await Promise.all([
         fetchPlanAndLogs(userId),
         supabase
           .from("workout_log")
@@ -207,8 +231,20 @@ export function useWeekCalendar(weekStart: Date): WeekCalendarData {
           .eq("user_id", userId)
           .gte("at", start.toISOString())
           .lt("at", end.toISOString()),
+        supabase
+          .from("food_log")
+          .select("at")
+          .eq("user_id", userId)
+          .gte("at", start.toISOString())
+          .lt("at", end.toISOString()),
       ]);
       if (cancelled) return;
+
+      const mealsCountByDate = new Map<string, number>();
+      for (const row of foodRes.data ?? []) {
+        const key = localDateKey(new Date((row as { at: string }).at));
+        mealsCountByDate.set(key, (mealsCountByDate.get(key) ?? 0) + 1);
+      }
 
       const pinnedByWeekday = new Map(sessions.filter((s) => s.weekday !== null).map((s) => [s.weekday as number, s]));
       const isFlexible = sessions.length > 0 && sessions.every((s) => s.weekday === null);
@@ -288,6 +324,7 @@ export function useWeekCalendar(weekStart: Date): WeekCalendarData {
           focus,
           isPinnedRest,
           status,
+          mealsCount: mealsCountByDate.get(dateKey) ?? 0,
         });
       }
 
@@ -300,7 +337,7 @@ export function useWeekCalendar(weekStart: Date): WeekCalendarData {
   }, [weekStartKey, refetchSignal]);
 
   return { loading, days, refetch };
-}
+};
 
 export interface MonthCalendarData {
   loading: boolean;
@@ -310,7 +347,7 @@ export interface MonthCalendarData {
   refetch: () => void;
 }
 
-export function useMonthCalendar(monthDate: Date): MonthCalendarData {
+export const useMonthCalendar = (monthDate: Date): MonthCalendarData => {
   const [loading, setLoading] = useState(true);
   const [completedDates, setCompletedDates] = useState<Set<string>>(new Set());
   const [partialDates, setPartialDates] = useState<Set<string>>(new Set());
@@ -382,7 +419,7 @@ export function useMonthCalendar(monthDate: Date): MonthCalendarData {
   }, [monthKey, refetchSignal]);
 
   return { loading, completedDates, partialDates, plannedDates, refetch };
-}
+};
 
 export interface DayDetailWorkout {
   workoutLogId: string;
@@ -424,7 +461,7 @@ const EMPTY_DAY_DETAIL: Omit<DayDetail, "isPast" | "isToday" | "isFuture" | "ref
   plannedSessionId: null,
 };
 
-export function useDayDetail(dateKey: string | null): DayDetail {
+export const useDayDetail = (dateKey: string | null): DayDetail => {
   const [state, setState] = useState<Omit<DayDetail, "isPast" | "isToday" | "isFuture" | "refetch">>(
     EMPTY_DAY_DETAIL,
   );
@@ -585,7 +622,7 @@ export function useDayDetail(dateKey: string | null): DayDetail {
     isFuture: !!dateKey && dateKey > todayKey,
     refetch,
   };
-}
+};
 
 export { WEEKDAY_LABELS };
 export { startOfWeek };

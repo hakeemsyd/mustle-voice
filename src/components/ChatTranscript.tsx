@@ -1,5 +1,6 @@
 import React, { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { Image, Keyboard, ScrollView, StyleSheet, Text, View } from "react-native";
+import { LinearGradient } from "expo-linear-gradient";
 import { colors, fonts } from "../constants/theme";
 import type { ChatMessage } from "../hooks/useHomeChat";
 import { MMark } from "../icons/MMark";
@@ -75,9 +76,10 @@ export const ChatTranscript = forwardRef<ChatTranscriptHandle, ChatTranscriptPro
     }));
 
     return (
+      <View style={styles.stage}>
       <ScrollView
         ref={scrollRef}
-        style={styles.stage}
+        style={styles.scroll}
         contentContainerStyle={styles.content}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="on-drag"
@@ -113,17 +115,17 @@ export const ChatTranscript = forwardRef<ChatTranscriptHandle, ChatTranscriptPro
                 </View>
                 <View style={styles.coachMsgBody}>
                   <CoachMessageText text={m.text} style={styles.coachMsgText} variant="plain" />
-                  {m.card?.type === "plan_breakdown" && onStartDay && onModifyPlan && (
-                    <PlanBreakdownCard
-                      card={m.card}
-                      onStartDay={onStartDay}
-                      onModify={onModifyPlan}
-                      onOpenPreview={onOpenPreview}
-                      variant={cardVariant}
-                    />
-                  )}
                 </View>
               </View>
+              {m.card?.type === "plan_breakdown" && onStartDay && onModifyPlan && (
+                <PlanBreakdownCard
+                  card={m.card}
+                  onStartDay={onStartDay}
+                  onModify={onModifyPlan}
+                  onOpenPreview={onOpenPreview}
+                  variant={cardVariant}
+                />
+              )}
               {m.card?.type === "daily_workout" && onStartDay && (
                 <DailyWorkoutCard card={m.card} onStartSession={onStartDay} variant={cardVariant} />
               )}
@@ -145,6 +147,15 @@ export const ChatTranscript = forwardRef<ChatTranscriptHandle, ChatTranscriptPro
           </View>
         )}
       </ScrollView>
+      {/* The gap between the thread and whatever sits below it (dock/chips) was a hard cutoff —
+          content simply stopped mid-line against flat black. Fades the last 48px into the
+          background instead, matching the reference's own bottom mask on this scroll box. */}
+      <LinearGradient
+        colors={["rgba(8,8,8,0)", colors.bg]}
+        style={styles.bottomFade}
+        pointerEvents="none"
+      />
+      </View>
     );
   },
 );
@@ -152,6 +163,16 @@ export const ChatTranscript = forwardRef<ChatTranscriptHandle, ChatTranscriptPro
 const styles = StyleSheet.create({
   stage: {
     flex: 1,
+  },
+  scroll: {
+    flex: 1,
+  },
+  bottomFade: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: 48,
   },
   content: {
     paddingHorizontal: 20,

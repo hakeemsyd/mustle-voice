@@ -22,13 +22,13 @@ const LIGHT_BAR_COLORS: Record<string, string> = {
   Fat: "#f97316",
 };
 
-function buildNote(proteinPct: number): string {
+const buildNote = (proteinPct: number): string => {
   if (proteinPct >= 100) return "Protein target hit for today — nice work staying on pace.";
   if (proteinPct >= 70) return "You're on pace for your protein target — keep this going through your next meal.";
   return "Still some room on protein today — a meal with lean protein would close the gap fast.";
-}
+};
 
-function MacroBarRow({
+const MacroBarRow = ({
   label,
   value,
   goal,
@@ -40,7 +40,7 @@ function MacroBarRow({
   goal: number;
   unit: string;
   color: string;
-}) {
+}) => {
   const pct = Math.min(100, Math.round((value / Math.max(1, goal)) * 100));
   return (
     <View style={barStyles.row}>
@@ -58,9 +58,9 @@ function MacroBarRow({
       </View>
     </View>
   );
-}
+};
 
-export function NutritionSummaryCard({ card, variant = "dark" }: NutritionSummaryCardProps) {
+export const NutritionSummaryCard = ({ card, variant = "dark" }: NutritionSummaryCardProps) => {
   const isLight = variant === "light";
 
   const consumed = card.calories_target - card.calories_left;
@@ -81,7 +81,7 @@ export function NutritionSummaryCard({ card, variant = "dark" }: NutritionSummar
     <View style={[styles.card, isLight && styles.cardLight]}>
       <View style={styles.header}>
         <View style={[styles.headerIcon, isLight && styles.headerIconLight]}>
-          <UtensilsIcon size={18} color={isLight ? colors.accentOn : colors.accent} />
+          <UtensilsIcon size={18} color={isLight ? lightCard.iconOn : colors.accent} />
         </View>
         <View style={styles.headerText}>
           <Text style={[styles.title, isLight && styles.titleLight]}>TODAY'S FUEL</Text>
@@ -169,7 +169,7 @@ export function NutritionSummaryCard({ card, variant = "dark" }: NutritionSummar
       )}
     </View>
   );
-}
+};
 
 const styles = StyleSheet.create({
   card: {
@@ -178,7 +178,7 @@ const styles = StyleSheet.create({
     borderColor: "rgba(255,255,255,0.08)",
     borderRadius: 16,
     padding: 16,
-    gap: 16,
+    gap: 12,
     marginTop: 6,
   },
   cardLight: {
@@ -228,14 +228,14 @@ const styles = StyleSheet.create({
   insightRow: {
     borderTopWidth: 1,
     borderTopColor: "rgba(255,255,255,0.08)",
-    paddingTop: 14,
+    paddingTop: 10,
   },
   insightRowLight: {
     borderTopColor: lightCard.dividerBg,
   },
   insightText: {
     fontFamily: fonts.body,
-    fontSize: 13,
+    fontSize: 12,
     lineHeight: 19,
     color: colors.muted,
     textAlign: "center",

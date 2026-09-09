@@ -65,7 +65,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 6,
     paddingHorizontal: 16,
-    paddingBottom: 8,
+    paddingBottom: 14,
   },
   chip: {
     borderRadius: 999,

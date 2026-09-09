@@ -10,12 +10,12 @@ import {
 
 // The enum's own camelCase keys ("functionalStrengthTraining") reversed from the numeric value
 // HealthKit hands back, then split into words — no dedicated humanizer ships with the library.
-function humanizeWorkoutActivity(type: WorkoutActivityType): string {
+const humanizeWorkoutActivity = (type: WorkoutActivityType): string => {
   const key = WorkoutActivityType[type] ?? 'workout';
   return key
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
     .replace(/^./, (c) => c.toUpperCase());
-}
+};
 
 /**
  * Read-only Apple Health integration — v1 scope (2026-09-05): body weight, workouts, sleep,
@@ -58,7 +58,7 @@ export interface HealthSnapshot {
 /** True only on a real iOS device/simulator with Health actually present — never assume the
  *  platform check alone means the module is safe to call (this can still be a fresh install with
  *  nothing granted). */
-export async function isAppleHealthAvailable(): Promise<boolean> {
+export const isAppleHealthAvailable = async (): Promise<boolean> => {
   if (Platform.OS !== 'ios') return false;
   try {
     return await isHealthDataAvailable();
@@ -66,12 +66,12 @@ export async function isAppleHealthAvailable(): Promise<boolean> {
     console.error('[appleHealth] availability check failed:', err);
     return false;
   }
-}
+};
 
 /** Prompts the real native permission sheet — same one Settings > Privacy > Health shows. Must
  *  be called before any read below; a read against a type never requested crashes rather than
  *  rejecting cleanly, per the library's own documented behavior. */
-export async function requestAppleHealthPermission(): Promise<boolean> {
+export const requestAppleHealthPermission = async (): Promise<boolean> => {
   try {
     const granted = await requestAuthorization({ toRead: [...READ_IDENTIFIERS] });
     return granted !== false;
@@ -79,17 +79,16 @@ export async function requestAppleHealthPermission(): Promise<boolean> {
     console.error('[appleHealth] permission request failed:', err);
     return false;
   }
-}
+};
 
 const KG_PER_LB = 0.453592;
 
-function toKg(quantity: number, unit: string): number {
+const toKg = (quantity: number, unit: string): number =>
   // HealthKit hands back whatever unit the user's own device is set to display in — never
   // assume kg just because that's what the rest of this app stores internally.
-  return unit.toLowerCase().startsWith('lb') ? quantity * KG_PER_LB : quantity;
-}
+  unit.toLowerCase().startsWith('lb') ? quantity * KG_PER_LB : quantity;
 
-async function readLatestWeightKg(): Promise<number | null> {
+const readLatestWeightKg = async (): Promise<number | null> => {
   try {
     const sample = await getMostRecentQuantitySample('HKQuantityTypeIdentifierBodyMass');
     return sample ? toKg(sample.quantity, sample.unit) : null;
@@ -97,9 +96,9 @@ async function readLatestWeightKg(): Promise<number | null> {
     console.error('[appleHealth] weight read failed:', err);
     return null;
   }
-}
+};
 
-async function readLatestHeartRateBpm(): Promise<number | null> {
+const readLatestHeartRateBpm = async (): Promise<number | null> => {
   try {
     const sample = await getMostRecentQuantitySample('HKQuantityTypeIdentifierHeartRate');
     return sample ? Math.round(sample.quantity) : null;
@@ -107,11 +106,11 @@ async function readLatestHeartRateBpm(): Promise<number | null> {
     console.error('[appleHealth] heart rate read failed:', err);
     return null;
   }
-}
+};
 
-async function readTodayQuantityTotal(
+const readTodayQuantityTotal = async (
   identifier: 'HKQuantityTypeIdentifierStepCount' | 'HKQuantityTypeIdentifierActiveEnergyBurned',
-): Promise<number | null> {
+): Promise<number | null> => {
   try {
     const startOfDay = new Date();
     startOfDay.setHours(0, 0, 0, 0);
@@ -127,9 +126,12 @@ async function readTodayQuantityTotal(
     console.error(`[appleHealth] ${identifier} read failed:`, err);
     return null;
   }
-}
+};
 
-async function readLastNightSleepMinutes(): Promise<number | null> {
+/** Standalone export (not just through readHealthSnapshot) so a screen that only cares about
+ *  sleep — Calendar's Today card — isn't forced to also query weight/steps/workouts/heart-rate
+ *  every time it loads. */
+export const readLastNightSleepMinutes = async (): Promise<number | null> => {
   try {
     const since = new Date();
     since.setHours(since.getHours() - 20);
@@ -149,9 +151,9 @@ async function readLastNightSleepMinutes(): Promise<number | null> {
     console.error('[appleHealth] sleep read failed:', err);
     return null;
   }
-}
+};
 
-async function readMostRecentExternalWorkout(): Promise<HealthSnapshot['mostRecentExternalWorkout']> {
+const readMostRecentExternalWorkout = async (): Promise<HealthSnapshot['mostRecentExternalWorkout']> => {
   try {
     const workouts = await queryWorkoutSamples({ limit: 1 });
     const latest = workouts?.[0];
@@ -166,12 +168,12 @@ async function readMostRecentExternalWorkout(): Promise<HealthSnapshot['mostRece
     console.error('[appleHealth] workout read failed:', err);
     return null;
   }
-}
+};
 
 /** Reads everything this module cares about in one pass — called right after a successful
  *  connect, and again opportunistically (e.g. on Home focus) rather than on any kind of
  *  background schedule, since v1 deliberately doesn't request background delivery. */
-export async function readHealthSnapshot(): Promise<HealthSnapshot> {
+export const readHealthSnapshot = async (): Promise<HealthSnapshot> => {
   const [weightKg, stepsToday, activeEnergyTodayKcal, sleepMinutesLastNight, mostRecentExternalWorkout, latestHeartRateBpm] =
     await Promise.all([
       readLatestWeightKg(),
@@ -190,4 +192,4 @@ export async function readHealthSnapshot(): Promise<HealthSnapshot> {
     mostRecentExternalWorkout,
     latestHeartRateBpm,
   };
-}
+};

@@ -14,6 +14,7 @@ import {
 } from "../hooks/useCalendarData";
 import { addDays, formatWeekRange, localDateKey } from "../lib/calendarDate";
 import { useScreenInsets } from "../hooks/useScreenInsets";
+import { isAppleHealthAvailable, readLastNightSleepMinutes } from "../lib/appleHealth";
 import { estimateRestSeconds, formatRestSeconds } from "../lib/restSuggestion";
 import { chooseRestDay } from "../lib/restDay";
 import { useActiveSessionContext } from "../session/ActiveSessionContext";
@@ -21,6 +22,7 @@ import { colors, fonts } from "../constants/theme";
 import {
   ArrowLeftIcon,
   BedDoubleIcon,
+  CalendarIcon,
   CheckCircleIcon,
   CircleIcon,
   ChevronRightIcon,
@@ -38,7 +40,7 @@ import { titleCase } from "../lib/textFormat";
 type Scope = "today" | "week" | "month";
 type Props = NativeStackScreenProps<RootStackParamList, "Calendar">;
 
-export function CalendarScreen({ route, navigation }: Props) {
+export const CalendarScreen = ({ route, navigation }: Props) => {
   const insets = useScreenInsets();
   const [scope, setScope] = useState<Scope>(route.params?.initialScope ?? "today");
   const [weekStart, setWeekStart] = useState(() => startOfWeek(new Date()));
@@ -51,6 +53,29 @@ export function CalendarScreen({ route, navigation }: Props) {
   const week = useWeekCalendar(weekStart);
   const month = useMonthCalendar(monthDate);
   const detail = useDayDetail(detailDate);
+
+  // Real last-night sleep from HealthKit, not the fabricated "10:30 PM / 6:30 AM" this card
+  // used to show — null while loading and after loading if Health isn't available or nothing
+  // was recorded, both rendered as an honest "no data" state rather than a fake number.
+  const [sleepMinutes, setSleepMinutes] = useState<number | null>(null);
+  const [sleepLoading, setSleepLoading] = useState(true);
+  useFocusEffect(
+    useCallback(() => {
+      let cancelled = false;
+      setSleepLoading(true);
+      (async () => {
+        const available = await isAppleHealthAvailable();
+        const minutes = available ? await readLastNightSleepMinutes() : null;
+        if (!cancelled) {
+          setSleepMinutes(minutes);
+          setSleepLoading(false);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, []),
+  );
 
   // None of the four hooks above refetch on their own when this screen regains focus — a tab/
   // drawer screen like this one stays mounted rather than remounting each visit, so without this
@@ -220,25 +245,52 @@ export function CalendarScreen({ route, navigation }: Props) {
 
               <View style={styles.todaySection}>
                 <View style={styles.todaySectionHeader}>
+                  <UtensilsIcon size={13} color={colors.muted} />
+                  <Text style={styles.todaySectionLabel}>Meals</Text>
+                </View>
+                {today.mealsToday.length === 0 ? (
+                  <Text style={styles.mealsEmpty}>Nothing logged yet — tell your coach what you ate.</Text>
+                ) : (
+                  <View style={styles.mealsList}>
+                    {today.mealsToday.map((meal, i) => (
+                      <View key={meal.id} style={styles.mealRow}>
+                        <View style={styles.mealIconWrap}>
+                          <UtensilsIcon size={14} color={colors.accent} />
+                        </View>
+                        <View style={styles.mealMain}>
+                          <Text style={styles.mealSlot}>
+                            Meal {i + 1} · {new Date(meal.at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
+                          </Text>
+                          <Text style={styles.mealDesc} numberOfLines={1}>{meal.description}</Text>
+                        </View>
+                        <View style={styles.mealMacros}>
+                          <Text style={styles.mealMacroValue}>{meal.calories} cal</Text>
+                          <Text style={styles.mealMacroSub}>{meal.proteinG}g protein</Text>
+                        </View>
+                      </View>
+                    ))}
+                  </View>
+                )}
+              </View>
+
+              <View style={styles.todaySection}>
+                <View style={styles.todaySectionHeader}>
                   <BedDoubleIcon size={13} color={colors.muted} />
                   <Text style={styles.todaySectionLabel}>Sleep</Text>
                 </View>
                 <View style={styles.sleepCard}>
-                  <View style={styles.sleepTimes}>
-                    <View style={styles.sleepTime}>
-                      <Text style={styles.sleepTimeValue}>10:30 PM</Text>
-                      <Text style={styles.sleepTimeLabel}>Bedtime</Text>
-                    </View>
-                    <Text style={styles.sleepArrow}>→</Text>
-                    <View style={styles.sleepTime}>
-                      <Text style={styles.sleepTimeValue}>{today.isRestDay ? "7:00 AM" : "6:30 AM"}</Text>
-                      <Text style={styles.sleepTimeLabel}>Wake</Text>
-                    </View>
-                  </View>
-                  <View style={styles.sleepTarget}>
-                    <Text style={styles.sleepTargetValue}>{today.isRestDay ? "8.5h" : "8h"}</Text>
-                    <Text style={styles.sleepTargetLabel}>target</Text>
-                  </View>
+                  {sleepLoading ? (
+                    <Text style={styles.sleepEmpty}>—</Text>
+                  ) : sleepMinutes != null ? (
+                    <>
+                      <Text style={styles.sleepValue}>
+                        {Math.floor(sleepMinutes / 60)}h {sleepMinutes % 60}m
+                      </Text>
+                      <Text style={styles.sleepLabel}>Last night</Text>
+                    </>
+                  ) : (
+                    <Text style={styles.sleepEmpty}>No sleep data from Apple Health yet</Text>
+                  )}
                 </View>
               </View>
             </View>
@@ -285,6 +337,11 @@ export function CalendarScreen({ route, navigation }: Props) {
                           )}
                           <Text style={styles.weekFocus}>{day.focus ? titleCase(day.focus) : "Rest day"}</Text>
                         </View>
+                        {day.mealsCount > 0 && (
+                          <Text style={styles.weekSub}>
+                            {day.mealsCount} {day.mealsCount === 1 ? "meal" : "meals"} logged
+                          </Text>
+                        )}
                       </View>
                       {day.status === "missed" && (
                         <View style={{ opacity: 0.6 }}>
@@ -503,7 +560,13 @@ export function CalendarScreen({ route, navigation }: Props) {
                   )}
 
                   {!hasPlan && !loggedWorkout && detail.meals.length === 0 && detail.injuryNotes.length === 0 && (
-                    <Text style={styles.detailEmpty}>Nothing logged this day.</Text>
+                    <View style={styles.detailEmpty}>
+                      <CalendarIcon size={28} color={colors.muted} />
+                      <Text style={styles.detailEmptyTitle}>No facts yet for this day</Text>
+                      <Text style={styles.detailEmptySub}>
+                        Meals, injuries, and workouts logged this day will show up here.
+                      </Text>
+                    </View>
                   )}
                 </>
               );
@@ -535,7 +598,7 @@ export function CalendarScreen({ route, navigation }: Props) {
       />
     </View>
   );
-}
+};
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.bg },
@@ -678,24 +741,53 @@ const styles = StyleSheet.create({
   exerciseSets: { fontFamily: fonts.bodyMedium, fontSize: 12, color: colors.muted },
 
   sleepCard: {
-    flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
-    paddingVertical: 14,
+    justifyContent: "center",
+    paddingVertical: 18,
     paddingHorizontal: 16,
     borderRadius: 14,
     backgroundColor: colors.surfaceDeep,
     borderWidth: 1,
     borderColor: colors.border,
+    gap: 3,
   },
-  sleepTimes: { flexDirection: "row", alignItems: "center", gap: 12 },
-  sleepTime: { gap: 2 },
-  sleepTimeValue: { fontFamily: fonts.bodyBold, fontSize: 14, color: colors.text },
-  sleepTimeLabel: { fontFamily: fonts.body, fontSize: 10, color: colors.muted },
-  sleepArrow: { fontFamily: fonts.body, fontSize: 13, color: colors.muted },
-  sleepTarget: { alignItems: "flex-end", gap: 1 },
-  sleepTargetValue: { fontFamily: fonts.bodyBold, fontSize: 16, color: colors.accent },
-  sleepTargetLabel: { fontFamily: fonts.body, fontSize: 10, color: colors.muted },
+  sleepValue: { fontFamily: fonts.bodyBold, fontSize: 20, color: colors.accent },
+  sleepLabel: { fontFamily: fonts.body, fontSize: 11, color: colors.muted },
+  sleepEmpty: { fontFamily: fonts.body, fontSize: 12, color: colors.muted, textAlign: "center" },
+
+  mealsEmpty: { fontFamily: fonts.body, fontSize: 13, color: colors.muted },
+  mealsList: { gap: 8 },
+  mealRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    backgroundColor: colors.surfaceDeep,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  mealIconWrap: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.surface,
+  },
+  mealMain: { flex: 1, gap: 2 },
+  mealSlot: {
+    fontFamily: fonts.bodyBold,
+    fontSize: 10.5,
+    letterSpacing: 0.42,
+    textTransform: "uppercase",
+    color: colors.accent,
+  },
+  mealDesc: { fontFamily: fonts.body, fontSize: 13, color: colors.text },
+  mealMacros: { alignItems: "flex-end", gap: 1 },
+  mealMacroValue: { fontFamily: fonts.bodySemiBold, fontSize: 12, color: colors.text },
+  mealMacroSub: { fontFamily: fonts.body, fontSize: 10.5, color: colors.muted },
 
   startBtn: {
     flexDirection: "row",
@@ -707,7 +799,7 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     marginTop: 18,
   },
-  startBtnText: { fontFamily: fonts.bodySemiBold, fontSize: 13, color: colors.accentOn },
+  startBtnText: { fontFamily: fonts.bodyBold, fontSize: 13, color: colors.accentOn },
 
   todayStartBtn: {
     flexDirection: "row",
@@ -757,6 +849,7 @@ const styles = StyleSheet.create({
   weekInfo: { flex: 1, gap: 3 },
   weekInfoTop: { flexDirection: "row", alignItems: "center", gap: 8 },
   weekFocus: { fontFamily: fonts.bodyMedium, fontSize: 13, color: colors.text },
+  weekSub: { fontFamily: fonts.body, fontSize: 10.5, color: colors.muted },
 
   monthWrap: {
     gap: 16,
@@ -796,18 +889,27 @@ const styles = StyleSheet.create({
   detailEyebrow: {
     fontFamily: fonts.bodySemiBold,
     fontSize: 11,
-    letterSpacing: 1.4,
+    letterSpacing: 1.1,
     textTransform: "uppercase",
     color: colors.accent,
   },
-  detailTitle: { fontFamily: fonts.display, fontSize: 30, color: colors.text, marginTop: 2, textTransform: "uppercase" },
+  detailTitle: {
+    fontFamily: fonts.display,
+    fontSize: 32,
+    letterSpacing: 0.64,
+    lineHeight: 34,
+    color: colors.text,
+    marginTop: 2,
+    textTransform: "uppercase",
+  },
   detailDate: { fontFamily: fonts.body, fontSize: 13, color: colors.muted, marginTop: 2 },
 
   plannedCard: {
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
-    padding: 13,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
     borderRadius: 14,
     backgroundColor: colors.surfaceDeep,
     borderWidth: 1,
@@ -824,7 +926,7 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
   },
   plannedText: { flex: 1, gap: 1 },
-  plannedLabel: { fontFamily: fonts.bodyBold, fontSize: 10, letterSpacing: 0.8, textTransform: "uppercase", color: colors.muted },
+  plannedLabel: { fontFamily: fonts.bodyBold, fontSize: 10, letterSpacing: 0.6, textTransform: "uppercase", color: colors.muted },
   plannedValue: { fontFamily: fonts.bodySemiBold, fontSize: 13.5, color: colors.text },
   statusBadge: { flexDirection: "row", alignItems: "center", gap: 4, paddingVertical: 4, paddingHorizontal: 10, borderRadius: 100 },
   statusDone: { backgroundColor: colors.accentDim },
@@ -849,25 +951,32 @@ const styles = StyleSheet.create({
   factsSectionLabel: {
     fontFamily: fonts.bodyBold,
     fontSize: 11,
-    letterSpacing: 0.6,
+    letterSpacing: 0.66,
     textTransform: "uppercase",
     color: colors.muted,
   },
   factRow: { gap: 6 },
   factSection: { gap: 6 },
-  factSectionHeader: { flexDirection: "row", alignItems: "center", gap: 7 },
+  factSectionHeader: { flexDirection: "row", alignItems: "center", gap: 6 },
   factSectionLabel: {
     flex: 1,
     fontFamily: fonts.bodyBold,
     fontSize: 11,
-    letterSpacing: 0.6,
+    letterSpacing: 0.55,
     textTransform: "uppercase",
     color: colors.muted,
   },
   factLink: { flexDirection: "row", alignItems: "center", gap: 3 },
   factLinkText: { fontFamily: fonts.bodyMedium, fontSize: 11, color: colors.muted },
-  detailEmpty: { fontFamily: fonts.body, fontSize: 13, color: colors.muted, paddingVertical: 12 },
-  detailLine: { fontFamily: fonts.body, fontSize: 13, color: "rgba(255,255,255,0.8)" },
+  detailEmpty: {
+    alignItems: "center",
+    gap: 8,
+    paddingVertical: 48,
+    paddingHorizontal: 24,
+  },
+  detailEmptyTitle: { fontFamily: fonts.bodySemiBold, fontSize: 13, color: colors.text, textAlign: "center" },
+  detailEmptySub: { fontFamily: fonts.body, fontSize: 12, color: colors.muted, textAlign: "center" },
+  detailLine: { fontFamily: fonts.body, fontSize: 13, lineHeight: 19, color: colors.text },
 
   macroBars: { gap: 10 },
   macroRow: { gap: 5 },

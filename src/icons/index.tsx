@@ -59,6 +59,12 @@ import { DrumstickIcon } from "./DrumstickIcon";
 import { FishIcon } from "./FishIcon";
 import { EggIcon } from "./EggIcon";
 import { BeefIcon } from "./BeefIcon";
+import { BellIcon } from "./BellIcon";
+import { CreditCardIcon } from "./CreditCardIcon";
+import { HelpCircleIcon } from "./HelpCircleIcon";
+import { ListIcon } from "./ListIcon";
+import { MailCheckIcon } from "./MailCheckIcon";
+import { SettingsIcon } from "./SettingsIcon";
 
 export {
   FemaleIcon,
@@ -122,4 +128,10 @@ export {
   FishIcon,
   EggIcon,
   BeefIcon,
+  BellIcon,
+  CreditCardIcon,
+  HelpCircleIcon,
+  ListIcon,
+  MailCheckIcon,
+  SettingsIcon,
 };

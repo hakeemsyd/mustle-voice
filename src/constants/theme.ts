@@ -38,8 +38,15 @@ export const lightCard = {
   muted: 'rgba(10,10,10,0.55)',
   pillBg: 'rgba(200,241,53,0.35)',
   pillText: '#4a5c00',
-  dividerBg: 'rgba(10,10,10,0.06)',
+  dividerBg: 'rgba(10,10,10,0.08)',
   surface: 'rgba(10,10,10,0.03)',
+  // The one card hairline that's genuinely 0.06, not 0.08 — PreviousWorkoutCard's outer .stats
+  // container border specifically, per the reference CSS.
+  statsBorder: 'rgba(10,10,10,0.06)',
+  // Icon color for a card's header badge sitting on the lime accent fill — a near-black
+  // (#0A0A0A), distinct from accentOn (#000000) which is the real token for the coach avatar's
+  // own MMark glyph on lime.
+  iconOn: '#0A0A0A',
 } as const;
 
 export const radius = {

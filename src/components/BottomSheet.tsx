@@ -1,24 +1,35 @@
 import React from 'react';
-import { Modal, Pressable, StyleSheet, View } from 'react-native';
+import { Dimensions, Modal, Pressable, StyleSheet, View } from 'react-native';
 import { colors } from '../constants/theme';
 import { XIcon } from '../icons';
+import { useScreenInsets } from '../hooks/useScreenInsets';
 
 interface BottomSheetProps {
   visible: boolean;
   onClose: () => void;
-  /** "half" ≈ 55% of screen height (default), "full" ≈ 92% — for content-heavy
-   *  sheets (e.g. Calendar's day detail) that need room for both a plan and a
-   *  logged retrospective without a cramped, doubly-nested scroll area. */
+  /** "half" ≈ 55% of screen height (default), "full" — for content-heavy sheets (e.g.
+   *  Calendar's day detail) that need room for both a plan and a logged retrospective
+   *  without a cramped, doubly-nested scroll area. Stops exactly at the status bar's own
+   *  height, matching the reference's `calc(100% - 54px)` — not a flat 92%, which
+   *  over/undershoots depending on device height. */
   heightVariant?: 'half' | 'full';
   children: React.ReactNode;
 }
 
-export function BottomSheet({ visible, onClose, heightVariant = 'half', children }: BottomSheetProps) {
+export const BottomSheet = ({ visible, onClose, heightVariant = 'half', children }: BottomSheetProps) => {
+  const insets = useScreenInsets();
+  const fullHeight = Dimensions.get('window').height - insets.top;
+
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
       <View style={styles.container}>
         <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
-        <View style={[styles.sheet, heightVariant === 'full' ? styles.sheetFull : styles.sheetHalf]}>
+        <View
+          style={[
+            styles.sheet,
+            heightVariant === 'full' ? { height: fullHeight } : styles.sheetHalf,
+          ]}
+        >
           <View style={styles.handleWrap}>
             <View style={styles.handle} />
           </View>
@@ -30,7 +41,7 @@ export function BottomSheet({ visible, onClose, heightVariant = 'half', children
       </View>
     </Modal>
   );
-}
+};
 
 const styles = StyleSheet.create({
   container: {
@@ -46,7 +57,6 @@ const styles = StyleSheet.create({
     borderTopColor: colors.border,
   },
   sheetHalf: { maxHeight: '55%' },
-  sheetFull: { height: '92%' },
   handleWrap: { alignItems: 'center', paddingTop: 10, paddingBottom: 4 },
   handle: { width: 36, height: 4, borderRadius: 2, backgroundColor: colors.border },
   closeBtn: {

@@ -357,7 +357,6 @@ export function HomeScreen() {
       <AppDrawer
         visible={drawerOpen}
         onClose={() => setDrawerOpen(false)}
-        onOpenSettings={() => navigation.navigate("Settings")}
         onOpenCalendar={() =>
           navigation.navigate("Calendar", { initialScope: "month" })
         }

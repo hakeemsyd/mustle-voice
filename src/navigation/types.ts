@@ -7,7 +7,6 @@ export type RootStackParamList = {
   // lets it survive minimize and be restored from the ActiveWorkoutBanner.
   ActiveSession: undefined;
   SessionReport: { workoutLogId: string; sessionMessages?: SessionThreadMessage[] };
-  Settings: undefined;
   Calendar: { initialScope?: "today" | "week" | "month" } | undefined;
   GlobalChat: { initialMode?: "mic" | "keyboard"; jumpToMessageId?: string } | undefined;
 };

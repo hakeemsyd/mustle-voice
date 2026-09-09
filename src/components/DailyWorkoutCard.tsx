@@ -9,14 +9,14 @@ interface DailyWorkoutCardProps {
   variant?: "dark" | "light";
 }
 
-export function DailyWorkoutCard({ card, onStartSession, variant = "dark" }: DailyWorkoutCardProps) {
+export const DailyWorkoutCard = ({ card, onStartSession, variant = "dark" }: DailyWorkoutCardProps) => {
   const isLight = variant === "light";
 
   return (
     <View style={[styles.card, isLight && styles.cardLight]}>
       <View style={styles.header}>
         <View style={[styles.headerIcon, isLight && styles.headerIconLight]}>
-          <DumbbellIcon size={18} color={isLight ? colors.accentOn : colors.accent} />
+          <DumbbellIcon size={18} color={isLight ? lightCard.iconOn : colors.accent} />
         </View>
         <View style={styles.headerText}>
           <Text style={[styles.title, isLight && styles.titleLight]}>{card.day_label}</Text>
@@ -52,7 +52,7 @@ export function DailyWorkoutCard({ card, onStartSession, variant = "dark" }: Dai
       </Pressable>
     </View>
   );
-}
+};
 
 const styles = StyleSheet.create({
   card: {

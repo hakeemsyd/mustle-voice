@@ -21,7 +21,7 @@ import type { RootStackParamList } from "../navigation/types";
 
 type Props = NativeStackScreenProps<RootStackParamList, "GlobalChat">;
 
-export function GlobalChatScreen({ route, navigation }: Props) {
+export const GlobalChatScreen = ({ route, navigation }: Props) => {
   const insets = useScreenInsets();
   const session = useActiveSessionContext();
   const userId = session.userId;
@@ -147,7 +147,7 @@ export function GlobalChatScreen({ route, navigation }: Props) {
         <QuickPromptChips onPick={handleQuickPrompt} options={GLOBAL_CHAT_PROMPT_OPTIONS} />
       )}
 
-      <View style={[styles.dock, { paddingBottom: Math.max(insets.bottom, 12) }]}>
+      <View style={[styles.dock, { paddingBottom: insets.bottom + 52 }]}>
         <SessionVoiceInputDock
           value={draft}
           onChangeText={setDraft}
@@ -175,7 +175,7 @@ export function GlobalChatScreen({ route, navigation }: Props) {
       />
     </View>
   );
-}
+};
 
 const styles = StyleSheet.create({
   // This is the same dark chat surface as Session Preview and Active Session, not a light
@@ -192,10 +192,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: 20,
-    paddingBottom: 12,
+    paddingBottom: 14,
   },
   headerSide: {
-    width: 34,
+    width: 74,
     justifyContent: "center",
   },
   headerTitle: {

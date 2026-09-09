@@ -13,21 +13,21 @@ const STATUS_LABEL: Record<PreviousWorkoutCardData["status"], string> = {
   switched: "Switched",
 };
 
-function formatDuration(totalSec: number | null): string {
+const formatDuration = (totalSec: number | null): string => {
   if (totalSec == null) return "—";
   const min = Math.round(totalSec / 60);
   if (min < 1) return "<1 min";
   return `${min} min`;
-}
+};
 
-export function PreviousWorkoutCard({ card }: PreviousWorkoutCardProps) {
+export const PreviousWorkoutCard = ({ card }: PreviousWorkoutCardProps) => {
   const isDone = card.status === "completed";
 
   return (
     <View style={styles.card}>
       <View style={styles.header}>
         <View style={styles.headerIcon}>
-          <HistoryIcon size={18} color={colors.accentOn} />
+          <HistoryIcon size={18} color={lightCard.iconOn} />
         </View>
         <View style={styles.headerText}>
           <Text style={styles.title}>{card.day_label}</Text>
@@ -65,7 +65,7 @@ export function PreviousWorkoutCard({ card }: PreviousWorkoutCardProps) {
       </View>
     </View>
   );
-}
+};
 
 const styles = StyleSheet.create({
   card: {
@@ -137,7 +137,7 @@ const styles = StyleSheet.create({
     alignItems: "stretch",
     backgroundColor: lightCard.surface,
     borderWidth: 1,
-    borderColor: lightCard.dividerBg,
+    borderColor: lightCard.statsBorder,
     borderRadius: 12,
     paddingVertical: 12,
     paddingHorizontal: 8,

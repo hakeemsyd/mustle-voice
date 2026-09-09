@@ -12,7 +12,7 @@ interface PlanBreakdownCardProps {
   variant?: "dark" | "light";
 }
 
-export function PlanBreakdownCard({ card, onStartDay, onModify, onOpenPreview, variant = "dark" }: PlanBreakdownCardProps) {
+export const PlanBreakdownCard = ({ card, onStartDay, onModify, onOpenPreview, variant = "dark" }: PlanBreakdownCardProps) => {
   const firstDay = card.days[0];
   const isLight = variant === "light";
 
@@ -20,7 +20,7 @@ export function PlanBreakdownCard({ card, onStartDay, onModify, onOpenPreview, v
     <View style={[styles.card, isLight && styles.cardLight]}>
       <View style={styles.header}>
         <View style={[styles.headerIcon, isLight && styles.headerIconLight]}>
-          <CalendarIcon size={16} color={isLight ? colors.accentOn : colors.accent} />
+          <CalendarIcon size={16} color={isLight ? lightCard.iconOn : colors.accent} />
         </View>
         <View style={styles.flex}>
           <Text style={[styles.title, isLight && styles.titleLight]}>Your Week's Plan</Text>
@@ -78,7 +78,7 @@ export function PlanBreakdownCard({ card, onStartDay, onModify, onOpenPreview, v
       </View>
     </View>
   );
-}
+};
 
 const styles = StyleSheet.create({
   flex: { flex: 1 },
@@ -87,8 +87,8 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.border,
     borderRadius: 16,
-    padding: 14,
-    gap: 12,
+    padding: 16,
+    gap: 14,
     marginTop: 6,
   },
   cardLight: {
@@ -176,8 +176,8 @@ const styles = StyleSheet.create({
     backgroundColor: lightCard.pillBg,
   },
   dayBadgeText: {
-    fontFamily: fonts.monoBold,
-    fontSize: 9,
+    fontFamily: fonts.bodyBold,
+    fontSize: 10,
     letterSpacing: 0.6,
     color: colors.accent,
   },
@@ -186,7 +186,7 @@ const styles = StyleSheet.create({
   },
   dayFocus: {
     fontFamily: fonts.bodySemiBold,
-    fontSize: 13,
+    fontSize: 14,
     color: colors.text,
   },
   dayFocusLight: {
@@ -204,14 +204,14 @@ const styles = StyleSheet.create({
   adaptNote: {
     borderTopWidth: 1,
     borderTopColor: colors.border,
-    paddingTop: 14,
+    paddingTop: 2,
   },
   adaptNoteLight: {
     borderTopColor: lightCard.dividerBg,
   },
   adaptNoteText: {
     fontFamily: fonts.body,
-    fontSize: 13,
+    fontSize: 12,
     lineHeight: 19,
     color: colors.muted,
   },
