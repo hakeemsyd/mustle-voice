@@ -127,12 +127,16 @@ function buildGreetingPrompt(
   const questionNote =
     ' End with one short, specific question about how they\'re doing today (energy, hunger, soreness, ' +
     'how yesterday\'s session felt) — never a purely one-way statement.';
+  const timeNote =
+    ' The current time is in the context below — let it inform the greeting naturally (never ' +
+    '"good morning" in the evening, and a late-night greeting reads differently than an early one) ' +
+    'without literally stating the clock time.';
 
   if (!sessionToday) {
     return (
       "Say hello for the first time today — not a reply to a question, and not generic small talk. Today " +
       "is a rest day (or there's nothing due) — one short, motivating line about that, progress toward my " +
-      `goal, or nutrition/recovery.${nutritionNote}${questionNote}`
+      `goal, or nutrition/recovery.${nutritionNote}${questionNote}${timeNote}`
     );
   }
   const exercises = sessionToday.exerciseNames.length > 0 ? sessionToday.exerciseNames.join(', ') : 'the exercises in it';
@@ -141,7 +145,7 @@ function buildGreetingPrompt(
     `Today's due session is "${sessionToday.focus}": ${exercises}. One short, motivating line that names ` +
     `this exact session and nothing else — do not call read_state, do not mention any other session from ` +
     `earlier in this conversation, and do not invent a day number or exercises not listed here.` +
-    `${nutritionNote}${questionNote}`
+    `${nutritionNote}${questionNote}${timeNote}`
   );
 }
 

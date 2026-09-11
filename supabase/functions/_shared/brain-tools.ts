@@ -45,13 +45,29 @@ export const BRAIN_TOOLS = [
   {
     name: 'generate_training_plan',
     description:
-      'Propose a full training plan from goals/frequency/history/biometrics/injuries. Every exercise is checked against active injuries before it can persist — if rejected, revise and call again.',
+      "Propose a brand-new user's first full training plan from goals/frequency/history/biometrics/injuries. " +
+      'Every exercise is checked against active injuries before it can persist — if rejected, revise and call ' +
+      'again. Call WITHOUT confirm first — it returns a preview, nothing is saved yet. Before confirming, this ' +
+      "is the moment for a real initial consultation: read back the plan and confirm which real day they'd " +
+      'like to start (today, tomorrow, a specific weekday) — never assume. Only call again with confirm:true ' +
+      'once they explicitly agree.',
     input_schema: {
       type: 'object',
       properties: {
         split: { type: 'string', description: "e.g. 'upper/lower', 'push/pull/legs'" },
         days_per_week: { type: 'integer' },
         sessions: { type: 'array', items: sessionSchema },
+        confirm: {
+          type: 'boolean',
+          description:
+            'Leave false/omitted to get a preview with nothing saved. Set true only after the user explicitly ' +
+            'agreed to the plan and start day in their most recent message.',
+        },
+        confirm_token: {
+          type: 'string',
+          description:
+            'Required alongside confirm:true — the exact confirm_token string the preview call just returned.',
+        },
       },
       required: ['split', 'days_per_week', 'sessions'],
     },
@@ -290,6 +306,51 @@ export const BRAIN_TOOLS = [
     },
   },
   {
+    name: 'resolve_interrupted_workout',
+    description:
+      'Resolves a workout that was interrupted and never formally finished (see the context note ' +
+      'about it, which gives the workout_log_id). Use this the first time it comes up in a genuinely ' +
+      'new conversation — ask what happened (finished it without the app, ended early, or want to ' +
+      'discard it — "lost connection/battery" or "left the gym" also map to whichever of those it ' +
+      'ends up being) before choosing an outcome. Call once WITHOUT confirm to preview, state plainly ' +
+      'what will happen, wait for explicit agreement, then call again with confirm:true and the exact ' +
+      'confirm_token.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        workout_log_id: { type: 'string' },
+        outcome: {
+          type: 'string',
+          enum: ['completed_independent', 'ended_early', 'discard'],
+          description:
+            'completed_independent: they finished it without the app — pair with additional_exercises_done ' +
+            'for anything not already tracked live. ended_early: they stopped partway and did not finish ' +
+            'the rest — keeps whatever was already tracked live, adds nothing. discard: drop it entirely, ' +
+            'as if it never happened.',
+        },
+        additional_exercises_done: {
+          type: 'array',
+          description:
+            'Only for completed_independent — exercises/sets done AFTER the interruption that were not ' +
+            'already tracked live. Never repeat an exercise already covered by the live-tracked portion.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              sets: { type: 'integer' },
+              reps: { type: 'string' },
+              load: { type: 'string' },
+            },
+            required: ['name', 'sets', 'reps', 'load'],
+          },
+        },
+        confirm: { type: 'boolean' },
+        confirm_token: { type: 'string' },
+      },
+      required: ['workout_log_id', 'outcome'],
+    },
+  },
+  {
     name: 'log_checkin',
     description: 'Silently record a weight/mood/sleep/soreness check-in.',
     input_schema: {
@@ -306,11 +367,16 @@ export const BRAIN_TOOLS = [
   {
     name: 'open_screen',
     description:
-      'Navigate the app to one of the main tabs — use when the user asks to see their progress, stats, nutrition, or recovery.',
+      'Navigate the app to one of the main tabs — use when the user asks to see their progress, stats, nutrition, or recovery, ' +
+      'including "where can I see that", "how do I check X" — actually open it for them rather than just naming the tab and ' +
+      'leaving them to find it themselves. ' +
+      'For "resume/reopen/go back to the workout" while a live session state block shows one genuinely in progress, use screen: ' +
+      "\"ActiveSession\" instead — returns no_session if nothing is actually running, in which case tell the user that rather " +
+      'than claiming it opened.',
     input_schema: {
       type: 'object',
       properties: {
-        screen: { type: 'string', enum: ['Home', 'Stats', 'Body', 'Fuel', 'Recovery'] },
+        screen: { type: 'string', enum: ['Home', 'Stats', 'Body', 'Fuel', 'Recovery', 'ActiveSession'] },
       },
       required: ['screen'],
     },

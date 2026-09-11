@@ -45,7 +45,7 @@ export function useSessionReport(workoutLogId: string): State {
       const { data: log, error: logError } = await supabase
         .from('workout_log')
         .select(
-          'id, at, status, session_type, cardio_activity, duration_sec, plan_session_id, exercises_done, note, feedback_tags',
+          'id, at, status, source, session_type, cardio_activity, duration_sec, plan_session_id, exercises_done, note, feedback_tags',
         )
         .eq('id', workoutLogId)
         .eq('user_id', userId)

@@ -77,9 +77,9 @@ function tagFromBlocks(blocks: any[] | null): HistoryTag | null {
 // tool call gets misattributed to an earlier, unrelated question.
 const TOOL_TAG_LOOKAHEAD_ROWS = 6;
 
-function findEventualTag(rows: any[], userRowIndex: number): HistoryTag {
-  const end = Math.min(userRowIndex + 1 + TOOL_TAG_LOOKAHEAD_ROWS, rows.length);
-  for (let j = userRowIndex + 1; j < end; j++) {
+function findEventualTag(rows: any[], userRowIndex: number, end: number): HistoryTag {
+  const scanEnd = Math.min(userRowIndex + 1 + TOOL_TAG_LOOKAHEAD_ROWS, end);
+  for (let j = userRowIndex + 1; j < scanEnd; j++) {
     const row = rows[j];
     if (row.role !== "assistant") continue;
     const tag = tagFromBlocks(row.blocks);
@@ -87,6 +87,14 @@ function findEventualTag(rows: any[], userRowIndex: number): HistoryTag {
   }
   return "general";
 }
+
+// Every back-and-forth turn was previously its own History row — a 5-message meal-logging
+// exchange (a question, a clarifying answer, a correction) showed as 5 separate entries instead
+// of the one real conversation it was. There's no explicit session boundary stored anywhere, so
+// a gap in activity is the same heuristic session/analytics tooling generally uses for this:
+// under it, back-to-back turns are still the same exchange; past it, enough time passed that
+// it reads as a new one, even if the topic happens to be similar.
+const CONVERSATION_GAP_MS = 15 * 60 * 1000;
 
 function dateLabel(at: string): string {
   const d = new Date(at);
@@ -143,14 +151,35 @@ export function useMessageHistory() {
       }
 
       const rows = (data ?? []).slice().reverse();
-      const entries: HistoryEntry[] = [];
-      for (let i = 0; i < rows.length; i++) {
-        const row = rows[i] as any;
-        if (row.role !== "user") continue;
-        const tag = tagFromContent(row.content) ?? findEventualTag(rows, i);
-        entries.push({ id: row.id, title: truncate(row.content, 80), tag, at: row.at });
+
+      // Partition into conversations first (by activity gap), then title/tag each one as a
+      // whole — this is what actually collapses a multi-turn exchange into one History row
+      // instead of one row per utterance.
+      const segments: { start: number; end: number }[] = [];
+      let segmentStart = 0;
+      for (let i = 1; i <= rows.length; i++) {
+        const endedByGap =
+          i < rows.length && new Date(rows[i].at).getTime() - new Date(rows[i - 1].at).getTime() > CONVERSATION_GAP_MS;
+        if (i === rows.length || endedByGap) {
+          segments.push({ start: segmentStart, end: i });
+          segmentStart = i;
+        }
       }
-      entries.reverse();
+
+      const entries: HistoryEntry[] = [];
+      for (const { start, end } of segments) {
+        let firstUserIndex = -1;
+        for (let i = start; i < end; i++) {
+          if ((rows[i] as any).role === "user") {
+            firstUserIndex = i;
+            break;
+          }
+        }
+        if (firstUserIndex === -1) continue;
+        const firstUserRow = rows[firstUserIndex] as any;
+        const tag = tagFromContent(firstUserRow.content) ?? findEventualTag(rows, firstUserIndex, end);
+        entries.push({ id: firstUserRow.id, title: truncate(firstUserRow.content, 80), tag, at: firstUserRow.at });
+      }
 
       const byDate = new Map<string, HistoryEntry[]>();
       for (const entry of entries) {

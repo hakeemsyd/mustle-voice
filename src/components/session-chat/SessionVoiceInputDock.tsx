@@ -142,25 +142,33 @@ export const SessionVoiceInputDock = forwardRef<TextInput, SessionVoiceInputDock
     };
 
     const canSubmit = value.trim().length > 0;
-    // Shown for the whole of mic mode, not just while a call is live — it labels the mode ("this
-    // is the speak surface"), which is how the design uses it. Once a call really is connected
-    // the orb state replaces the label with what the coach is actually doing.
+    // Shown for the whole of mic mode so the dock is never empty, but the animated bars only run
+    // while a call is genuinely connected — those bars read as "I'm listening right now", and
+    // showing them with no call live at all was a real false affordance: confirmed live, a user
+    // started talking to a disconnected mic because "YOU SPEAK" with pulsing bars looked identical
+    // whether or not the agent could actually hear them. Idle/disconnected gets a plain, static
+    // prompt instead, visually distinct from the live states below it.
     const showSpeakBanner = mode === "mic" && !muted;
+    const isLive = isVoiceActive && voiceStatus === "connected";
     const speakLabel = reconnecting
       ? "RECONNECTING…"
       : voiceStatus === "connecting"
         ? "CONNECTING…"
-        : (isVoiceActive && orbState && ORB_HINTS[orbState]) || "YOU SPEAK";
+        : isLive
+          ? (orbState && ORB_HINTS[orbState]) || "YOU SPEAK"
+          : "TAP TO TALK";
 
     return (
       <View style={styles.wrap}>
         {showSpeakBanner && (
           <View style={styles.speakBanner}>
-            <View style={styles.speakBars}>
-              <SpeakBar delay={0} />
-              <SpeakBar delay={140} />
-              <SpeakBar delay={280} />
-            </View>
+            {(isLive || reconnecting || voiceStatus === "connecting") && (
+              <View style={styles.speakBars}>
+                <SpeakBar delay={0} />
+                <SpeakBar delay={140} />
+                <SpeakBar delay={280} />
+              </View>
+            )}
             <Text style={styles.speakText}>{speakLabel}</Text>
           </View>
         )}

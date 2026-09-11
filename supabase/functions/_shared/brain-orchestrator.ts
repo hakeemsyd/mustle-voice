@@ -20,9 +20,17 @@ export interface ModelTurn {
   content: ContentBlock[];
 }
 
+// The static instructions (rules, tool guidance) barely change turn to turn, but the dynamic
+// half (today's date, live session state) changes on every single turn — concatenating them into
+// one string before it reaches the model defeats Anthropic's prompt caching, since caching only
+// hits on a byte-identical prefix. Passing them separately lets createCallModel cache just the
+// static half. A plain string is still accepted for callers (like the text-chat brain) that
+// haven't split their prompt yet — it's simply sent uncached.
+export type SystemPromptInput = string | { static: string; dynamic: string };
+
 export type CallModel = (
   messages: any[],
-  system: string,
+  system: SystemPromptInput,
   onTextDelta?: (delta: string) => void,
 ) => Promise<ModelTurn>;
 
@@ -45,7 +53,7 @@ const MAX_TOOL_ROUNDS = 6;
 const STUCK_REPLY = "I'm having trouble finishing that — let's try again in a moment.";
 
 export async function runBrainTurn(opts: {
-  systemPrompt: string;
+  systemPrompt: SystemPromptInput;
   messages: any[];
   handlers: ToolHandlers;
   callModel: CallModel;
@@ -84,7 +92,10 @@ export async function runBrainTurn(opts: {
       }
 
       try {
+        // TEMPORARY — voice-timing instrumentation. Remove once the slow phase is identified.
+        const tTool0 = Date.now();
         const result = await handler(block.input);
+        console.log(`[voice-timing:server] tool ${block.name}: +${Date.now() - tTool0}ms`);
         toolCalls.push({ name: block.name!, input: block.input, result });
         toolResults.push({
           type: 'tool_result',

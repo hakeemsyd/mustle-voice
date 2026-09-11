@@ -69,14 +69,39 @@ export function WheelPicker({
         lastCommitted.current = next;
         onChange(next);
       }
+      return clamped;
     },
     [itemHeight, values.length, min, onChange],
   );
 
-  const handleMomentumEnd = useCallback(
-    (e: NativeSyntheticEvent<NativeScrollEvent>) =>
-      commitFromOffset(e.nativeEvent.contentOffset.y),
+  // onScrollEndDrag can fire while the scroll is still decelerating under its own momentum (the
+  // finger lifted, but the view keeps moving) — onMomentumScrollEnd is the only one of the two
+  // that means "this has genuinely come to rest." Forcing a scrollTo correction from drag-end
+  // fought that still-in-flight native animation and made the whole picker feel stuck; only
+  // committing the value there (a plain state update, nothing that touches the scroll itself)
+  // is safe from both.
+  const handleDragEnd = useCallback(
+    (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      commitFromOffset(e.nativeEvent.contentOffset.y);
+    },
     [commitFromOffset],
+  );
+
+  const handleMomentumEnd = useCallback(
+    (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      const offsetY = e.nativeEvent.contentOffset.y;
+      const clamped = commitFromOffset(offsetY);
+      // iOS's snapToInterval can settle a few pixels short of an exact item boundary,
+      // especially with decelerationRate="fast" — confirmed live: the resting scroll position
+      // left two adjacent numbers straddling the center band instead of one sitting cleanly in
+      // it. Safe to correct here specifically, since onMomentumScrollEnd only fires once
+      // scrolling has actually stopped, so this can't race an animation still in progress.
+      const snappedY = clamped * itemHeight;
+      if (Math.abs(snappedY - offsetY) > 0.5) {
+        scrollRef.current?.scrollTo({ y: snappedY, animated: true });
+      }
+    },
+    [commitFromOffset, itemHeight],
   );
 
   const handleTapItem = (n: number) => {
@@ -105,7 +130,7 @@ export function WheelPicker({
         }}
         onScroll={scrollHandler}
         onMomentumScrollEnd={handleMomentumEnd}
-        onScrollEndDrag={handleMomentumEnd}
+        onScrollEndDrag={handleDragEnd}
         scrollEventThrottle={16}
         contentOffset={{ x: 0, y: (value - min) * itemHeight }}
         accessibilityRole="adjustable"

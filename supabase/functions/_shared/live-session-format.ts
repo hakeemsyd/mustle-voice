@@ -4,7 +4,12 @@ import { humanizeFocus } from './humanize.ts';
 // supabase/functions/, the same reason resolveTodaySession/estimateRestSeconds are duplicated
 // instead of imported. Any behavioral change to either copy should be mirrored in the other.
 
-export const LIVE_STATE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+// Was 6 hours — meant the coach could keep treating an abandoned session (app closed mid-workout,
+// never formally ended) as "in progress" for most of a day. Damion's explicit spec (2026-09-09):
+// 60 minutes of inactivity for V1, then the session closes and gets marked interrupted for the
+// coach to ask about — see interrupted-session.ts, which uses this same constant as its staleness
+// threshold, not just a "stop treating it as live" cutoff.
+export const LIVE_STATE_MAX_AGE_MS = 60 * 60 * 1000;
 
 interface LoggedSet {
   weight: number | null;
@@ -120,14 +125,32 @@ export function describeLiveSessionSnapshot(snapshot: LiveSessionSnapshot): stri
     // Spelled out as completed-vs-remaining rather than a bare "set N of M" ordinal. Confirmed
     // live: "set 4 of 4" (3 done, the 4th still to do) was read as "4 of 4 finished", and the
     // coach moved on to the next exercise while the app was still waiting on the last set.
+    // The rep target is spelled out as the only acceptable source rather than just stated, because
+    // stating it was not enough: confirmed live, minutes after being handed "Romanian Deadlift,
+    // target 8-10", the coach announced "Romanian Deadlift, six to eight reps" — carrying over the
+    // previous exercise's range after five turns of repeating it. A number said many times in the
+    // conversation beats a number listed once, unless the listing is explicit that it wins.
     lines.push(
-      `- Current exercise: "${c.name}" (target ${c.repScheme}${c.loadScheme ? `, ${c.loadScheme}` : ''}).`,
+      `- Current exercise: "${c.name}" — target reps ${c.repScheme}` +
+        `${c.loadScheme ? `, load ${c.loadScheme}` : ''}. When you say the target out loud, say ` +
+        `EXACTLY ${c.repScheme} — never a rep range carried over from an earlier exercise in this ` +
+        `session, however many times you just said it.`,
     );
     lines.push(
       remaining > 0
         ? `- Sets COMPLETED on it: ${done} of ${c.totalSets}. ${remaining} still to do — the next one ` +
             `to perform is set ${done + 1}, which has NOT happened yet. Do not move on to another ` +
-            `exercise until all ${c.totalSets} are completed.`
+            `exercise until all ${c.totalSets} are completed. Announcing a set, or telling them to go, ` +
+            `does NOT complete it, and never count one twice because it was discussed more than once ` +
+            `— confirmed live, the coach treated its own "set three, go" as set three being finished ` +
+            `and challenged the user's real report of it as a duplicate. ` +
+            `IMPORTANT: this count can lag by one set. It is written by the app a moment after a set ` +
+            `is logged, so a set the user reported seconds ago may not be in it yet. If a message in ` +
+            `THIS turn says the app just logged a set, that message is newer than this block and wins ` +
+            `— confirmed live: the coach told a user their set "didn't register" and to tap the screen, ` +
+            `while the app had already logged it and the screen already showed it. Never tell the user ` +
+            `a set failed to register, and never accuse them of repeating one; if the two disagree, ` +
+            `believe the more recent one and move on.`
         : `- Sets COMPLETED on it: ${done} of ${c.totalSets}. This exercise is finished.`,
     );
     lines.push(`- Loads logged so far on this exercise: ${loggedDesc}.`);

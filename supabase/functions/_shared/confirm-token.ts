@@ -31,8 +31,13 @@ async function hmac(secret: string, message: string): Promise<string> {
 /** `key` should encode every value the confirm call must reproduce exactly — e.g. a session id,
  *  or a stable hash of the exact proposed fields — so a token silently stops matching the moment
  *  either side has drifted. */
-export async function issueConfirmToken(secret: string, tool: string, key: string): Promise<string> {
-  const expiry = Date.now() + TOKEN_TTL_MS;
+export async function issueConfirmToken(
+  secret: string,
+  tool: string,
+  key: string,
+  ttlMs: number = TOKEN_TTL_MS,
+): Promise<string> {
+  const expiry = Date.now() + ttlMs;
   const sig = await hmac(secret, `${tool}:${key}:${expiry}`);
   return `${expiry}.${sig}`;
 }

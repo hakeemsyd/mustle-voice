@@ -1,7 +1,7 @@
 import { ReactNode, useMemo } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { colors, fonts } from "../constants/theme";
-import { localDateKey } from "../lib/calendarDate";
+import { localDateKey, startOfLocalDay } from "../lib/calendarDate";
 import { ChevronRightIcon } from "../icons";
 
 const WEEKDAYS = ["S", "M", "T", "W", "T", "F", "S"];
@@ -41,7 +41,7 @@ function buildMonthGrid(monthDate: Date): MonthGridDayInfo[] {
   }
   while (cells.length % 7 !== 0) {
     const last = cells[cells.length - 1];
-    const nextDate = new Date(`${last.key}T00:00:00`);
+    const nextDate = startOfLocalDay(last.key);
     nextDate.setDate(nextDate.getDate() + 1);
     cells.push({ date: nextDate.getDate(), key: localDateKey(nextDate), inMonth: false, isToday: false });
   }

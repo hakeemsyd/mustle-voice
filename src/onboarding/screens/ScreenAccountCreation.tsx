@@ -13,12 +13,15 @@ import {
 import { Ionicons } from "@expo/vector-icons";
 import * as Linking from "expo-linking";
 import { supabase } from "../../lib/supabase";
+import { isIdentityAlreadyLinkedError } from "../../lib/authErrors";
 import {
   linkAppleToCurrentUser,
+  signInWithApple,
   AppleSignInCancelledError,
 } from "../../lib/appleAuth";
 import {
   linkGoogleToCurrentUser,
+  signInWithGoogle,
   GoogleSignInCancelledError,
 } from "../../lib/googleAuth";
 import { colors, fonts } from "../../constants/theme";
@@ -79,6 +82,38 @@ export const ScreenAccountCreation = ({
   const [appleSubmitting, setAppleSubmitting] = useState(false);
   const [googleSubmitting, setGoogleSubmitting] = useState(false);
 
+  // A prior install/rebuild can leave an orphaned anonymous account already linked to this same
+  // Google/Apple identity (see the anonymous-identity-instability history this project has hit
+  // before) — linking it again here always fails identically, since it really is already used.
+  // The only real recovery is signing into that existing account instead, which is what this
+  // offers rather than a dead-end "try again" that can never succeed.
+  const offerExistingAccountSignIn = (
+    provider: "Google" | "Apple",
+    signIn: () => Promise<void>,
+  ) => {
+    Alert.alert(
+      "Account already exists",
+      `You've already used this ${provider} account with MUSTLE before. Sign in to that account instead? ` +
+        "Anything you just entered in this setup won't be attached to it.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Sign In",
+          onPress: async () => {
+            try {
+              await signIn();
+              clearPendingEmailConfirmation();
+              onSuccess();
+            } catch (err) {
+              console.error(`[account creation] ${provider} recovery sign-in failed:`, err);
+              Alert.alert("Sign in failed", `Something went wrong signing into your ${provider} account.`);
+            }
+          },
+        },
+      ],
+    );
+  };
+
   const handleGoogleTap = async () => {
     setGoogleSubmitting(true);
     try {
@@ -86,7 +121,11 @@ export const ScreenAccountCreation = ({
       clearPendingEmailConfirmation();
       onSuccess();
     } catch (err) {
-      if (!(err instanceof GoogleSignInCancelledError)) {
+      if (err instanceof GoogleSignInCancelledError) {
+        // no-op
+      } else if (isIdentityAlreadyLinkedError(err)) {
+        offerExistingAccountSignIn("Google", signInWithGoogle);
+      } else {
         console.error("[account creation] Google sign-up failed:", err);
         Alert.alert(
           "Sign up failed",
@@ -105,7 +144,11 @@ export const ScreenAccountCreation = ({
       clearPendingEmailConfirmation();
       onSuccess();
     } catch (err) {
-      if (!(err instanceof AppleSignInCancelledError)) {
+      if (err instanceof AppleSignInCancelledError) {
+        // no-op
+      } else if (isIdentityAlreadyLinkedError(err)) {
+        offerExistingAccountSignIn("Apple", signInWithApple);
+      } else {
         console.error("[account creation] Apple sign-up failed:", err);
         Alert.alert(
           "Sign up failed",

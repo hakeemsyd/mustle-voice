@@ -12,7 +12,7 @@ import {
   useDayDetail,
   startOfWeek,
 } from "../hooks/useCalendarData";
-import { addDays, formatWeekRange, localDateKey } from "../lib/calendarDate";
+import { addDays, formatWeekRange, localDateKey, startOfLocalDay } from "../lib/calendarDate";
 import { useScreenInsets } from "../hooks/useScreenInsets";
 import { isAppleHealthAvailable, readLastNightSleepMinutes } from "../lib/appleHealth";
 import { estimateRestSeconds, formatRestSeconds } from "../lib/restSuggestion";
@@ -400,7 +400,7 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
         {detailDate && !detail.loading && (
           <ScrollView style={styles.detailScroll} contentContainerStyle={styles.detailBody}>
             {(() => {
-              const dateObj = new Date(`${detailDate}T00:00:00`);
+              const dateObj = startOfLocalDay(detailDate);
               const loggedWorkout = detail.workouts[0] ?? null;
               const doneFocus = loggedWorkout?.focus ?? null;
               const plannedValue = doneFocus ? titleCase(doneFocus) : detail.plannedFocus ? titleCase(detail.plannedFocus) : "No session scheduled";
@@ -549,6 +549,13 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                               <ChevronRightIcon size={12} color={colors.muted} />
                             </View>
                           </View>
+                          <Text style={styles.sourceLabel}>
+                            {loggedWorkout.status === "interrupted"
+                              ? "Needs Review — ask your coach what happened"
+                              : loggedWorkout.source === "independent"
+                                ? "Completed Independently"
+                                : "Logged with MUSTLE"}
+                          </Text>
                           {loggedWorkout.exercisesDone.map((ex, j) => (
                             <Text key={j} style={styles.detailLine}>
                               {ex.name} — {ex.sets}×{ex.reps} @ {ex.load}
@@ -977,6 +984,13 @@ const styles = StyleSheet.create({
   detailEmptyTitle: { fontFamily: fonts.bodySemiBold, fontSize: 13, color: colors.text, textAlign: "center" },
   detailEmptySub: { fontFamily: fonts.body, fontSize: 12, color: colors.muted, textAlign: "center" },
   detailLine: { fontFamily: fonts.body, fontSize: 13, lineHeight: 19, color: colors.text },
+  sourceLabel: {
+    fontFamily: fonts.monoBold,
+    fontSize: 9.5,
+    letterSpacing: 0.5,
+    color: colors.accent,
+    marginBottom: 4,
+  },
 
   macroBars: { gap: 10 },
   macroRow: { gap: 5 },

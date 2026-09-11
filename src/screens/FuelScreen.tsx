@@ -11,6 +11,7 @@ import Svg, { Circle } from "react-native-svg";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useFocusEffect } from "@react-navigation/native";
 import { useFuelData, type FoodLogEntry } from "../hooks/useFuelData";
+import { startOfLocalDay } from "../lib/calendarDate";
 import { colors, fonts } from "../constants/theme";
 import {
   AppleIcon,
@@ -48,12 +49,12 @@ function formatLongDate(iso: string): string {
 // convention as the reference's own formatLoggedDateLabel.
 function formatLoggedDateLabel(dateKey: string, todayKey: string): string {
   if (dateKey === todayKey) return "Today";
-  const yesterday = new Date(`${todayKey}T00:00:00`);
+  const yesterday = startOfLocalDay(todayKey);
   yesterday.setDate(yesterday.getDate() - 1);
   if (dateKey === `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, "0")}-${String(yesterday.getDate()).padStart(2, "0")}`) {
     return "Yesterday";
   }
-  return new Date(`${dateKey}T00:00:00`).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return startOfLocalDay(dateKey).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
 // Same 4 time-of-day boundaries as the reference's inferMealTypeFromTime — coarse on
@@ -158,7 +159,11 @@ export function FuelScreen() {
   const caloriesOver = Math.max(0, Math.round(caloriesCurrent - caloriesGoal));
   const overLimit =
     !!macros && macros.some((m) => m.goal > 0 && m.current > m.goal);
-  const hasLoggedToday = caloriesCurrent > 0;
+  // The ring now tracks whichever day is being browsed (see useFuelData), not always literally
+  // today — name/copy follow that so "log your first meal" doesn't claim to be about today while
+  // showing a past day's totals.
+  const hasLoggedForDay = caloriesCurrent > 0;
+  const isViewingToday = loggedDate === todayKey;
 
   return (
     <SafeAreaView style={styles.screen} edges={["top"]}>
@@ -177,8 +182,14 @@ export function FuelScreen() {
         >
           {!macros ? (
             <EmptyRing text="No nutrition targets yet — tell your coach your goal to get started." />
-          ) : !hasLoggedToday ? (
-            <EmptyRing text="Log your first meal to see today's macros" />
+          ) : !hasLoggedForDay ? (
+            <EmptyRing
+              text={
+                isViewingToday
+                  ? "Log your first meal to see today's macros"
+                  : "Nothing logged this day"
+              }
+            />
           ) : (
             <View style={styles.ringSection}>
               <View style={styles.ringWrap}>
@@ -204,7 +215,7 @@ export function FuelScreen() {
 
               {overLimit && (
                 <Text style={styles.overNotice}>
-                  Over today's target — logging still works.
+                  {isViewingToday ? "Over today's target" : "Over this day's target"} — logging still works.
                 </Text>
               )}
 

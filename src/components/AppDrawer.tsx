@@ -22,7 +22,7 @@ import {
   useDayDetail,
 } from "../hooks/useCalendarData";
 import { useFuelData } from "../hooks/useFuelData";
-import { localDateKey, addDays } from "../lib/calendarDate";
+import { localDateKey, addDays, startOfLocalDay } from "../lib/calendarDate";
 import { colors, fonts, lightCard } from "../constants/theme";
 import { MMark } from "../icons/MMark";
 import { MonthGrid } from "./MonthGrid";
@@ -62,6 +62,9 @@ interface AppDrawerProps {
   /** Jumps back into the chat transcript at a specific message — passed through from Home,
    *  which owns the transcript this drawer's History entries point into. */
   onOpenHistoryEntry?: (messageId: string) => void;
+  /** Opens a past workout's session summary — passed through from Home, which owns the navigator
+   *  this drawer sits over. */
+  onOpenSessionReport?: (workoutLogId: string) => void;
 }
 
 const SCREEN_WIDTH = Dimensions.get("window").width;
@@ -97,7 +100,7 @@ const dateGroupLabel = (dateKey: string): string => {
   const yesterday = localDateKey(addDays(new Date(), -1));
   if (dateKey === today) return "Today";
   if (dateKey === yesterday) return "Yesterday";
-  return new Date(`${dateKey}T00:00:00`).toLocaleDateString("en-US", { month: "long", day: "numeric" });
+  return startOfLocalDay(dateKey).toLocaleDateString("en-US", { month: "long", day: "numeric" });
 };
 
 const formatTime = (iso: string): string =>
@@ -369,7 +372,7 @@ const HistoryDetail = ({
             <View style={styles.datePager}>
               <Pressable
                 style={styles.datePagerBtn}
-                onPress={() => setSelectedDateKey((d) => localDateKey(addDays(new Date(`${d}T00:00:00`), -1)))}
+                onPress={() => setSelectedDateKey((d) => localDateKey(addDays(startOfLocalDay(d), -1)))}
                 hitSlop={6}
               >
                 <View style={{ transform: [{ rotate: "180deg" }] }}>
@@ -382,7 +385,7 @@ const HistoryDetail = ({
               </View>
               <Pressable
                 style={[styles.datePagerBtn, selectedDateKey >= localDateKey(new Date()) && styles.datePagerBtnDisabled]}
-                onPress={() => setSelectedDateKey((d) => localDateKey(addDays(new Date(`${d}T00:00:00`), 1)))}
+                onPress={() => setSelectedDateKey((d) => localDateKey(addDays(startOfLocalDay(d), 1)))}
                 disabled={selectedDateKey >= localDateKey(new Date())}
                 hitSlop={6}
               >
@@ -421,7 +424,13 @@ const EmptyState = ({ title, subtitle }: { title: string; subtitle: string }) =>
 
 // ---------- Calendar detail ----------
 
-const CalendarTimelineDay = ({ dateKey }: { dateKey: string }) => {
+const CalendarTimelineDay = ({
+  dateKey,
+  onOpenSessionReport,
+}: {
+  dateKey: string;
+  onOpenSessionReport?: (workoutLogId: string) => void;
+}) => {
   const detail = useDayDetail(dateKey);
   if (detail.loading) return <ActivityIndicator color={colors.accent} style={{ marginTop: 24 }} />;
 
@@ -436,15 +445,32 @@ const CalendarTimelineDay = ({ dateKey }: { dateKey: string }) => {
 
   return (
     <View style={styles.calDayBody}>
-      {hasPlan && (
-        <View style={styles.calPlannedRow}>
-          <View style={styles.calPlannedIcon}>
-            <DumbbellIcon size={14} color={colors.accent} />
+      {hasPlan &&
+        // A logged workout is the entry point to its own report here, the same way the full
+        // Calendar screen's day sheet is — this list rendered it as a static row, so a session
+        // summary was only ever reachable in the moments right after finishing a workout, and
+        // never again for any earlier day.
+        (loggedWorkout && onOpenSessionReport ? (
+          <Pressable
+            style={styles.calPlannedRow}
+            onPress={() => onOpenSessionReport(loggedWorkout.workoutLogId)}
+          >
+            <View style={styles.calPlannedIcon}>
+              <DumbbellIcon size={14} color={colors.accent} />
+            </View>
+            <Text style={styles.calPlannedText}>{plannedValue}</Text>
+            <Text style={styles.calReportLink}>View report</Text>
+            <ChevronRightIcon size={13} color={colors.accent} />
+          </Pressable>
+        ) : (
+          <View style={styles.calPlannedRow}>
+            <View style={styles.calPlannedIcon}>
+              <DumbbellIcon size={14} color={colors.accent} />
+            </View>
+            <Text style={styles.calPlannedText}>{plannedValue}</Text>
+            {loggedWorkout && <CheckCircleIcon size={14} color={colors.accent} />}
           </View>
-          <Text style={styles.calPlannedText}>{plannedValue}</Text>
-          {loggedWorkout && <CheckCircleIcon size={14} color={colors.accent} />}
-        </View>
-      )}
+        ))}
       {detail.meals.map((m, i) => (
         <View key={i} style={styles.calFactLine}>
           <UtensilsIcon size={12} color={colors.muted} />
@@ -465,7 +491,13 @@ const CalendarTimelineDay = ({ dateKey }: { dateKey: string }) => {
   );
 };
 
-const CalendarDetail = ({ onOpenFullCalendar }: { onOpenFullCalendar: () => void }) => {
+const CalendarDetail = ({
+  onOpenFullCalendar,
+  onOpenSessionReport,
+}: {
+  onOpenFullCalendar: () => void;
+  onOpenSessionReport?: (workoutLogId: string) => void;
+}) => {
   const [heroView, setHeroView] = useState<"session" | "nutrition">("session");
   const [dateView, setDateView] = useState<"day" | "month">("day");
   const [monthCursor, setMonthCursor] = useState(() => new Date());
@@ -623,11 +655,11 @@ const CalendarDetail = ({ onOpenFullCalendar }: { onOpenFullCalendar: () => void
         <>
           <DatePagerRow
             dateKey={timelineDateKey}
-            onPrev={() => setTimelineDateKey((d) => localDateKey(addDays(new Date(`${d}T00:00:00`), -1)))}
-            onNext={() => setTimelineDateKey((d) => localDateKey(addDays(new Date(`${d}T00:00:00`), 1)))}
+            onPrev={() => setTimelineDateKey((d) => localDateKey(addDays(startOfLocalDay(d), -1)))}
+            onNext={() => setTimelineDateKey((d) => localDateKey(addDays(startOfLocalDay(d), 1)))}
             nextDisabled={timelineDateKey >= localDateKey(new Date())}
           />
-          <CalendarTimelineDay dateKey={timelineDateKey} />
+          <CalendarTimelineDay dateKey={timelineDateKey} onOpenSessionReport={onOpenSessionReport} />
         </>
       ) : (
         <>
@@ -906,7 +938,14 @@ const ProfileDetail = ({ userId, userName }: { userId: string | null; userName: 
 
 // ---------- Root drawer ----------
 
-export const AppDrawer = ({ visible, onClose, onOpenCalendar, userId, onOpenHistoryEntry }: AppDrawerProps) => {
+export const AppDrawer = ({
+  visible,
+  onClose,
+  onOpenCalendar,
+  userId,
+  onOpenHistoryEntry,
+  onOpenSessionReport,
+}: AppDrawerProps) => {
   const insets = useScreenInsets();
   const userName = useProfileName(userId);
   const { groups: historyGroups } = useMessageHistory();
@@ -1009,6 +1048,13 @@ export const AppDrawer = ({ visible, onClose, onOpenCalendar, userId, onOpenHist
                   onClose();
                   onOpenCalendar();
                 }}
+                onOpenSessionReport={
+                  onOpenSessionReport &&
+                  ((workoutLogId) => {
+                    onClose();
+                    onOpenSessionReport(workoutLogId);
+                  })
+                }
               />
             )}
             {detailView === "profile" && <ProfileDetail userId={userId} userName={userName ?? ""} />}
@@ -1311,6 +1357,7 @@ const styles = StyleSheet.create({
   },
   calPlannedIcon: { width: 28, height: 28, borderRadius: 14, alignItems: "center", justifyContent: "center", backgroundColor: colors.surface },
   calPlannedText: { flex: 1, fontFamily: fonts.bodySemiBold, fontSize: 13, color: colors.text },
+  calReportLink: { fontFamily: fonts.bodySemiBold, fontSize: 12, color: colors.accent },
   calFactLine: { flexDirection: "row", alignItems: "center", gap: 8 },
   calFactText: { flex: 1, fontFamily: fonts.body, fontSize: 12.5, color: colors.text },
 

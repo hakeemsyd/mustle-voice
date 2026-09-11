@@ -362,6 +362,7 @@ export function HomeScreen() {
         }
         userId={userId}
         onOpenHistoryEntry={handleOpenHistoryEntry}
+        onOpenSessionReport={(workoutLogId) => navigation.navigate("SessionReport", { workoutLogId })}
       />
     </SafeAreaView>
   );

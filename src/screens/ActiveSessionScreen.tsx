@@ -27,6 +27,7 @@ import { CARDIO_ACTIVITIES } from "../components/SwitchWorkoutSheet";
 import { formatClock } from "../lib/formatClock";
 import { useScreenInsets } from "../hooks/useScreenInsets";
 import { useSharedVoiceSession } from "../session/VoiceSessionProvider";
+import { SYSTEM_CUE_PREFIX } from "../hooks/useVoiceSession";
 import { useActiveSessionContext, type SessionTarget } from "../session/ActiveSessionContext";
 import { usePlanAlternatives } from "../hooks/usePlanAlternatives";
 import { getSwapCandidates, type SwapCandidate } from "../session/exerciseSwap";
@@ -202,7 +203,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
 
   useEffect(() => {
     setMessageHandler((message) => {
-      if (!message.text.startsWith("[[SYSTEM_CUE]]")) {
+      if (!message.text.startsWith(SYSTEM_CUE_PREFIX)) {
         session.appendMessage(message.role === "user" ? "user" : "coach", message.text);
       }
       // Checked before the rest guard below: during rest this is the one thing the user can say
@@ -211,9 +212,20 @@ export function ActiveSessionScreen({ navigation }: Props) {
       if (message.role === "user" && !isCardio && resting && looksLikeStartSetCommand(message.text)) {
         session.finishRest();
         try {
+          // They asked to go, out loud, so this is the one moment that most needs a real spoken
+          // prompt — confirmed live: the coach answered "Start set two" with the word "Silence",
+          // reading the stay-quiet-through-rest briefing as still in force. Spelling out the exact
+          // numbers it should say is what makes it coach here instead of going quiet or reaching
+          // for a template.
+          const setNumber = currentSetCount + 1;
           sendContextRef.current?.(
-            "The user just asked to start the next set, so the app ended their rest early and the " +
-              "timer is now cleared. Rest is over — pick the next set up from here.",
+            `The user just asked to start the next set out loud, so the app ended their rest early ` +
+              `and the timer is cleared. Rest is over. Answer them — going quiet here is wrong, they ` +
+              `just spoke to you. Give them the real next-set prompt: this is set ${setNumber}` +
+              `${currentExercise ? ` of ${currentExercise.sets} for ${currentExercise.name}` : ""}, ` +
+              `${currentExercise ? `target ${currentExercise.repScheme} reps` : "the target reps"}` +
+              `${lastLoggedWeight != null ? ` at ${lastLoggedWeight}kg, the same weight as their last set` : ""}. ` +
+              `One short line, natural, then let them lift.`,
           );
         } catch (err) {
           console.error("[active session] failed to tell coach rest was skipped:", err);
@@ -241,18 +253,57 @@ export function ActiveSessionScreen({ navigation }: Props) {
         }
         return;
       }
-      commitSet(parsed.weight, parsed.reps, true, parsed.unit);
+      // A bare "eight reps" follow-up (no weight repeated) reads as bodyweight to the parser,
+      // silently dropping a real weight already established earlier for this exercise — confirmed
+      // live: answering the app's own "How many reps?" clarifying question with reps only logged
+      // 60kg as bodyweight. Carry forward the last weight actually logged for this exercise
+      // instead of trusting "no weight mentioned this sentence" as "true bodyweight movement".
+      const resolvedWeight =
+        parsed.weight === null && parsed.unit !== "seconds" ? (lastLoggedWeight ?? null) : parsed.weight;
+      const parsedForLog = { ...parsed, weight: resolvedWeight };
+      commitSet(parsedForLog.weight, parsedForLog.reps, true, parsedForLog.unit);
       const setNumber = currentSetCount + 1;
+      // A voice-reported set is logged and acknowledged entirely through this inline context
+      // update, never through the set_logged/exercise_advanced cue system below (that's
+      // deliberately skipped for viaVoice sets — see commitSet's own comment). That means THIS
+      // message is the only place the model can learn a transition happened at all. It used to
+      // only ever describe the set that was just finished — confirmed live: when that set was
+      // the exercise's last one, the model was never told a new exercise had started, so it kept
+      // narrating the OLD exercise's rep scheme and set count indefinitely (a fictional "set
+      // four" on a 3-set exercise, the wrong rep range) since nothing ever corrected it.
+      const exerciseComplete = !!currentExercise && setNumber >= (currentExercise.sets ?? 0);
+      const nextExercise = exerciseComplete ? (exercises[currentExerciseIndex + 1] ?? null) : null;
+      // Moving to a new exercise is the one moment the coach MUST speak, and a contextual update
+      // can't make it: it reaches the model without demanding a reply, so it only ever got
+      // announced when it happened to land before that turn finished generating. Confirmed live:
+      // two of three transitions in one workout were never announced — "Rest." and then nothing,
+      // while the screen had already moved on. Re-arming the cue (voice-reported sets normally skip
+      // it) routes this through exercise_advanced instead, which is sent as a turn and is therefore
+      // always answered. The contextual update below is skipped in that case so the transition is
+      // announced exactly once, by the cue.
+      const handOffToCue = exerciseComplete && !!nextExercise;
+      if (handOffToCue) pendingSetCueRef.current = "fire";
       // describeParsedSet is unit-aware ("52s held" vs "60kg × 8 reps") — this used to hardcode
       // "× N reps" regardless, so a timed hold (Plank, etc.) told the coach a rep count that was
       // actually a duration, and it would confirm "52 reps" out loud for a 52-second hold.
+      if (handOffToCue) return;
       try {
         sendContextRef.current?.(
           `The app just logged this set directly from what the user said: ${currentExercise?.name ?? "the current exercise"}, ` +
-            `set ${setNumber}${currentExercise ? ` of ${currentExercise.sets}` : ""}, ${describeParsedSet(parsed)}. ` +
+            `set ${setNumber}${currentExercise ? ` of ${currentExercise.sets}` : ""}, ${describeParsedSet(parsedForLog)}. ` +
             `It's already recorded — don't ask what exercise it was, whether they've done it before, or ask them to confirm ` +
             `any of these details, and if they say it was wrong or misheard, call undo_last_set instead of just apologizing ` +
-            `in text. Acknowledge in one short sentence and move the conversation forward.`,
+            `in text. Acknowledge in one short sentence and move the conversation forward.` +
+            (exerciseComplete
+              ? nextExercise
+                ? ` That was the last set of ${currentExercise!.name} — the app has already moved on to the next ` +
+                  `exercise: ${nextExercise.name}, ${nextExercise.sets} sets of ${nextExercise.repScheme}` +
+                  `${nextExercise.loadScheme ? ` at ${nextExercise.loadScheme}` : ""}. There is no rest timer between ` +
+                  `exercises, so name the new exercise and its real target next — these exact numbers, never ` +
+                  `${currentExercise!.name}'s.`
+                : ` That was the last set of the last exercise — the workout is complete. Wrap it up; don't reference ` +
+                  `another set or exercise.`
+              : ""),
         );
       } catch (err) {
         console.error("[active session] failed to send set-logged context to voice:", err);
@@ -279,7 +330,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
     triggerCueRef.current = (cue: string) => {
       if (voiceStatus !== "connected") return;
       try {
-        sendUserMessage(`[[SYSTEM_CUE]] ${cue}`);
+        sendUserMessage(`${SYSTEM_CUE_PREFIX} ${cue}`);
       } catch (err) {
         console.error("[active session] failed to send coach cue:", err);
       }
@@ -323,6 +374,13 @@ export function ActiveSessionScreen({ navigation }: Props) {
     liveStateWriteRef.current = supabase.from("live_session_state").upsert({
       user_id: session.userId,
       state: {
+        // Scopes the coach's replayed conversation to THIS workout (see brain-voice's prepareTurn).
+        // The session survives leaving the screen — Home's in-progress card comes back to the same
+        // in-memory session — so the coach should still remember the weight they were told. Killing
+        // the app wipes that state and starts a new session with a new stamp, so the coach forgets
+        // exactly what the UI forgot, instead of insisting they're on set 3 of a workout the screen
+        // has restarted from zero.
+        startedAt: session.startedAt,
         target,
         focus,
         exercises,
@@ -346,12 +404,9 @@ export function ActiveSessionScreen({ navigation }: Props) {
     if (!isCardio && !currentExercise) return;
     if (greetedSessionRef.current === target) return;
     greetedSessionRef.current = target;
-    // The coach's first line reads target reps/load from the live_session_state row this same
-    // screen just wrote — confirmed live: firing this cue right after the (un-awaited) upsert let
-    // the read race the write, so on an unlucky first turn the row wasn't there yet and the coach
-    // stated a made-up rep count instead of the plan's real one. Waiting on the same write promise
-    // the effect above just started (settled either way, so a write failure doesn't mute the cue)
-    // guarantees the row exists before the coach is asked to read from it.
+    // Either outcome sends the cue: a failed live_session_state write is worth greeting through
+    // anyway (session_start's own wording falls back to a generic hello when no state block
+    // reaches the model), whereas skipping it would leave the user in silence.
     void liveStateWriteRef.current.then(
       () => triggerCueRef.current?.("session_start"),
       () => triggerCueRef.current?.("session_start"),
@@ -373,11 +428,20 @@ export function ActiveSessionScreen({ navigation }: Props) {
     const pending = pendingSetCueRef.current;
     pendingSetCueRef.current = null;
     if (pending !== "fire") return;
+    // set_logged's wording ("rest has started") is only true when a rest period actually began —
+    // the set that just finished an exercise (advancing to a new one, or ending the workout) never
+    // starts one. resting/ended already reflect the post-commit state by the time this re-runs
+    // (same render as totalSetsLogged), so they're enough to tell the three outcomes apart without
+    // any new state: still resting -> set_logged is accurate; ended -> the workout-complete flow
+    // handles its own acknowledgment, nothing to cue here; neither -> the exercise just advanced
+    // with no rest, which needs exercise_advanced's different wording instead.
+    if (ended) return;
+    const cue = resting ? "set_logged" : "exercise_advanced";
     void liveStateWriteRef.current.then(
-      () => triggerCueRef.current?.("set_logged"),
-      () => triggerCueRef.current?.("set_logged"),
+      () => triggerCueRef.current?.(cue),
+      () => triggerCueRef.current?.(cue),
     );
-  }, [totalSetsLogged]);
+  }, [totalSetsLogged, resting, ended]);
 
   // Rest has to end itself. Nothing called finishRest except the expanded card's Continue
   // button, so a finished rest sat at 0:00 forever and the next set could never begin.
@@ -412,14 +476,19 @@ export function ActiveSessionScreen({ navigation }: Props) {
     }
   }, [resting, restKey, restTargetSec, restPausedRemainingSec, voiceStatus]);
 
-  const restCueStateRef = useRef({ key: -1, countdown: false, over: false, silence: false });
+  // silenceCount: 0 = no check-in sent yet, 1 = the casual first nudge fired, 2 = the final,
+  // more direct one fired — capped there per Damion's spec ("prompt once and follow up once
+  // later, then wait"), not the single check-in this used to cap at.
+  const restCueStateRef = useRef({ key: -1, countdown: false, over: false, silenceCount: 0 });
   const restingRef = useRef(resting);
   restingRef.current = resting;
   useEffect(() => {
     if (restCueStateRef.current.key !== restKey) {
-      restCueStateRef.current = { key: restKey, countdown: false, over: false, silence: false };
+      restCueStateRef.current = { key: restKey, countdown: false, over: false, silenceCount: 0 };
     }
   }, [restKey]);
+
+  const SILENCE_CHECKIN_DELAY_MS = 20_000;
 
   useEffect(() => {
     if (!resting || voiceStatus !== "connected") return;
@@ -433,13 +502,22 @@ export function ActiveSessionScreen({ navigation }: Props) {
         () => triggerCueRef.current?.("rest_over"),
         () => triggerCueRef.current?.("rest_over"),
       );
-      setTimeout(() => {
-        const s = restCueStateRef.current;
-        if (s.key === restKey && !s.silence && restingRef.current) {
-          s.silence = true;
-          triggerCueRef.current?.("silence_after_rest");
-        }
-      }, 20_000);
+
+      const scheduleCheckIn = () => {
+        setTimeout(() => {
+          const s = restCueStateRef.current;
+          if (s.key !== restKey || !restingRef.current) return;
+          if (s.silenceCount === 0) {
+            s.silenceCount = 1;
+            triggerCueRef.current?.("silence_after_rest");
+            scheduleCheckIn();
+          } else if (s.silenceCount === 1) {
+            s.silenceCount = 2;
+            triggerCueRef.current?.("silence_after_rest_final");
+          }
+        }, SILENCE_CHECKIN_DELAY_MS);
+      };
+      scheduleCheckIn();
     } else if (restRemaining > 0 && restRemaining <= 10 && !state.countdown) {
       state.countdown = true;
       void liveStateWriteRef.current.then(
@@ -838,27 +916,39 @@ export function ActiveSessionScreen({ navigation }: Props) {
                             ) : (
                               <View style={styles.chipInfoRow}>
                                 <View style={styles.chipInfoColExercise}>
-                                  <Text style={styles.chipInfoLabelTag}>EXERCISE</Text>
+                                  <Text style={styles.chipInfoLabelTag} numberOfLines={1}>
+                                    EXERCISE
+                                  </Text>
                                   <Text style={styles.chipInfoValue} numberOfLines={1}>
                                     {exercise.name.toUpperCase()}
                                   </Text>
                                 </View>
                                 <View style={styles.chipDivider} />
                                 <View style={styles.chipInfoCol}>
-                                  <Text style={styles.chipInfoLabel}>SET</Text>
-                                  <Text style={styles.chipInfoValueSmall}>
+                                  <Text style={styles.chipInfoLabel} numberOfLines={1}>
+                                    SET
+                                  </Text>
+                                  <Text style={styles.chipInfoValueSmall} numberOfLines={1}>
                                     {Math.min(currentSetCount + 1, exercise.sets ?? 1)}/{exercise.sets ?? 1}
                                   </Text>
                                 </View>
                                 <View style={styles.chipDivider} />
                                 <View style={styles.chipInfoCol}>
-                                  <Text style={styles.chipInfoLabel}>REPS</Text>
-                                  <Text style={styles.chipInfoValueSmall}>{exercise.repScheme ?? "—"}</Text>
+                                  <Text style={styles.chipInfoLabel} numberOfLines={1}>
+                                    REPS
+                                  </Text>
+                                  <Text style={styles.chipInfoValueSmall} numberOfLines={1}>
+                                    {exercise.repScheme ?? "—"}
+                                  </Text>
                                 </View>
                                 <View style={styles.chipDivider} />
-                                <View style={styles.chipInfoCol}>
-                                  <Text style={styles.chipInfoLabel}>WEIGHT</Text>
-                                  <Text style={styles.chipInfoValueSmall}>{currentWeightLabel}</Text>
+                                <View style={styles.chipInfoColWeight}>
+                                  <Text style={styles.chipInfoLabel} numberOfLines={1}>
+                                    WEIGHT
+                                  </Text>
+                                  <Text style={styles.chipInfoValueSmall} numberOfLines={1}>
+                                    {currentWeightLabel}
+                                  </Text>
                                 </View>
                               </View>
                             )}
@@ -1372,6 +1462,16 @@ const styles = StyleSheet.create({
   },
   chipInfoCol: {
     gap: 4,
+  },
+  // Weight's own cap: unlike Set ("1/4") and Reps ("6-8"), which are always short, a load scheme
+  // can be a full sentence ("moderate — find your working weight") for an exercise with no fixed
+  // number to show. Confirmed live: with no width limit here, that sentence claimed however much
+  // space it needed and starved the exercise-name column down to a single visible letter — the
+  // opposite of the intended "Set/Reps/Weight never truncate" priority, since Weight itself was
+  // never supposed to be unbounded either. Capped and left to ellipsize like the exercise name.
+  chipInfoColWeight: {
+    gap: 4,
+    maxWidth: 92,
   },
   // Only the exercise column may shrink and ellipsize — its length is the unpredictable one,
   // and Set/Reps/Weight must never be the columns that get truncated.

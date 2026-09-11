@@ -72,9 +72,9 @@ export const NutritionSummaryCard = ({ card, variant = "dark" }: NutritionSummar
   const protein = card.macros.find((m) => m.label === "Protein");
   const carbs = card.macros.find((m) => m.label === "Carbs");
   const fat = card.macros.find((m) => m.label === "Fat");
-  const proteinConsumed = protein ? Math.round(protein.target * progress) : 0;
-  const carbsConsumed = carbs ? Math.round(carbs.target * progress) : 0;
-  const fatConsumed = fat ? Math.round(fat.target * progress) : 0;
+  const proteinConsumed = protein?.current ?? 0;
+  const carbsConsumed = carbs?.current ?? 0;
+  const fatConsumed = fat?.current ?? 0;
   const proteinPct = protein && protein.target > 0 ? Math.round((proteinConsumed / protein.target) * 100) : 0;
 
   return (

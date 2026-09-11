@@ -1,13 +1,14 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useNavigation } from "@react-navigation/native";
+import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { BottomSheet } from "../components/BottomSheet";
 import { SvgLineChart } from "../components/SvgLineChart";
 import { BodyZoneMap, type FlaggedZone } from "../components/BodyZoneMap";
 import { FloatingParticles, type ParticleConfig } from "../components/FloatingParticles";
 import { HeroGlow } from "../components/HeroGlow";
 import { useBodyData } from "../hooks/useBodyData";
+import { cmToDisplayHeight, kgToDisplayWeight, kgToDisplayWeightValue } from "../lib/units";
 import { colors, fonts } from "../constants/theme";
 import {
   InfoIcon,
@@ -28,10 +29,6 @@ const BODY_PARTICLES: ParticleConfig[] = [
   { left: "48%", size: 3, duration: 4100, delay: 700 },
   { left: "76%", size: 2, duration: 3900, delay: 1400 },
 ];
-
-function kgToLb(kg: number): number {
-  return Math.round(kg * 2.20462 * 10) / 10;
-}
 
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
@@ -56,6 +53,7 @@ export function BodyScreen() {
     profile,
     proteinAdherence,
     sourcesSynced,
+    unitPrefs,
     refetch,
   } = useBodyData();
   const [compOpen, setCompOpen] = useState(false);
@@ -63,10 +61,20 @@ export function BodyScreen() {
   const [detail, setDetail] = useState<FlaggedZone | null>(null);
   const [infoOpen, setInfoOpen] = useState(false);
 
+  // This tab stays mounted across navigation, so without this a profile field the coach updates
+  // (e.g. after "Update with your coach" hands off to Global Chat) wouldn't show up here until
+  // the app relaunched — same reasoning as Fuel's identical refetch-on-focus.
+  useFocusEffect(
+    useCallback(() => {
+      refetch();
+    }, [refetch]),
+  );
+
   const dataInRange = composition.slice(-range);
-  const chartValues = dataInRange.map((p) => kgToLb(p.weightKg));
+  const chartValues = dataInRange.map((p) => kgToDisplayWeightValue(p.weightKg, unitPrefs));
   const down = (weekDeltaKg ?? 0) <= 0;
   const latestEntry = composition[composition.length - 1] ?? null;
+  const weekDeltaDisplay = weekDeltaKg !== null ? kgToDisplayWeight(Math.abs(weekDeltaKg), unitPrefs) : null;
 
   const checkin = !hasTrend
     ? {
@@ -79,13 +87,13 @@ export function BodyScreen() {
       ? {
           icon: <MoonIcon size={20} color={CHECKIN_ICON_COLOR} />,
           greeting: "Body check-in",
-          main: `${down ? "Down" : "Up"} ${Math.abs(weekDeltaKg ?? 0)} lb from last week.\n${flaggedZones[0].label} is still flagged — check in with your coach before pushing that area.`,
+          main: `${down ? "Down" : "Up"} ${weekDeltaDisplay} from last week.\n${flaggedZones[0].label} is still flagged — check in with your coach before pushing that area.`,
           sub: `Body composition · updated ${relativeDay(latestEntry!.date)}`,
         }
       : {
           icon: <SunIcon size={20} color={CHECKIN_ICON_COLOR} />,
           greeting: "Body check-in",
-          main: `${down ? "Down" : "Up"} ${Math.abs(weekDeltaKg ?? 0)} lb from last week.\nNothing flagged right now — you're clear to train.`,
+          main: `${down ? "Down" : "Up"} ${weekDeltaDisplay} from last week.\nNothing flagged right now — you're clear to train.`,
           sub: `Body composition · updated ${relativeDay(latestEntry!.date)}`,
         };
 
@@ -130,7 +138,7 @@ export function BodyScreen() {
                 </View>
               </View>
               <Text style={[styles.statusTitle, hasTrend && styles.statusTitleActive]}>
-                {hasTrend ? `${Math.abs(weekDeltaKg ?? 0)} lb ${down ? "down" : "up"}` : "No trend yet"}
+                {hasTrend ? `${weekDeltaDisplay} ${down ? "down" : "up"}` : "No trend yet"}
               </Text>
               <Text style={[styles.statusSub, hasTrend && styles.statusSubActive]}>
                 {hasTrend ? "vs last week" : "Tell your coach your weight to see a weekly trend"}
@@ -140,7 +148,7 @@ export function BodyScreen() {
                 <View style={[styles.statusStatsRow, styles.statusStatsRowActive]}>
                   <View style={styles.statusStat}>
                     <Text style={[styles.statusStatValue, styles.statusStatValueActive]}>
-                      {kgToLb(latestWeightKg!)} lb
+                      {kgToDisplayWeight(latestWeightKg!, unitPrefs)}
                     </Text>
                     <Text style={[styles.statusStatLabel, styles.statusStatLabelActive]}>Current</Text>
                   </View>
@@ -177,7 +185,7 @@ export function BodyScreen() {
                 <Text style={styles.compChipLabel}>No data yet — tell your coach your weight</Text>
               ) : (
                 <>
-                  <Text style={styles.compChipValue}>{kgToLb(latestWeightKg)} lb</Text>
+                  <Text style={styles.compChipValue}>{kgToDisplayWeight(latestWeightKg, unitPrefs)}</Text>
                   {hasTrend && (
                     <View style={styles.compChipTrendRow}>
                       {down ? (
@@ -186,7 +194,7 @@ export function BodyScreen() {
                         <TrendingUpIcon size={13} color="rgba(255,255,255,0.5)" />
                       )}
                       <Text style={[styles.compChipTrend, down ? styles.compChipTrendDown : styles.compChipTrendUp]}>
-                        {Math.abs(weekDeltaKg ?? 0)} lb
+                        {weekDeltaDisplay}
                       </Text>
                     </View>
                   )}
@@ -214,7 +222,7 @@ export function BodyScreen() {
                             <SparklesIcon size={14} color={colors.accent} />
                             <Text style={styles.insightText}>
                               <Text style={styles.insightStrong}>
-                                {down ? "Down" : "Up"} {Math.abs(weekDeltaKg ?? 0)} lb
+                                {down ? "Down" : "Up"} {weekDeltaDisplay}
                               </Text>{" "}
                               this week
                               {proteinAdherence
@@ -303,8 +311,8 @@ export function BodyScreen() {
                 [
                   ["Goal", titleCase(profile.goal)],
                   ["Frequency", profile.daysPerWeek ? `${profile.daysPerWeek}× per week` : "—"],
-                  ["Height", profile.heightCm ? `${profile.heightCm} cm` : "—"],
-                  ["Weight", profile.weightKg ? `${kgToLb(profile.weightKg)} lb` : "—"],
+                  ["Height", profile.heightCm ? cmToDisplayHeight(profile.heightCm, unitPrefs) : "—"],
+                  ["Weight", profile.weightKg ? kgToDisplayWeight(profile.weightKg, unitPrefs) : "—"],
                   ["Injuries", profile.injuriesLabel],
                 ] as const
               ).map(([k, v], i, arr) => (
@@ -313,7 +321,14 @@ export function BodyScreen() {
                   <Text style={styles.profileRowVal}>{v}</Text>
                 </View>
               ))}
-              <Pressable style={styles.updateBtn} onPress={() => navigation.navigate("Home" as never)}>
+              <Pressable
+                style={styles.updateBtn}
+                onPress={() =>
+                  navigation.navigate("GlobalChat", {
+                    autoSendMessage: "I'd like to update something on my profile.",
+                  })
+                }
+              >
                 <Text style={styles.updateBtnText}>Update with your coach</Text>
               </Pressable>
             </View>

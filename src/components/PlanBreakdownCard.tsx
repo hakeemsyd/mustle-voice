@@ -12,8 +12,11 @@ interface PlanBreakdownCardProps {
   variant?: "dark" | "light";
 }
 
+const WEEKDAY_BADGE = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+
 export const PlanBreakdownCard = ({ card, onStartDay, onModify, onOpenPreview, variant = "dark" }: PlanBreakdownCardProps) => {
-  const firstDay = card.days[0];
+  const isPinned = card.schedule_type === "pinned";
+  const firstDay = card.days.find((d) => d.plan_session_id);
   const isLight = variant === "light";
 
   return (
@@ -31,42 +34,56 @@ export const PlanBreakdownCard = ({ card, onStartDay, onModify, onOpenPreview, v
       </View>
 
       <View style={styles.days}>
-        {card.days.map((day, i) => (
-          <Pressable
-            key={day.plan_session_id}
-            style={[styles.dayRow, isLight && styles.dayRowLight]}
-            onPress={onOpenPreview ? () => onOpenPreview(day.plan_session_id) : undefined}
-          >
-            <View style={[styles.dayBadge, isLight && styles.dayBadgeLight]}>
-              <Text style={[styles.dayBadgeText, isLight && styles.dayBadgeTextLight]}>DAY {i + 1}</Text>
-            </View>
-            <View style={[styles.dayIcon, isLight && styles.dayIconLight]}>
-              <DumbbellIcon size={13} color={isLight ? lightCard.text : colors.text} />
-            </View>
-            <View style={styles.flex}>
-              <Text style={[styles.dayFocus, isLight && styles.dayFocusLight]}>{titleCase(day.focus)}</Text>
-              <Text style={[styles.dayExercises, isLight && styles.dayExercisesLight]}>
-                {day.exercises.map(titleCase).join(" · ")}
-              </Text>
-            </View>
-            <ChevronRightIcon
-              size={16}
-              color={isLight ? "rgba(10,10,10,0.35)" : colors.muted}
-            />
-          </Pressable>
-        ))}
+        {card.days.map((day, i) => {
+          const isRest = !day.plan_session_id;
+          const badgeLabel = isPinned && day.weekday !== null ? WEEKDAY_BADGE[day.weekday] : `DAY ${i + 1}`;
+          return (
+            <Pressable
+              key={day.plan_session_id ?? `rest-${day.weekday ?? i}`}
+              style={[styles.dayRow, isLight && styles.dayRowLight, isRest && styles.dayRowRest]}
+              onPress={!isRest && onOpenPreview ? () => onOpenPreview(day.plan_session_id!) : undefined}
+            >
+              <View style={[styles.dayBadge, isLight && styles.dayBadgeLight]}>
+                <Text style={[styles.dayBadgeText, isLight && styles.dayBadgeTextLight]}>{badgeLabel}</Text>
+              </View>
+              {!isRest && (
+                <View style={[styles.dayIcon, isLight && styles.dayIconLight]}>
+                  <DumbbellIcon size={13} color={isLight ? lightCard.text : colors.text} />
+                </View>
+              )}
+              <View style={styles.flex}>
+                <Text style={[styles.dayFocus, isLight && styles.dayFocusLight, isRest && styles.dayFocusRest]}>
+                  {isRest ? "Rest Day" : titleCase(day.focus)}
+                </Text>
+                {!isRest && (
+                  <Text style={[styles.dayExercises, isLight && styles.dayExercisesLight]}>
+                    {day.exercises.map(titleCase).join(" · ")}
+                  </Text>
+                )}
+              </View>
+              {!isRest && (
+                <ChevronRightIcon
+                  size={16}
+                  color={isLight ? "rgba(10,10,10,0.35)" : colors.muted}
+                />
+              )}
+            </Pressable>
+          );
+        })}
       </View>
 
       <View style={[styles.adaptNote, isLight && styles.adaptNoteLight]}>
         <Text style={[styles.adaptNoteText, isLight && styles.adaptNoteTextLight]}>
-          Rest days aren't shown here — recovery stays built into the week, and the plan adjusts
-          automatically based on how you're feeling.
+          {isPinned
+            ? "MUSTLE adjusts your sets, reps, and load automatically based on how you're feeling."
+            : "This rotation repeats and isn't tied to specific weekdays — which day you land on " +
+              "depends on when you actually train, and MUSTLE adjusts load and reps as you go."}
         </Text>
       </View>
 
       <View style={styles.actions}>
         {firstDay && (
-          <Pressable style={styles.primaryBtn} onPress={() => onStartDay(firstDay.plan_session_id)}>
+          <Pressable style={styles.primaryBtn} onPress={() => onStartDay(firstDay.plan_session_id!)}>
             <Text style={styles.primaryBtnText} numberOfLines={1}>START DAY 1</Text>
           </Pressable>
         )}
@@ -150,6 +167,9 @@ const styles = StyleSheet.create({
     backgroundColor: lightCard.surface,
     borderColor: lightCard.border,
   },
+  dayRowRest: {
+    opacity: 0.55,
+  },
   dayBadge: {
     borderWidth: 1,
     borderColor: colors.accentBorder,
@@ -191,6 +211,10 @@ const styles = StyleSheet.create({
   },
   dayFocusLight: {
     color: lightCard.text,
+  },
+  dayFocusRest: {
+    fontFamily: fonts.body,
+    color: colors.muted,
   },
   dayExercises: {
     fontFamily: fonts.body,

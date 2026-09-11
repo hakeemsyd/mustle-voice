@@ -308,10 +308,7 @@ const styles = StyleSheet.create({
     fontSize: 14,
     letterSpacing: 1,
     color: "rgba(255,255,255,0.35)",
-    marginBottom: 8,
-    position: "absolute",
-    top: 38,
-    zIndex: 10000,
+    marginBottom: 12,
   },
   heightWheels: {
     flexDirection: "row",

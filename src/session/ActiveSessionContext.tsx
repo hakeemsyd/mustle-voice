@@ -7,18 +7,22 @@ import React, {
   useRef,
   useState,
 } from "react";
+import * as Crypto from "expo-crypto";
 import { supabase } from "../lib/supabase";
 import { callBrain, COACH_UNREACHABLE_MESSAGE } from "../lib/brain";
 import { DEFAULT_REST_SEC, suggestRestSeconds, type RestSuggestionReason } from "../lib/restSuggestion";
 import { useProfileName } from "../hooks/useProfileName";
 import { buildLiveSessionSnapshot, describeLiveSessionSnapshot } from "./liveSessionState";
 
-// Module-level, not a ref — confirmed live: two messages landed with the exact same generated id
-// ("<same millisecond>-13"), which a per-instance useRef(0) counter can only produce if two
-// provider instances briefly existed at once (a remount overlap) and both happened to be on
-// their 13th message. A counter that lives here, at module scope, never resets for as long as the
-// JS process is alive, so no two instances — overlapping or not — can ever draw the same value.
-let globalMessageCounter = 0;
+// Previously a module-level counter combined with Date.now() — confirmed live: two messages
+// landed with the exact same generated id ("<same millisecond>-13"). Module scope fixed the
+// specific case that caused (two provider instances briefly existing at once, both on their 13th
+// message), but confirmed live AGAIN later: it doesn't survive Metro Fast Refresh resetting
+// module-level `let` state mid-session while React preserves the provider's own hook state across
+// the same refresh — the counter restarts at 0 while old messages with low counter values are
+// still mounted, and a new message can land on an id one of them already has. A real UUID has no
+// state to reset in the first place, so there's nothing left for any refresh/remount scenario to
+// collide on.
 
 const EXTEND_REST_SEC = 10;
 // How long an identical set report is treated as a repeat of the one just logged rather than a
@@ -174,9 +178,17 @@ interface ActiveSessionValue {
   messages: SessionThreadMessage[];
   appendMessage: (role: "coach" | "user", text: string) => void;
   elapsedSec: number;
+  /** When the current session was started, ISO. Written into live_session_state so brain-voice can
+   *  scope replayed conversation to THIS workout — without it the coach reads the previous
+   *  session's turns as if they were still in progress and carries its set count over. */
+  startedAt: string | null;
   paused: boolean;
   minimized: boolean;
-  start: (target: SessionTarget, resumeExercisesDone?: ResumeExerciseEntry[]) => void;
+  start: (
+    target: SessionTarget,
+    resumeExercisesDone?: ResumeExerciseEntry[],
+    preloaded?: { focus: string | null; exercises: SessionExercise[] },
+  ) => void;
   minimize: () => void;
   restore: () => void;
   logSet: (weight: number | null, reps: number, unit?: 'seconds') => void;
@@ -237,6 +249,7 @@ export function ActiveSessionProvider({
   const [coachThinking, setCoachThinking] = useState(false);
   const [messages, setMessages] = useState<SessionThreadMessage[]>([]);
   const [elapsedSec, setElapsedSec] = useState(0);
+  const [startedAt, setStartedAt] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
   const [minimized, setMinimized] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
@@ -245,6 +258,15 @@ export function ActiveSessionProvider({
   const userIdRef = useRef<string | null>(null);
   const logIdRef = useRef<string | null>(null);
   const resumeDataRef = useRef<ResumeExerciseEntry[] | null>(null);
+  // Set inside start() to the exact `target` object it just passed to setTarget when the caller
+  // (Preview, which already loaded and displayed this exact plan_session's exercises for the user
+  // to review) hands the same data straight through — the fetch effect below checks this by
+  // reference to skip its own redundant plan_session/plan_exercise query for that target.
+  // Confirmed live: without this, every "Start Session" tap re-fetched data Preview had already
+  // fetched seconds earlier, adding a real network round trip before the greet cue's own guard
+  // (which needs a real currentExercise) could even fire — a measurable chunk of a reported
+  // 10-15s gap between landing on Active Session and hearing anything.
+  const preloadedTargetRef = useRef<SessionTarget | null>(null);
   // Latest writeWorkoutLog, kept current every render (assigned right after its own declaration
   // below) — lets start() call it before resetting state without needing writeWorkoutLog defined
   // earlier in this file, and without start()'s own identity needing to depend on it.
@@ -265,7 +287,11 @@ export function ActiveSessionProvider({
   const lastSetSnapshotRef = useRef<LastSetSnapshot | null>(null);
 
   const start = useCallback(
-    (next: SessionTarget, resumeExercisesDone?: ResumeExerciseEntry[]) => {
+    (
+      next: SessionTarget,
+      resumeExercisesDone?: ResumeExerciseEntry[],
+      preloaded?: { focus: string | null; exercises: SessionExercise[] },
+    ) => {
       // Persist whatever was in progress before resetting — the outgoing session's own
       // exercises/target/elapsedSec are still what writeWorkoutLogRef's current closure holds
       // at this point, since state hasn't reset yet.
@@ -277,12 +303,21 @@ export function ActiveSessionProvider({
       lastSetSnapshotRef.current = null;
       resumeDataRef.current = resumeExercisesDone ?? null;
       setTarget(next);
-      setLoading(next.type === "strength");
       setError(null);
-      setFocus(next.type === "cardio" ? next.activity : null);
-      setExercises([]);
+      // Resuming deliberately forfeits the preload fast-path: resumeDataRef is only ever consumed
+      // by the fetch effect below, which the preload skips, so a resumed session would silently
+      // come back with none of its already-completed sets.
+      const canUsePreload = !!preloaded && next.type === "strength" && !resumeExercisesDone;
+      preloadedTargetRef.current = canUsePreload ? next : null;
+      setLoading(next.type === "strength" && !canUsePreload);
+      setFocus(next.type === "cardio" ? next.activity : canUsePreload ? preloaded!.focus : null);
+      setExercises(canUsePreload ? preloaded!.exercises : []);
       setCurrentExerciseIndex(0);
-      setLoggedSets([]);
+      // One slot per exercise, matching what the fetch effect does — logSet indexes straight into
+      // this by exercise index, and on the preload path that effect returns early and never sizes
+      // it. Left empty, logSet spread `undefined` and threw before recording anything: no set
+      // logged, no rest timer, the card stuck on set 1 while the coach carried on as if it had.
+      setLoggedSets(canUsePreload ? preloaded!.exercises.map(() => []) : []);
       setResting(false);
       setRestTargetSec(DEFAULT_REST_SEC);
       setRestEndAt(null);
@@ -293,6 +328,7 @@ export function ActiveSessionProvider({
       setCoachMessage("Ready when you are.");
       setMessages([]);
       setElapsedSec(0);
+      setStartedAt(new Date().toISOString());
       setPaused(false);
       setMinimized(false);
       logIdRef.current = null;
@@ -306,8 +342,7 @@ export function ActiveSessionProvider({
 
   const appendMessage = useCallback((role: "coach" | "user", text: string) => {
     if (!text.trim()) return;
-    globalMessageCounter += 1;
-    setMessages((prev) => [...prev, { id: `${Date.now()}-${globalMessageCounter}`, role, text }]);
+    setMessages((prev) => [...prev, { id: Crypto.randomUUID(), role, text }]);
   }, []);
 
   // Resolved once, independent of any running session: the voice agent needs the user's id
@@ -346,6 +381,7 @@ export function ActiveSessionProvider({
     setExercises([]);
     setLoggedSets([]);
     setElapsedSec(0);
+    setStartedAt(null);
     setMinimized(false);
     setResting(false);
     setRestEndAt(null);
@@ -369,6 +405,9 @@ export function ActiveSessionProvider({
       userIdRef.current = session?.user.id ?? null;
 
       if (!target || target.type !== "strength") return;
+      // start() already populated exercises/focus for this exact target from Preview's own data
+      // — skip re-fetching what was just fetched and shown to the user seconds ago.
+      if (preloadedTargetRef.current === target) return;
       if (!userIdRef.current) {
         if (!cancelled) {
           setError("Not signed in");
@@ -453,6 +492,10 @@ export function ActiveSessionProvider({
           load: s.every((set) => set.weight == null)
             ? "bodyweight"
             : s.map((set) => set.weight ?? "-").join(","),
+          // Every set here came from a real logSet call in this running session — never a
+          // conversational report — so it's always "tracked live," even for a run that later
+          // gets reconciled after an interruption (see resolve_interrupted_workout server-side).
+          tracked: "live" as const,
         }));
 
       if (!isCardio && exercisesDone.length === 0) return;
@@ -547,7 +590,7 @@ export function ActiveSessionProvider({
 
       const next = loggedSets.map((sets) => sets.slice());
       next[currentExerciseIndex] = [
-        ...next[currentExerciseIndex],
+        ...(next[currentExerciseIndex] ?? []),
         { weight, reps, unit },
       ];
       setLoggedSets(next);
@@ -868,6 +911,7 @@ export function ActiveSessionProvider({
       messages,
       appendMessage,
       elapsedSec,
+      startedAt,
       paused,
       minimized,
       start,
@@ -918,6 +962,7 @@ export function ActiveSessionProvider({
       messages,
       appendMessage,
       elapsedSec,
+      startedAt,
       paused,
       minimized,
       start,

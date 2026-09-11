@@ -45,6 +45,17 @@ export function SessionReportScreen({ route, navigation }: Props) {
       <View style={styles.header}>
         <View style={styles.headerEyebrowRow}>
           <Text style={styles.headerEyebrow}>SESSION REPORT</Text>
+          {report && (
+            <View style={styles.sourceTag}>
+              <Text style={styles.sourceTagText}>
+                {report.status === "interrupted"
+                  ? "NEEDS REVIEW"
+                  : report.source === "independent"
+                    ? "COMPLETED INDEPENDENTLY"
+                    : "LOGGED WITH MUSTLE"}
+              </Text>
+            </View>
+          )}
           {report?.isPartial && (
             <View style={styles.partialTag}>
               <Text style={styles.partialTagText}>PARTIAL SESSION</Text>
@@ -149,6 +160,7 @@ export function SessionReportScreen({ route, navigation }: Props) {
                     <View key={`${row.exerciseName}-${row.setNumber}-${i}`} style={styles.tableRow}>
                       <Text style={[styles.tableCell, styles.colExercise]} numberOfLines={1}>
                         {row.exerciseName}
+                        {row.tracked === "reported" && <Text style={styles.reportedMark}> · reported</Text>}
                       </Text>
                       <Text style={[styles.tableCell, styles.colSet, styles.tableCellMuted]}>{row.setNumber}</Text>
                       <Text style={[styles.tableCell, styles.colValue]}>{row.weight !== null ? `${row.weight} kg` : "—"}</Text>
@@ -156,6 +168,11 @@ export function SessionReportScreen({ route, navigation }: Props) {
                     </View>
                   ))}
                 </View>
+                {report.setLog.some((row) => row.tracked === "reported") && (
+                  <Text style={styles.reportedFootnote}>
+                    "Reported" sets were told to your coach afterward, not tracked live during the session.
+                  </Text>
+                )}
               </Section>
             )}
 
@@ -359,6 +376,20 @@ const styles = StyleSheet.create({
     letterSpacing: 0.72,
     color: colors.text,
   },
+  sourceTag: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 20,
+    backgroundColor: colors.accentDim,
+    borderWidth: 1,
+    borderColor: colors.accentBorder,
+  },
+  sourceTagText: {
+    fontFamily: fonts.monoBold,
+    fontSize: 9,
+    letterSpacing: 0.72,
+    color: colors.accent,
+  },
   closeBtn: {
     width: 34,
     height: 34,
@@ -472,6 +503,17 @@ const styles = StyleSheet.create({
   },
   tableCell: { fontFamily: fonts.body, fontSize: 12.5, color: colors.text },
   tableCellMuted: { color: colors.muted },
+  reportedMark: {
+    fontFamily: fonts.body,
+    fontSize: 11,
+    color: colors.muted,
+  },
+  reportedFootnote: {
+    fontFamily: fonts.body,
+    fontSize: 11,
+    color: colors.muted,
+    marginTop: 8,
+  },
   colExercise: { flex: 1.6 },
   colSet: { flex: 0.6 },
   colValue: { flex: 0.8 },

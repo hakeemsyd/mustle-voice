@@ -11,8 +11,11 @@ export interface WorkoutLogRow {
   status?: string | null;
 }
 
+// An 'interrupted' session (abandoned mid-workout, awaiting the coach's reconciliation ask) is
+// just as unresolved as a 'partial' one — neither should advance a flexible rotation or count as
+// "done today" until it's actually been resolved.
 function isPartial(log: WorkoutLogRow): boolean {
-  return log.status === 'partial';
+  return log.status === 'partial' || log.status === 'interrupted';
 }
 
 function sameLocalDay(a: Date, b: Date): boolean {

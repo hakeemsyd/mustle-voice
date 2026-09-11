@@ -25,7 +25,7 @@ export const GlobalChatScreen = ({ route, navigation }: Props) => {
   const insets = useScreenInsets();
   const session = useActiveSessionContext();
   const userId = session.userId;
-  const { transcript, coachTyping, sendMessage, appendLocal, loadMessageContext, attachImage, attachFile } =
+  const { transcript, coachTyping, loaded, sendMessage, appendLocal, loadMessageContext, attachImage, attachFile } =
     useHomeChat(userId);
   const {
     orbState, isActive, toggle, connect, release, status: voiceStatus, reconnecting,
@@ -74,6 +74,19 @@ export const GlobalChatScreen = ({ route, navigation }: Props) => {
       setTimeout(() => transcriptRef.current?.scrollToMessageId(target), 150);
     })();
   }, [route.params?.jumpToMessageId, loadMessageContext]);
+
+  // "Update with your coach" (Body/Profile) and similar entry points hand off straight into a
+  // real turn instead of just opening an empty composer — feels like tapping a quick-prompt chip
+  // that was already typed for you. Gated on `loaded` so this can't race the history fetch and
+  // fire before the transcript (and today's day-boundary reset) has settled; the ref stops a
+  // re-focus or param identity change from sending it twice.
+  const autoSentRef = useRef(false);
+  useEffect(() => {
+    const message = route.params?.autoSendMessage;
+    if (!message || autoSentRef.current || !loaded) return;
+    autoSentRef.current = true;
+    void sendMessage(message);
+  }, [route.params?.autoSendMessage, loaded, sendMessage]);
 
   const handleSend = () => {
     const text = draft.trim();

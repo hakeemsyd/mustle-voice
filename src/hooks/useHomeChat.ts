@@ -31,11 +31,19 @@ export function useHomeChat(userId: string | null) {
       // the OLDEST 50 messages ever (a real, unrelated correctness bug found while touching this
       // file for History's tap-to-jump: a long-running account's Home chat only ever showed its
       // very first exchanges, never anything recent).
+      //
+      // Bounded to today's local calendar day so Global Chat starts fresh each day instead of
+      // reopening onto yesterday's tail — older conversations are still there in History, this
+      // only changes what's shown by default on open. The server applies the same day boundary
+      // (see brain/index.ts) so the model's own reply doesn't awkwardly continue a stale thread.
+      const startOfDay = new Date();
+      startOfDay.setHours(0, 0, 0, 0);
       const { data, error } = await supabase
         .from('message')
         .select('id,role,content,card,attachment_url,at')
         .eq('user_id', userId)
         .eq('hidden', false)
+        .gte('at', startOfDay.toISOString())
         .order('at', { ascending: false })
         .limit(50);
       if (cancelled) return;

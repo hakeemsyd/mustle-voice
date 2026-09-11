@@ -20,7 +20,8 @@
       "usesAppleSignIn": true,
       "infoPlist": {
         "NSMicrophoneUsageDescription": "Mustle needs microphone access to hear your voice coaching requests.",
-        "NSPhotoLibraryUsageDescription": "Mustle uses your photo library to let you show your coach a photo — of a meal, your form, or your progress."
+        "NSPhotoLibraryUsageDescription": "Mustle uses your photo library to let you show your coach a photo — of a meal, your form, or your progress.",
+        "UIBackgroundModes": ["audio"]
       }
     },
     "android": {

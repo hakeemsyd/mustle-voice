@@ -17,9 +17,28 @@ const sanitizeForSpeech = (text: string): string => text.replace(/[—–]/g, ',
 // (e.g. "[clicking]", "(background noise)") instead of returning empty — strip those out so
 // they never get used as real answer text, and treat what's left as no answer if nothing
 // alphabetic survives.
+//
+// It also sometimes hands back the same kind of placeholder unbracketed — a bare "Silence."
+// with no brackets at all, which the regex above has nothing to strip and which then reads as
+// real speech (confirmed live: the agent said the word "silence" back to the user). Caught here
+// by treating the whole utterance as empty when, once cleaned, it's nothing but one of these
+// known placeholders — real speech that happens to mention "silence" mid-sentence is untouched
+// since this only matches the *entire* cleaned utterance, not a substring.
+const NON_SPEECH_PLACEHOLDER_WORDS = new Set([
+  'silence',
+  'background noise',
+  'noise',
+  'inaudible',
+  'static',
+  'no speech detected',
+]);
+
 export const stripNonSpeechArtifacts = (text: string): string => {
   const cleaned = text.replace(/[[(][^\])]*[\])]/g, '').replace(/\s+/g, ' ').trim();
-  return /[a-zA-Z]/.test(cleaned) ? cleaned : '';
+  if (!/[a-zA-Z]/.test(cleaned)) return '';
+  const bare = cleaned.toLowerCase().replace(/[.!?,]+$/, '').trim();
+  if (NON_SPEECH_PLACEHOLDER_WORDS.has(bare)) return '';
+  return cleaned;
 };
 
 const fetchSpeechAudio = async (text: string): Promise<string> => {

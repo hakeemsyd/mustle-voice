@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { supabase } from "../lib/supabase";
 import { resolveInjuryZone } from "../lib/injuryZones";
 import { localDateKey } from "../lib/calendarDate";
+import type { Units } from "../lib/units";
 import type { FlaggedZone } from "../components/BodyZoneMap";
 
 export interface WeightPoint {
@@ -32,6 +33,7 @@ export interface BodyData {
   profile: BodyProfile;
   proteinAdherence: ProteinAdherence | null;
   sourcesSynced: number;
+  unitPrefs: Units;
   refetch: () => void;
 }
 
@@ -53,6 +55,7 @@ export function useBodyData(): BodyData {
     profile: { goal: null, daysPerWeek: null, heightCm: null, weightKg: null, injuriesLabel: "None" },
     proteinAdherence: null,
     sourcesSynced: 0,
+    unitPrefs: "metric",
   });
   const [refetchSignal, setRefetchSignal] = useState(0);
   const refetch = useCallback(() => setRefetchSignal((n) => n + 1), []);
@@ -75,7 +78,7 @@ export function useBodyData(): BodyData {
       const sevenDaysAgo = new Date();
       sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
-      const [biometricsRes, goalRes, planRes, weightRes, injuryRes, nutritionRes, foodRes] = await Promise.all([
+      const [biometricsRes, goalRes, planRes, weightRes, injuryRes, nutritionRes, foodRes, profileRes] = await Promise.all([
         settled(supabase.from("biometrics").select("height_cm").eq("user_id", userId).maybeSingle()),
         settled(supabase.from("goal").select("objective").eq("user_id", userId).maybeSingle()),
         settled(
@@ -100,6 +103,7 @@ export function useBodyData(): BodyData {
             .eq("user_id", userId)
             .gte("at", sevenDaysAgo.toISOString()),
         ),
+        settled(supabase.from("profile").select("unit_prefs").eq("user_id", userId).maybeSingle()),
       ]);
       if (cancelled) return;
 
@@ -160,6 +164,7 @@ export function useBodyData(): BodyData {
           injuriesLabel: flaggedZones.length === 0 ? "None" : flaggedZones.map((z) => z.label).join(", "),
         },
         proteinAdherence,
+        unitPrefs: profileRes.data?.unit_prefs === "imperial" ? "imperial" : "metric",
         sourcesSynced: latest ? 1 : 0,
       });
     })();

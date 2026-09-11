@@ -2,7 +2,7 @@ import { createClient } from 'npm:@supabase/supabase-js@2';
 import { runBrainTurn } from '../_shared/brain-orchestrator.ts';
 import { replayHistory } from '../_shared/replay-history.ts';
 import { buildSystemPrompt, callModel, MESSAGE_HISTORY_LIMIT } from '../_shared/brain-config.ts';
-import { buildContextBlock } from '../_shared/brain-context.ts';
+import { buildContextBlock, startOfLocalDayUtc } from '../_shared/brain-context.ts';
 import { createHandlers } from '../_shared/brain-handlers.ts';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
@@ -29,11 +29,20 @@ Deno.serve(async (req) => {
     const handlers = createHandlers(supabase, userId, timezone);
 
     const askedAt = new Date();
+    // Global Chat is a continuous scrollback with no session boundary of its own, so without a
+    // cutoff the model (and, client-side, the visible transcript) would keep replaying whatever
+    // was last said — even from days ago — as if it were still the same conversation. Damion
+    // reported opening the app on a new day and finding "yesterday's conversation" still current.
+    // Bounding history to the user's own local calendar day gives each day a fresh conversation
+    // the same way a new voice call already gets one (see brain-voice's isFirstTurnOfCall) —
+    // factual memory (plan, logs, nutrition) is untouched, since that comes from buildContextBlock
+    // reading the database directly, never from this replayed turn history.
     const [{ data: history, error: historyError }, contextBlock] = await Promise.all([
       supabase
         .from('message')
         .select('role,content,blocks')
         .eq('user_id', userId)
+        .gte('at', startOfLocalDayUtc(timezone).toISOString())
         .order('at', { ascending: false })
         .order('role', { ascending: true })
         .limit(MESSAGE_HISTORY_LIMIT),

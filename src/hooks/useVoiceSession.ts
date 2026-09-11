@@ -1,6 +1,6 @@
 import { useConversation } from '@elevenlabs/react-native';
+import { AudioSession } from '@livekit/react-native';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AppState } from 'react-native';
 import { setAudioModeAsync } from 'expo-audio';
 import { subscribeToAudioInterruptions } from '../../modules/mustle-audio-session';
 import { supabase } from '../lib/supabase';
@@ -26,6 +26,12 @@ export interface VoiceSessionConfig {
 }
 
 const MAX_AUTO_RECONNECTS = 1;
+
+/** Marks a turn the app injected to make the coach speak (greeting, rest countdown), rather than
+ *  something the user said. It goes out through sendUserMessage — the only call that makes the
+ *  agent actually reply — so it comes back as a user turn and has to be told apart from real
+ *  speech on the way in. brain-voice rewrites it server-side (see _shared/system-cue.ts). */
+export const SYSTEM_CUE_PREFIX = '[[SYSTEM_CUE]]';
 
 // A handful of short, deliberate stop phrases — matched as a WHOLE clause, never as a
 // substring anywhere in a longer sentence. "Done" is deliberately excluded: mid-workout it
@@ -98,7 +104,7 @@ export function useVoiceSession(
   const configRef = useRef(config);
   configRef.current = config;
   const lastUserActivityRef = useRef(Date.now());
-  const endedByBackgroundRef = useRef(false);
+  const wasMutedRef = useRef(false);
 
   const {
     startSession,
@@ -125,7 +131,12 @@ export function useVoiceSession(
       const cleaned = stripNonSpeechArtifacts(message);
       if (!cleaned) return;
       if (role === 'user') {
-        lastUserActivityRef.current = Date.now();
+        // A system cue is the app prompting the coach, not the user speaking — it just arrives as
+        // a user turn because sendUserMessage is the only call that makes the agent reply. Letting
+        // it through here let the app reset its own idle timeout: rest check-ins reschedule
+        // themselves, so a rest period nobody responded to could hold the call open indefinitely
+        // with the dock stuck on LISTENING, exactly the case SILENCE_TIMEOUT_MS exists to catch.
+        if (!cleaned.startsWith(SYSTEM_CUE_PREFIX)) lastUserActivityRef.current = Date.now();
         if (isStopCommand(cleaned)) {
           intentionalEndRef.current = true;
           Promise.resolve(endSession())
@@ -188,7 +199,12 @@ export function useVoiceSession(
     } catch (err) {
       console.warn('[voice] failed to enable recording audio mode:', err);
     }
-    return startSession(options);
+    // Deliberately not awaited: the SDK types startSession as `=> void` and its implementation is
+    // fire-and-forget (failures surface through onError, not a rejected promise). Awaiting it
+    // resolved on the very next microtask, which made anything sequenced "after the connection is
+    // up" actually run during the SDK's own audio setup — see the voiceChat note in the
+    // status-connected effect below.
+    startSession(options);
   };
 
   useEffect(() => {
@@ -218,6 +234,15 @@ export function useVoiceSession(
       // up permanently, since the counter only ever incremented across the screen's lifetime.
       reconnectAttemptsRef.current = 0;
       lastUserActivityRef.current = Date.now();
+      // ElevenLabs' RN setup configures LiveKit with `defaultOutput: 'speaker'`, which native-side
+      // picks Apple's `.videoChat` audio mode — tuned for FaceTime-style calls, not phone-call-grade
+      // noise suppression. `.voiceChat` is the more aggressive AEC/noise-suppression profile a
+      // VoIP-style app wants. Applied on `connected` rather than right after startSession(), which
+      // returns before the SDK has configured anything: mutating the audio session mid-setup, while
+      // WebRTC was still bringing up its capture unit, is what left the mic open but deaf.
+      AudioSession.setAppleAudioConfiguration({ audioMode: 'voiceChat' }).catch((err) =>
+        console.warn('[voice] failed to set voiceChat audio mode:', err),
+      );
     }
   }, [status]);
 
@@ -225,6 +250,21 @@ export function useVoiceSession(
   // been talking — see the SILENCE_TIMEOUT_MS comment above for why only user speech resets it.
   useEffect(() => {
     if (status !== 'connected') return;
+    // Muting is a deliberate "I'm here, just don't listen right now", not absence — but it also
+    // stops every user transcript, the only thing that resets the timer. Left running, mute
+    // guaranteed a timeout kill after 60s, and because toggleMute is a no-op unless the status is
+    // `connected`, the mute button then had no way back: the call was gone and the control inert.
+    if (isMuted) {
+      wasMutedRef.current = true;
+      return;
+    }
+    // Unmuting counts as activity in its own right: the paused timer is otherwise still holding
+    // whenever they last spoke before muting, which is past the limit for any mute worth the name,
+    // so the very first tick after coming back would close the call instead of resuming it.
+    if (wasMutedRef.current) {
+      wasMutedRef.current = false;
+      lastUserActivityRef.current = Date.now();
+    }
     const id = setInterval(() => {
       if (Date.now() - lastUserActivityRef.current < SILENCE_TIMEOUT_MS) return;
       intentionalEndRef.current = true;
@@ -234,47 +274,44 @@ export function useVoiceSession(
         .catch((err) => console.error('[voice] failed to end session on silence timeout:', err));
     }, SILENCE_CHECK_INTERVAL_MS);
     return () => clearInterval(id);
-  }, [status, endSession]);
+  }, [status, endSession, isMuted]);
 
-  // A call answered, or the app backgrounded for any other reason, must not leave the mic/voice
-  // session silently running — confirmed live: an incoming call didn't pause or stop the coach.
-  // `background` (not `inactive`, which also fires for transient UI like Control Center) is the
-  // only state that reliably means the user actually left the app.
+  // Simply backgrounding the app (switching apps, locking the phone, checking a notification)
+  // must NOT end the call — the app declares the `audio` UIBackgroundMode specifically so a
+  // workout conversation can keep running while the screen is off or another app is briefly in
+  // front. Only a genuine interruption — a phone call, Siri, an alarm, competing music/video —
+  // actually seizes the audio session, and that's covered below by the real iOS notification, not
+  // by watching AppState. The silence-timeout effect above is still the backstop for "walked away
+  // and never came back."
+  //
+  // A call banner answered without switching apps, Siri, or an alarm seizes the audio session
+  // while Mustle stays foregrounded — none of those fire an AppState change either. This listens
+  // for the actual iOS audio-session interruption directly (see modules/mustle-audio-session) so
+  // every real interruption ends the call, instead of leaving the mic silently open through
+  // someone else's phone call.
+  const endedByInterruptionRef = useRef(false);
   useEffect(() => {
-    const sub = AppState.addEventListener('change', (next) => {
-      if (next === 'background') {
+    return subscribeToAudioInterruptions(
+      () => {
         if (status !== 'connected' && status !== 'connecting') return;
-        // Remembered so returning to the app can pick the call back up. Backgrounding still has
-        // to end it — iOS won't keep the mic open for us — but a user who locks their phone or
-        // steps out to change music mid-workout should not have to find and tap the mic again.
-        endedByBackgroundRef.current = true;
         intentionalEndRef.current = true;
+        endedByInterruptionRef.current = true;
         Promise.resolve(endSession())
           .then(() => setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }))
-          .catch((err) => console.error('[voice] failed to end session on backgrounding:', err));
-        return;
-      }
-      if (next === 'active' && endedByBackgroundRef.current) {
-        endedByBackgroundRef.current = false;
-        connectRef.current();
-      }
-    });
-    return () => sub.remove();
-  }, [status, endSession]);
-
-  // Backgrounding alone doesn't cover every interruption — a call banner answered without
-  // switching apps, Siri, or an alarm can seize the audio session while Mustle stays foregrounded,
-  // and none of those fire an AppState change. This listens for the actual iOS audio-session
-  // interruption directly (see modules/mustle-audio-session) so those cases end the call too,
-  // instead of leaving the mic silently open through someone else's phone call.
-  useEffect(() => {
-    return subscribeToAudioInterruptions(() => {
-      if (status !== 'connected' && status !== 'connecting') return;
-      intentionalEndRef.current = true;
-      Promise.resolve(endSession())
-        .then(() => setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }))
-        .catch((err) => console.error('[voice] failed to end session on audio interruption:', err));
-    });
+          .catch((err) => console.error('[voice] failed to end session on audio interruption:', err));
+      },
+      // Only resumes a call this listener itself closed, so a plain "ended" with nothing to
+      // restore (an interruption that arrived while voice was already off) never dials out
+      // unprompted. Nothing else reopens the mic mid-workout — the screen stays focused
+      // throughout, so its focus effect never re-fires — so without this the coach stays deaf for
+      // the rest of the session after a single phone call.
+      () => {
+        if (!endedByInterruptionRef.current) return;
+        endedByInterruptionRef.current = false;
+        setReconnecting(true);
+        setReconnectTrigger((n) => n + 1);
+      },
+    );
   }, [status, endSession]);
 
   // Real ASR interim transcripts aren't available on this SDK's Conversational-AI/WebRTC path

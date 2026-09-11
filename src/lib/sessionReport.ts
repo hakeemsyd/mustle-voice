@@ -3,12 +3,16 @@ export interface LoggedExercise {
   sets: number;
   reps: string;
   load: string;
+  /** Absent on rows written before this field existed — treated as "live" there, since every
+   *  workout_log write used to only ever come from the real in-app session. */
+  tracked?: "live" | "reported";
 }
 
 export interface WorkoutLogRecord {
   id: string;
   at: string;
   status: string | null;
+  source: string | null;
   session_type: string | null;
   cardio_activity: string | null;
   duration_sec: number | null;
@@ -37,6 +41,7 @@ export interface SetLogRow {
   setNumber: number;
   weight: number | null;
   reps: number | null;
+  tracked: "live" | "reported";
 }
 
 export interface ScoreComponent {
@@ -64,6 +69,7 @@ export interface SessionReport {
   title: string;
   isCardio: boolean;
   status: string;
+  source: "mustle" | "independent";
   isPartial: boolean;
   dateLabel: string;
   timeLabel: string;
@@ -118,6 +124,7 @@ export function buildSetLog(exercises: LoggedExercise[]): SetLogRow[] {
         setNumber: i + 1,
         weight: weights[i] ?? null,
         reps: reps[i] ?? null,
+        tracked: exercise.tracked ?? "live",
       });
     }
   }
@@ -312,6 +319,7 @@ export function buildSessionReport(
     title,
     isCardio,
     status: log.status ?? 'completed',
+    source: log.source === 'independent' ? 'independent' : 'mustle',
     isPartial: log.status === 'partial',
     dateLabel: formatDateLabel(at),
     timeLabel: formatTimeLabel(at),
@@ -330,7 +338,10 @@ export function buildSessionReport(
     nutrition,
     debrief: buildDebrief(
       isCardio,
-      log.status === 'partial',
+      // An 'interrupted' session hasn't been reconciled yet — the debrief must not claim full
+      // completion for it, same as a genuinely partial one, even though its own header badge
+      // shows "Needs Review" rather than "Partial Session".
+      log.status === 'partial' || log.status === 'interrupted',
       title,
       totalSets,
       targetSets,

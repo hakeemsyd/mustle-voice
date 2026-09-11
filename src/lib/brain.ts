@@ -7,9 +7,14 @@ export interface PlanBreakdownCard {
   type: 'plan_breakdown';
   split: string;
   days_per_week: number;
+  /** 'pinned' plans get a full 7-day week (days.length === 7, Sun-Sat order, rest days included
+   *  as plan_session_id: null); 'flexible' plans have no fixed weekday, so days are the rotation
+   *  in day_order — no synthetic rest rows since there's no fixed day to hang one on. */
+  schedule_type: 'pinned' | 'flexible';
   days: {
-    plan_session_id: string;
+    plan_session_id: string | null;
     day_order: number;
+    weekday: number | null;
     focus: string;
     exercises: string[];
   }[];
@@ -32,7 +37,9 @@ export interface NutritionSummaryCard {
   type: 'nutrition_summary';
   calories_left: number;
   calories_target: number;
-  macros: { label: string; target: number; unit: string }[];
+  /** `current` is a real sum of today's food_log rows — the same records the Fuel screen reads,
+   *  never estimated from the calories-consumed ratio. */
+  macros: { label: string; target: number; current: number; unit: string }[];
   insight: string;
 }
 

@@ -202,7 +202,18 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
     const pending = pendingTargetRef.current;
     pendingTargetRef.current = null;
     if (!pending) return;
-    session.start(pending.target, pending.resume && lastTime ? lastTime.exercises : undefined);
+    // Only for this preview's own session, unswapped — a switched-to alternate or cardio target
+    // has different real exercises than what `exercises`/`focus` above loaded for planSessionId,
+    // so those still go through Active Session's own fetch rather than being handed stale data.
+    const isThisSession =
+      pending.target.type === "strength" &&
+      pending.target.planSessionId === planSessionId &&
+      !pending.target.switchedFromSessionId;
+    session.start(
+      pending.target,
+      pending.resume && lastTime ? lastTime.exercises : undefined,
+      isThisSession ? { focus, exercises } : undefined,
+    );
     navigation.replace("ActiveSession");
   };
 

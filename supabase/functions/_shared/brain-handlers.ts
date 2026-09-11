@@ -242,6 +242,8 @@ async function computeStatsSnapshot(supabase: any, userId: string, timezone: str
   const foodRowsToday = (foodRowsShifted ?? []).filter((r: any) => new Date(r.at) >= startOfDay);
   const caloriesToday = foodRowsToday.reduce((sum: number, r: any) => sum + (r.calories ?? 0), 0);
   const proteinToday = foodRowsToday.reduce((sum: number, r: any) => sum + (r.protein_g ?? 0), 0);
+  const carbsToday = foodRowsToday.reduce((sum: number, r: any) => sum + (r.carbs_g ?? 0), 0);
+  const fatToday = foodRowsToday.reduce((sum: number, r: any) => sum + (r.fat_g ?? 0), 0);
 
   return {
     performanceScore,
@@ -255,10 +257,15 @@ async function computeStatsSnapshot(supabase: any, userId: string, timezone: str
     caloriesLeft: Math.max(0, Math.round((nutrition?.calories ?? 0) - caloriesToday)),
     caloriesTarget: nutrition?.calories ?? 0,
     proteinToday: Math.round(proteinToday),
+    // Real per-macro sums from today's food_log rows — the same records the Fuel screen reads,
+    // not an estimate. Confirmed live: the nutrition card previously derived "consumed" for every
+    // macro (including protein, despite proteinToday already being computed correctly above but
+    // never used here) as `target * caloriesConsumedRatio` — a fabricated number that could, and
+    // did, disagree with the Fuel screen's real sums even when calories matched exactly.
     macroTargets: [
-      { label: 'Protein', target: nutrition?.protein_g ?? 0, unit: 'g' },
-      { label: 'Carbs', target: nutrition?.carbs_g ?? 0, unit: 'g' },
-      { label: 'Fat', target: nutrition?.fat_g ?? 0, unit: 'g' },
+      { label: 'Protein', target: nutrition?.protein_g ?? 0, current: Math.round(proteinToday), unit: 'g' },
+      { label: 'Carbs', target: nutrition?.carbs_g ?? 0, current: Math.round(carbsToday), unit: 'g' },
+      { label: 'Fat', target: nutrition?.fat_g ?? 0, current: Math.round(fatToday), unit: 'g' },
     ],
   };
 }
@@ -309,7 +316,12 @@ async function resolveExercises(supabase: any, names: string[]) {
   return byName;
 }
 
-async function writePlan(supabase: any, userId: string, plan: any) {
+async function writePlan(
+  supabase: any,
+  userId: string,
+  plan: any,
+  options: { confirmSecret?: string; requireConfirm?: boolean } = {},
+) {
   const names = plan.sessions.flatMap((s: any) => s.exercises.map((e: any) => e.name));
   const [injuries, exerciseByName] = await Promise.all([
     fetchActiveInjuries(supabase, userId),
@@ -325,6 +337,34 @@ async function writePlan(supabase: any, userId: string, plan: any) {
 
   for (const name of names) {
     if (!exerciseByName.has(name)) throw new Error(`Unknown exercise "${name}" — not in the catalog.`);
+  }
+
+  // Only generate_training_plan gates on this, not update_training_plan (a live plan revision
+  // is already an in-conversation, immediate action per the client's confirmation-gate spec) —
+  // a brand-new user's very first plan is the one place Damion asked for an explicit consultation
+  // and start-date confirmation before anything goes live. Keyed on a fixed literal, not the plan
+  // payload itself — a full multi-session/exercise plan is exactly the kind of large structure an
+  // LLM won't reproduce byte-for-byte between preview and confirm calls (see log_workout's
+  // identical fix, same session), and there's only ever one "confirm my new plan" action pending
+  // at a time for a given conversation, so a payload-bound signature buys nothing here.
+  if (options.requireConfirm) {
+    const tokenKey = 'new_plan';
+    if (
+      !plan.confirm ||
+      !(await verifyConfirmToken(options.confirmSecret!, 'generate_training_plan', tokenKey, plan.confirm_token))
+    ) {
+      return {
+        status: 'preview',
+        split: plan.split,
+        days_per_week: plan.days_per_week,
+        sessions: plan.sessions,
+        confirm_token: await issueConfirmToken(options.confirmSecret!, 'generate_training_plan', tokenKey),
+        instruction:
+          'Nothing is saved yet. Read back the plan (split, days per week, one line per session) and ' +
+          'confirm which real day they want to start on, wait for explicit agreement, then call ' +
+          'generate_training_plan again with the same fields plus confirm:true and this exact confirm_token.',
+      };
+    }
   }
 
   const rpcPlan = {
@@ -557,7 +597,7 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
       return out;
     },
 
-    generate_training_plan: (input) => writePlan(supabase, userId, input),
+    generate_training_plan: (input) => writePlan(supabase, userId, input, { confirmSecret, requireConfirm: true }),
     update_training_plan: (input) => writePlan(supabase, userId, input),
 
     generate_nutrition_targets: (input) => writeNutritionTargets(supabase, userId, input.goal),
@@ -723,7 +763,11 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
       if (fetchError) throw new Error(`food_log fetch: ${fetchError.message}`);
       if (!current) return { status: 'not_found' };
       const proposed = { ...current, ...fields };
-      const tokenKey = `${id}:${JSON.stringify(proposed)}`;
+      // Keyed on the row id alone, not the full proposed payload — same reliability problem as
+      // log_workout below: a model resending its own proposed fields verbatim on the confirm call
+      // isn't guaranteed to reproduce them byte-for-byte (rounding, field order), which silently
+      // failed verification and forced another preview instead of saving.
+      const tokenKey = id;
 
       // Structural confirm gate: without a valid token this only previews and never writes, so
       // the model cannot say "done" before the user has actually agreed to THESE exact values in
@@ -792,26 +836,98 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
     },
 
     log_workout: async (input) => {
-      const tokenKey = `${input.plan_session_id ?? ''}:${JSON.stringify(input.exercises_done ?? null)}`;
+      // Keyed on the session only, not the full exercises_done payload — a full multi-exercise/
+      // sets/reps/weights report relayed piece by piece over voice is exactly the payload an LLM
+      // is least likely to reproduce byte-for-byte between the preview and confirm calls (field
+      // order, a "10" vs "10.0", one extra note), so a payload-bound signature silently rejected
+      // the confirm and looped back to another preview — confirmed live: the user kept saying
+      // "yes" and kept getting asked again. The token's real job is proving a preview genuinely
+      // happened moments ago for this same session, not that the payload never changed a bit.
+      const tokenKey = input.plan_session_id ?? 'manual';
+      // Longer-lived than the default: relaying a whole workout's exercises/sets/reps/weights by
+      // voice, then confirming, routinely runs past the standard 5-minute window on its own.
+      const LOG_WORKOUT_TOKEN_TTL_MS = 15 * 60 * 1000;
       if (!input.confirm || !(await verifyConfirmToken(confirmSecret, 'log_workout', tokenKey, input.confirm_token))) {
         return {
           status: 'preview',
           exercises_done: input.exercises_done,
-          confirm_token: await issueConfirmToken(confirmSecret, 'log_workout', tokenKey),
+          confirm_token: await issueConfirmToken(confirmSecret, 'log_workout', tokenKey, LOG_WORKOUT_TOKEN_TTL_MS),
           instruction:
             'Nothing is saved yet. Read back exactly what will be logged and wait for the user to ' +
             'explicitly agree in their next message, then call log_workout again with the same ' +
             'fields plus confirm:true and this exact confirm_token.',
         };
       }
+      // A whole workout described conversationally, start to finish, was never tracked live —
+      // every set here was told to the coach, not captured by logSet during a running session.
+      const exercisesDone = (input.exercises_done ?? []).map((e: any) => ({ ...e, tracked: 'reported' }));
       const { error } = await supabase.from('workout_log').insert({
         user_id: userId,
         plan_session_id: input.plan_session_id ?? null,
-        exercises_done: input.exercises_done,
+        exercises_done: exercisesDone,
+        source: 'independent',
         note: input.note ?? null,
       });
       if (error) throw new Error(`workout_log insert: ${error.message}`);
       return { status: 'logged' };
+    },
+
+    resolve_interrupted_workout: async (input) => {
+      const { data: row, error: fetchError } = await supabase
+        .from('workout_log')
+        .select('id, exercises_done')
+        .eq('id', input.workout_log_id)
+        .eq('user_id', userId)
+        .eq('status', 'interrupted')
+        .maybeSingle();
+      if (fetchError) throw new Error(`workout_log fetch: ${fetchError.message}`);
+      if (!row) return { status: 'not_found' };
+
+      const tokenKey = input.workout_log_id;
+      if (
+        !input.confirm ||
+        !(await verifyConfirmToken(confirmSecret, 'resolve_interrupted_workout', tokenKey, input.confirm_token))
+      ) {
+        return {
+          status: 'preview',
+          workout_log_id: row.id,
+          already_logged: row.exercises_done,
+          confirm_token: await issueConfirmToken(confirmSecret, 'resolve_interrupted_workout', tokenKey),
+          instruction:
+            'Nothing has changed yet. State plainly what will happen for the chosen outcome ' +
+            '(completed_independent/ended_early/discard) and wait for explicit agreement, then call ' +
+            'again with the same fields plus confirm:true and this exact confirm_token.',
+        };
+      }
+
+      if (input.outcome === 'discard') {
+        const { error: delError } = await supabase.from('workout_log').delete().eq('id', row.id).eq('user_id', userId);
+        if (delError) throw new Error(`workout_log delete: ${delError.message}`);
+        return { status: 'discarded' };
+      }
+
+      if (input.outcome === 'ended_early') {
+        const { error: updError } = await supabase
+          .from('workout_log')
+          .update({ status: 'partial' })
+          .eq('id', row.id)
+          .eq('user_id', userId);
+        if (updError) throw new Error(`workout_log update: ${updError.message}`);
+        return { status: 'partial' };
+      }
+
+      // completed_independent — whatever was tracked live before the interruption stays exactly
+      // as it was; anything the user reports happened afterward is appended and marked reported,
+      // never merged into or replacing the live entries.
+      const additional = (input.additional_exercises_done ?? []).map((e: any) => ({ ...e, tracked: 'reported' }));
+      const merged = [...(row.exercises_done ?? []), ...additional];
+      const { error: updError } = await supabase
+        .from('workout_log')
+        .update({ status: 'completed', source: 'independent', exercises_done: merged })
+        .eq('id', row.id)
+        .eq('user_id', userId);
+      if (updError) throw new Error(`workout_log update: ${updError.message}`);
+      return { status: 'completed' };
     },
 
     log_checkin: async (input) => {
@@ -832,6 +948,20 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
     },
 
     open_screen: async (input) => {
+      // ActiveSession renders whatever ActiveSessionContext currently holds, which is empty once
+      // a workout has ended — sending the user there with nothing running would open a broken
+      // screen instead of the workout they asked to resume. Confirmed live: "resume the active
+      // session" had no navigation path at all before this screen was addable here, so the coach
+      // could only recite the exercise/reps from the live session state block, never reopen it.
+      if (input.screen === 'ActiveSession') {
+        const { data: liveRow } = await supabase
+          .from('live_session_state')
+          .select('updated_at')
+          .eq('user_id', userId)
+          .maybeSingle();
+        const isLive = liveRow && Date.now() - new Date(liveRow.updated_at).getTime() < LIVE_STATE_MAX_AGE_MS;
+        if (!isLive) return { status: 'no_session' };
+      }
       await writeAppAction(supabase, userId, 'navigate', { screen: input.screen });
       return { status: 'opened', screen: input.screen };
     },
@@ -1022,19 +1152,43 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
       if (error) throw new Error(`training_plan fetch: ${error.message}`);
       if (!plan) return { status: 'no_plan' };
 
-      const days = (plan.plan_session ?? [])
-        .slice()
-        .sort((a: any, b: any) => a.day_order - b.day_order)
-        .map((session: any) => ({
-          plan_session_id: session.id,
-          day_order: session.day_order,
-          focus: humanizeFocus(session.focus),
-          exercises: (session.plan_exercise ?? [])
-            .slice()
-            .sort((a: any, b: any) => a.ord - b.ord)
-            .map((e: any) => e.exercise?.name)
-            .filter(Boolean),
-        }));
+      const sessions = plan.plan_session ?? [];
+      const describeDay = (session: any) => ({
+        plan_session_id: session.id as string,
+        day_order: session.day_order as number,
+        weekday: (session.weekday ?? null) as number | null,
+        focus: humanizeFocus(session.focus),
+        exercises: (session.plan_exercise ?? [])
+          .slice()
+          .sort((a: any, b: any) => a.ord - b.ord)
+          .map((e: any) => e.exercise?.name)
+          .filter(Boolean),
+      });
+
+      // Pinned (weekday-fixed) plans get a real 7-day Sun-Sat week, rest days included — the
+      // client was showing "DAY 1..DAY 6" ordinals and a blanket "rest days aren't shown here"
+      // disclaimer even for a plan that has real, fixed rest days, which read as hiding
+      // information rather than a flexible split genuinely having none to show. A flexible
+      // rotation has no fixed weekday by definition, so it keeps the day-order ordinal listing —
+      // CalendarScreen's useWeekCalendar projects a flexible rotation onto real dates for the
+      // week view, but duplicating that projection here for a routine/plan-level chat card isn't
+      // worth the duplication; the honest "day order, not weekday" framing stays instead.
+      const pinned = sessions.some((s: any) => s.weekday !== null && s.weekday !== undefined);
+      let days: any[];
+      if (pinned) {
+        const byWeekday = new Map(sessions.map((s: any) => [s.weekday, s]));
+        days = Array.from({ length: 7 }, (_, weekday) => {
+          const session = byWeekday.get(weekday);
+          return session
+            ? describeDay(session)
+            : { plan_session_id: null, day_order: -1, weekday, focus: 'Rest', exercises: [] };
+        });
+      } else {
+        days = sessions
+          .slice()
+          .sort((a: any, b: any) => a.day_order - b.day_order)
+          .map(describeDay);
+      }
 
       return {
         status: 'shown',
@@ -1042,6 +1196,7 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
           type: 'plan_breakdown',
           split: plan.split,
           days_per_week: plan.days_per_week,
+          schedule_type: pinned ? 'pinned' : 'flexible',
           days,
         },
       };
