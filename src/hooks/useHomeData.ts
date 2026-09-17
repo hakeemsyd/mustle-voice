@@ -121,9 +121,10 @@ function buildGreetingPrompt(
   nutrition: { caloriesLeft: number; proteinLeft: number } | null,
 ): string {
   const nutritionNote = nutrition
-    ? ` You also know today's nutrition: ${nutrition.caloriesLeft} calories and ${nutrition.proteinLeft}g protein ` +
-      `left — feel free to reference this instead of the workout if it's more relevant right now (e.g. it's a ` +
-      `rest day, or they haven't logged a meal yet today).`
+    ? ` They have calories and protein still to hit today — feel free to reference nutrition or recovery ` +
+      `instead of the workout if that's more relevant right now (e.g. it's a rest day, or they haven't ` +
+      `logged a meal yet today). Never state an exact calorie or gram figure: the screen shows those live, ` +
+      `and this greeting is written once, so any number here goes stale the moment they log a meal.`
     : '';
   const questionNote =
     ' End with one short, specific question about how they\'re doing today (energy, hunger, soreness, ' +

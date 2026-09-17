@@ -14,3 +14,15 @@ export function humanizeFocus(focus: string | null | undefined): string {
     .map((word) => word[0].toUpperCase() + word.slice(1))
     .join(' ');
 }
+
+const LEADING_CONCESSION =
+  /^(?:you(?:'|’)?re|you are)\s+(?:absolutely\s+|completely\s+|totally\s+|quite\s+)?right\s*[,.!—–-]\s*(?=\S)/i;
+const SUBSTANTIVE_CONCESSION =
+  /^(?:you(?:'|’)?re|you are)\s+(?:absolutely\s+|completely\s+|totally\s+|quite\s+)?right\s+(?:that|about)\b/i;
+
+export function dropLeadingConcession(text: string): string {
+  if (SUBSTANTIVE_CONCESSION.test(text)) return text;
+  const trimmed = text.replace(LEADING_CONCESSION, '');
+  if (trimmed === text) return text;
+  return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+}

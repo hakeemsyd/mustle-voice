@@ -1,6 +1,7 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
 import { runBrainTurn } from '../_shared/brain-orchestrator.ts';
 import { replayHistory } from '../_shared/replay-history.ts';
+import { dropLeadingConcession } from '../_shared/humanize.ts';
 import {
   buildStaticSystemPrompt,
   createCallModel,
@@ -65,7 +66,7 @@ function isSilencePlaceholder(text: string): boolean {
 }
 
 function sanitizeForSpeech(text: string): string {
-  return verbalizeUnitsForSpeech(text)
+  return dropLeadingConcession(verbalizeUnitsForSpeech(text))
     .replace(/\[\[SYSTEM_CUE\]\]\s*\S*/gi, '')
     .replace(/\s*[—–]\s*/g, ', ');
 }

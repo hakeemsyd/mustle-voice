@@ -1,6 +1,7 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
 import { runBrainTurn } from '../_shared/brain-orchestrator.ts';
 import { replayHistory } from '../_shared/replay-history.ts';
+import { dropLeadingConcession } from '../_shared/humanize.ts';
 import { buildSystemPrompt, callModel, MESSAGE_HISTORY_LIMIT } from '../_shared/brain-config.ts';
 import { buildContextBlock, startOfLocalDayUtc } from '../_shared/brain-context.ts';
 import { createHandlers } from '../_shared/brain-handlers.ts';
@@ -96,6 +97,8 @@ Deno.serve(async (req) => {
     );
     const updatedDisplayName = profileUpdateCall?.result.display_name ?? null;
 
+    const reply = dropLeadingConcession(result.reply);
+
     const { error: logError } = await supabase.from('message').insert([
       {
         user_id: userId,
@@ -109,7 +112,7 @@ Deno.serve(async (req) => {
       {
         user_id: userId,
         role: 'assistant',
-        content: result.reply,
+        content: reply,
         modality: 'text',
         hidden,
         blocks: turnBlocks.length > 0 ? turnBlocks : null,
@@ -122,7 +125,7 @@ Deno.serve(async (req) => {
 
     return new Response(
       JSON.stringify({
-        reply: result.reply,
+        reply,
         toolCalls: result.toolCalls.map((t) => t.name),
         card,
         updatedDisplayName,
