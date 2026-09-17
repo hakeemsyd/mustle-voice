@@ -14,7 +14,12 @@ import {
 } from "../hooks/useCalendarData";
 import { addDays, formatWeekRange, localDateKey, startOfLocalDay } from "../lib/calendarDate";
 import { useScreenInsets } from "../hooks/useScreenInsets";
-import { isAppleHealthAvailable, readLastNightSleepMinutes } from "../lib/appleHealth";
+import {
+  canReadAppleHealth,
+  isAppleHealthAvailable,
+  readLastNightSleepMinutes,
+  requestAppleHealthPermission,
+} from "../lib/appleHealth";
 import { estimateRestSeconds, formatRestSeconds } from "../lib/restSuggestion";
 import { chooseRestDay } from "../lib/restDay";
 import { useActiveSessionContext } from "../session/ActiveSessionContext";
@@ -59,12 +64,24 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
   // was recorded, both rendered as an honest "no data" state rather than a fake number.
   const [sleepMinutes, setSleepMinutes] = useState<number | null>(null);
   const [sleepLoading, setSleepLoading] = useState(true);
+  // Health permission is per INSTALL, not per account, and the only place that ever asked for it
+  // was onboarding. So installing the app and signing in to an existing account, or reinstalling,
+  // or moving to a second device, all leave it permanently unasked — the sheet simply never
+  // appears. Tracking it here lets this card offer the prompt where the absence is actually
+  // visible, instead of claiming there is "no data yet" for something never connected.
+  const [healthConnectable, setHealthConnectable] = useState(false);
+  const [connectingHealth, setConnectingHealth] = useState(false);
+  const [healthRefresh, setHealthRefresh] = useState(0);
   useFocusEffect(
     useCallback(() => {
       let cancelled = false;
       setSleepLoading(true);
       (async () => {
-        const available = await isAppleHealthAvailable();
+        // canReadAppleHealth, not isAppleHealthAvailable: the latter is true on every iPhone and
+        // says nothing about whether this app was ever granted access, which is how a skipped
+        // onboarding step turned into "Authorization not determined" on every Calendar open.
+        const available = await canReadAppleHealth();
+        if (!available && (await isAppleHealthAvailable())) setHealthConnectable(true);
         const minutes = available ? await readLastNightSleepMinutes() : null;
         if (!cancelled) {
           setSleepMinutes(minutes);
@@ -74,7 +91,9 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
       return () => {
         cancelled = true;
       };
-    }, []),
+      // healthRefresh re-runs this after the permission sheet is answered, so granting access
+      // fills the card in immediately instead of on some later visit.
+    }, [healthRefresh]),
   );
 
   // None of the four hooks above refetch on their own when this screen regains focus — a tab/
@@ -288,6 +307,22 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                       </Text>
                       <Text style={styles.sleepLabel}>Last night</Text>
                     </>
+                  ) : healthConnectable ? (
+                    <Pressable
+                      style={styles.sleepConnect}
+                      onPress={async () => {
+                        setConnectingHealth(true);
+                        await requestAppleHealthPermission();
+                        setConnectingHealth(false);
+                        setHealthConnectable(false);
+                        setHealthRefresh((n) => n + 1);
+                      }}
+                      disabled={connectingHealth}
+                    >
+                      <Text style={styles.sleepConnectText}>
+                        {connectingHealth ? "Connecting…" : "Connect Apple Health"}
+                      </Text>
+                    </Pressable>
                   ) : (
                     <Text style={styles.sleepEmpty}>No sleep data from Apple Health yet</Text>
                   )}
@@ -465,7 +500,7 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                     </View>
                   )}
 
-                  {(loggedWorkout || detail.meals.length > 0 || detail.injuryNotes.length > 0 || detail.macros) && (
+                  {(loggedWorkout || detail.sleepHours != null || detail.meals.length > 0 || detail.injuryNotes.length > 0 || detail.macros) && (
                     <View style={styles.factsSection}>
                       {detail.isToday && <Text style={styles.factsSectionLabel}>Logged so far</Text>}
 
@@ -480,6 +515,22 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                               {n.summary}
                             </Text>
                           ))}
+                        </View>
+                      )}
+
+                      {detail.sleepHours != null && (
+                        <View style={styles.factSection}>
+                          <View style={styles.factSectionHeader}>
+                            <BedDoubleIcon size={14} color={colors.muted} />
+                            <Text style={styles.factSectionLabel}>Sleep</Text>
+                          </View>
+                          {/* Sourced so the number is never ambiguous: a measured night and a
+                              remembered one are different kinds of fact, and the check-in figure
+                              is whatever the user told the coach. */}
+                          <Text style={styles.detailLine}>
+                            {detail.sleepHours}h
+                            {detail.sleepSource === "checkin" ? " — as reported" : " — Apple Health"}
+                          </Text>
                         </View>
                       )}
 
@@ -566,7 +617,7 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                     </View>
                   )}
 
-                  {!hasPlan && !loggedWorkout && detail.meals.length === 0 && detail.injuryNotes.length === 0 && (
+                  {!hasPlan && !loggedWorkout && detail.sleepHours == null && detail.meals.length === 0 && detail.injuryNotes.length === 0 && (
                     <View style={styles.detailEmpty}>
                       <CalendarIcon size={28} color={colors.muted} />
                       <Text style={styles.detailEmptyTitle}>No facts yet for this day</Text>
@@ -760,6 +811,17 @@ const styles = StyleSheet.create({
   },
   sleepValue: { fontFamily: fonts.bodyBold, fontSize: 20, color: colors.accent },
   sleepLabel: { fontFamily: fonts.body, fontSize: 11, color: colors.muted },
+  sleepConnect: {
+    paddingHorizontal: 16,
+    paddingVertical: 9,
+    borderRadius: 999,
+    backgroundColor: colors.accent,
+  },
+  sleepConnectText: {
+    fontFamily: fonts.bodySemiBold,
+    fontSize: 13,
+    color: colors.accentOn,
+  },
   sleepEmpty: { fontFamily: fonts.body, fontSize: 12, color: colors.muted, textAlign: "center" },
 
   mealsEmpty: { fontFamily: fonts.body, fontSize: 13, color: colors.muted },

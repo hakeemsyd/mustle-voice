@@ -119,13 +119,13 @@ export const OnboardingFlow = ({ userId, onComplete, skipSplash = false }: Onboa
     }
     planReadyRef.current = syncOnboarding(userId, state)
       .then(() =>
-        callBrain(
+        callBrain({
           userId,
-          "I just finished onboarding — please set up my training plan and nutrition targets from what you know about me, and briefly explain why you chose this split and these targets.",
-          'text',
-          true,
-          45000,
-        ),
+          message:
+            "I just finished onboarding — please set up my training plan and nutrition targets from what you know about me, and briefly explain why you chose this split and these targets.",
+          hidden: true,
+          timeoutMs: 45000,
+        }),
       )
       .then(async () => {
         const { data } = await supabase

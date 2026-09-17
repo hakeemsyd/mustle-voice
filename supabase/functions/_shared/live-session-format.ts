@@ -89,7 +89,9 @@ export function buildLiveSessionSnapshot(input: SnapshotInput): LiveSessionSnaps
           loggedSets: input.loggedSets[input.currentExerciseIndex] ?? [],
         }
       : null,
-    upcomingExercises: input.exercises.slice(input.currentExerciseIndex + 1).map((e) => e.name),
+    upcomingExercises: input.exercises
+      .slice(input.currentExerciseIndex + 1)
+      .map((e) => `${e.name} (${e.sets} sets of ${e.repScheme}${e.loadScheme ? `, ${e.loadScheme}` : ''})`),
     restTargetSec: input.resting ? input.restTargetSec : null,
     restRemainingSec,
   };
@@ -159,13 +161,29 @@ export function describeLiveSessionSnapshot(snapshot: LiveSessionSnapshot): stri
   }
 
   if (snapshot.status === 'resting' && snapshot.restRemainingSec !== null) {
-    lines.push(`- Resting: ${snapshot.restRemainingSec}s remaining of a ${snapshot.restTargetSec}s target.`);
+    lines.push(
+      `- Resting: ${snapshot.restRemainingSec}s remaining of a ${snapshot.restTargetSec}s target. ` +
+        `This figure was read at the instant this block was written and is already out of date by ` +
+        `the time you speak. You have no clock: you cannot count down, you cannot work out how ` +
+        `much is left now, and you cannot tell how long your own reply took to reach them. So ` +
+        `never say a number of seconds remaining out loud — not this one, not one derived from it. ` +
+        `Say "almost there" or "nearly up", never "ten seconds". The app owns the timer, it is on ` +
+        `screen in front of them, and it is the only thing that announces when rest is over. Never ` +
+        `claim you are timing anything yourself and never ask them to read the timer to you.`,
+    );
   }
 
   lines.push(
     snapshot.upcomingExercises.length > 0
       ? `- Upcoming exercises: ${snapshot.upcomingExercises.join(', ')}.`
       : '- No exercises left after this one.',
+  );
+
+  lines.push(
+    'Count sets ONLY from this block. Announcing a set is not the same as the user performing it, ' +
+    'and neither is acknowledging one you misheard — your own earlier turns are not a record of ' +
+    'what happened, this block is. If it disagrees with something you said a minute ago, this ' +
+    'block is right and you were wrong.',
   );
 
   lines.push(

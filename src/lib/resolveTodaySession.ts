@@ -11,17 +11,63 @@ export interface WorkoutLogRow {
   status?: string | null;
 }
 
-// An 'interrupted' session (abandoned mid-workout, awaiting the coach's reconciliation ask) is
-// just as unresolved as a 'partial' one — neither should advance a flexible rotation or count as
-// "done today" until it's actually been resolved.
-function isPartial(log: WorkoutLogRow): boolean {
-  return log.status === 'partial' || log.status === 'interrupted';
+/**
+ * Whether a logged workout is still unresolved. An 'interrupted' session (abandoned mid-workout,
+ * awaiting the coach's reconciliation ask) is exactly as unfinished as a 'partial' one — neither
+ * should advance a flexible rotation, count as "done today", extend a streak, or fill a training
+ * slot until it has actually been resolved.
+ *
+ * THE single definition of "done", exported because every screen that reads workout_log.status
+ * needs to agree. They did not: this module and the day-detail sheet treated 'interrupted' as
+ * unfinished, while Calendar's Today and Week tabs and every Stats metric tested
+ * `status !== 'partial'` and so counted it as a completed workout. The result was one screen
+ * saying "Workout logged" while the sheet behind it offered a Start Session button for the same
+ * day — confirmed live. Add a new status here, not at the call sites.
+ */
+export function isUnfinishedWorkout(status: string | null | undefined): boolean {
+  return status === 'partial' || status === 'interrupted';
 }
 
 function sameLocalDay(a: Date, b: Date): boolean {
   return (
     a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
   );
+}
+
+function isPartial(log: WorkoutLogRow): boolean {
+  return isUnfinishedWorkout(log.status);
+}
+
+/**
+ * Most-recent-first, with finished sessions winning any tie on timestamp.
+ *
+ * Two rows can share an `at` to the second — a session and a leftover snapshot of itself, or two
+ * logs written in the same instant. A plain sort leaves their order to whatever the input
+ * happened to be, and the rotation pointer reads the FIRST match: finished advances it, unfinished
+ * holds it. So the same data could resolve to two different sessions on different loads. Ordering
+ * finished first makes the answer deterministic and picks the one that actually represents
+ * completed work.
+ */
+/**
+ * Whether an unfinished session should still block the rotation from advancing.
+ *
+ * Only on the day it happened. Resuming is a real option for a few hours: you stepped away
+ * mid-workout and came back. It stops being one overnight — nobody finishes Tuesday's session on
+ * Thursday — and an unbounded hold made the app read as stuck, offering the same workout every day
+ * until something was completed. Confirmed live: an interrupted Tuesday session left Home showing
+ * "Upper Pull" for the rest of the week while the plan had moved on.
+ *
+ * The log itself is untouched either way. What lapses is only the offer to resume; the sets stay
+ * in history, and the coach still raises the unfinished session for reconciliation separately.
+ */
+export function holdsRotation(log: WorkoutLogRow, now: Date): boolean {
+  return isUnfinishedWorkout(log.status) && sameLocalDay(new Date(log.at), now);
+}
+
+export function byMostRecentFinishedFirst(a: WorkoutLogRow, b: WorkoutLogRow): number {
+  const byTime = new Date(b.at).getTime() - new Date(a.at).getTime();
+  if (byTime !== 0) return byTime;
+  return Number(isPartial(a)) - Number(isPartial(b));
 }
 
 // YYYY-MM-DD in the device's own local time — matches how rest_day.date rows are written
@@ -46,7 +92,12 @@ export function resolveTodaySession<T extends PlanSessionRow>(
   logs: WorkoutLogRow[],
   now: Date = new Date(),
   restDayDates: Set<string> = new Set(),
+  dayOverride: T | null = null,
 ): T | null {
+  // A one-off session the user asked the coach for (see write_custom_session) outranks everything
+  // — the rotation, the weekday pinning, and a rest day. Checked first for that reason, and
+  // regardless of whether the plan has any sessions at all: a custom session stands on its own.
+  if (dayOverride) return dayOverride;
   if (sessions.length === 0) return null;
   if (restDayDates.has(localDateKey(now))) return null;
 
@@ -66,13 +117,13 @@ export function resolveTodaySession<T extends PlanSessionRow>(
 
   const lastLogged = logs
     .slice()
-    .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
+    .sort(byMostRecentFinishedFirst)
     .find((log) => log.plan_session_id && inPlan.has(log.plan_session_id));
 
   if (!lastLogged) return rotation[0];
 
   const lastIndex = rotation.findIndex((s) => s.id === lastLogged.plan_session_id);
   if (lastIndex === -1) return rotation[0];
-  if (isPartial(lastLogged)) return rotation[lastIndex];
+  if (holdsRotation(lastLogged, now)) return rotation[lastIndex];
   return rotation[(lastIndex + 1) % rotation.length];
 }

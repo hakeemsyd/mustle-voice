@@ -7,8 +7,16 @@
 import { humanizeFocus } from './humanize.ts';
 import { issueConfirmToken, verifyConfirmToken } from './confirm-token.ts';
 import { validatePlan, explainViolations, forbiddenTags, type Injury } from './injury-validator.ts';
+import { validateSplit, explainSplitProblems } from './split-validator.ts';
 import { computeNutritionTargets, computeBodyFatGoal, type GoalObjective } from './nutrition.ts';
-import { resolveTodaySession, nowInTimezone, logsInTimezone, toTimezone, fetchRestDayDates } from './brain-context.ts';
+import {
+  resolveTodaySession,
+  nowInTimezone,
+  logsInTimezone,
+  toTimezone,
+  fetchRestDayDates,
+  fetchDayOverrideSession,
+} from './brain-context.ts';
 import { LIVE_STATE_MAX_AGE_MS } from './live-session-format.ts';
 import type { ToolHandlers } from './brain-orchestrator.ts';
 
@@ -256,7 +264,12 @@ async function computeStatsSnapshot(supabase: any, userId: string, timezone: str
     topLifts,
     caloriesLeft: Math.max(0, Math.round((nutrition?.calories ?? 0) - caloriesToday)),
     caloriesTarget: nutrition?.calories ?? 0,
+    // All four totals are exposed, not just protein, so read_state can quote the same numbers the
+    // nutrition card shows rather than summing rows itself — see recent_food.totals_today.
+    caloriesToday: Math.round(caloriesToday),
     proteinToday: Math.round(proteinToday),
+    carbsToday: Math.round(carbsToday),
+    fatToday: Math.round(fatToday),
     // Real per-macro sums from today's food_log rows — the same records the Fuel screen reads,
     // not an estimate. Confirmed live: the nutrition card previously derived "consumed" for every
     // macro (including protein, despite proteinToday already being computed correctly above but
@@ -334,6 +347,20 @@ async function writePlan(
   }));
   const violations = validatePlan(exercisesForValidator, injuries);
   if (violations.length > 0) throw new Error(explainViolations(violations));
+
+  // The shape of the week, not the safety of its exercises. Every exercise in a split can be
+  // individually fine while the split itself is wrong by construction — confirmed live: a
+  // generated plan ran Upper Push on two consecutive days and gave push double the volume of
+  // pull, and passed every gate because nothing looked at the week as a whole.
+  const splitProblems = validateSplit(
+    plan.sessions.map((s: any) => ({ day_order: s.day_order, focus: humanizeFocus(s.focus) })),
+  );
+  if (splitProblems.length > 0) {
+    throw new Error(
+      `That split doesn't work as scheduled. ${explainSplitProblems(splitProblems)} ` +
+        'Nothing was saved — reorder or re-focus the days and call the tool again.',
+    );
+  }
 
   for (const name of names) {
     if (!exerciseByName.has(name)) throw new Error(`Unknown exercise "${name}" — not in the catalog.`);
@@ -565,20 +592,39 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
         ).data;
       }
       if (scope.includes('recent_logs')) {
-        const [timezone, { data: foodRows }] = await Promise.all([
+        const [timezone, { data: foodRows }, snapshot] = await Promise.all([
           resolveTimezone(supabase, userId, requestTimezone),
           supabase.from('food_log').select('*').eq('user_id', userId).order('at', { ascending: false }).limit(15),
+          computeStatsSnapshot(supabase, userId, requestTimezone ?? null),
         ]);
 
         // Raw ISO timestamps forced the model to do its own UTC-to-local mental math to decide
         // what counts as "today" — confirmed live: it pulled a two-day-old meal into today's
         // total. Doing that conversion here and labeling each row explicitly removes the guess.
         const todayLocal = nowInTimezone(timezone).toISOString().slice(0, 10);
+        // The totals come from computeStatsSnapshot — the SAME function behind
+        // show_nutrition_summary, Home and Fuel — instead of being summed by the model from the
+        // rows below. Asking it to add them up made read_state a second, competing implementation
+        // of "today's intake", and the two disagreed in front of the user: the coach said 105g of
+        // protein and the nutrition card said 153g seconds later, the difference being a previous
+        // day's steak and pitas that the model's own arithmetic had swept in. The rows are still
+        // listed (they are what lets it name and edit an individual meal) but they are no longer
+        // the basis of any total.
         out.recent_food = {
           today_date: todayLocal,
+          totals_today: {
+            calories: snapshot.caloriesToday,
+            protein_g: snapshot.proteinToday,
+            carbs_g: snapshot.carbsToday,
+            fat_g: snapshot.fatToday,
+          },
           instruction:
-            'Only rows with is_today=true count toward today\'s intake — never include an earlier ' +
-            'local_date in today\'s total, and never invent a total yourself: sum exactly these rows.',
+            'totals_today is the authoritative intake for today, computed by the app from the same ' +
+            'date-filtered records Home, Fuel and show_nutrition_summary use. Quote those numbers ' +
+            'verbatim and NEVER add up the entries below to produce a total of your own — doing so ' +
+            'is what produced a coach total and an on-screen total that disagreed by a whole ' +
+            'previous day of food. The entries are provided only so you can refer to, correct or ' +
+            'delete an individual meal; rows with is_today=false are NOT part of today at all.',
           entries: (foodRows ?? []).map((row: any) => {
             const localDate = toTimezone(new Date(row.at), timezone).toISOString().slice(0, 10);
             return { ...row, local_date: localDate, is_today: localDate === todayLocal };
@@ -975,7 +1021,6 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
         .maybeSingle();
 
       const sessions = activePlan?.plan_session ?? [];
-      if (sessions.length === 0) return { status: 'no_session', reason: 'no_active_plan' };
 
       const [timezone, { data: recentLogs }, restDayDates] = await Promise.all([
         resolveTimezone(supabase, userId, requestTimezone),
@@ -988,11 +1033,18 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
         fetchRestDayDates(supabase, userId, new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10)),
       ]);
 
+      // Resolved before the no-plan bail-out: a custom session built for today is due on its own
+      // authority, with or without an active plan behind it.
+      const now = nowInTimezone(timezone);
+      const override = await fetchDayOverrideSession(supabase, userId, now.toISOString().slice(0, 10));
+      if (sessions.length === 0 && !override) return { status: 'no_session', reason: 'no_active_plan' };
+
       const today = resolveTodaySession(
         sessions,
         logsInTimezone(recentLogs ?? [], timezone),
-        nowInTimezone(timezone),
+        now,
         restDayDates,
+        override,
       );
       if (!today) return { status: 'no_session', reason: 'rest_day' };
 
@@ -1012,7 +1064,6 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
         .maybeSingle();
 
       const sessions = activePlan?.plan_session ?? [];
-      if (sessions.length === 0) return { status: 'no_session', reason: 'no_active_plan' };
 
       const [timezone, { data: recentLogs }, restDayDates, { data: liveRow }] = await Promise.all([
         resolveTimezone(supabase, userId, requestTimezone),
@@ -1030,11 +1081,18 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
         return { status: 'already_active' };
       }
 
+      // A custom session built for today is startable on its own authority, with or without an
+      // active plan behind it — so the no-plan bail-out happens after this, not before.
+      const now = nowInTimezone(timezone);
+      const override = await fetchDayOverrideSession(supabase, userId, now.toISOString().slice(0, 10));
+      if (sessions.length === 0 && !override) return { status: 'no_session', reason: 'no_active_plan' };
+
       const today = resolveTodaySession(
         sessions,
         logsInTimezone(recentLogs ?? [], timezone),
-        nowInTimezone(timezone),
+        now,
         restDayDates,
+        override,
       );
       if (!today) return { status: 'no_session', reason: 'rest_day' };
 
@@ -1104,7 +1162,8 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
       ]);
       const logs = logsInTimezone((recentLogs ?? []) as any[], timezone);
       const sessions = plan.plan_session ?? [];
-      const dueToday = resolveTodaySession(sessions, logs, now, restDayDates);
+      const override = await fetchDayOverrideSession(supabase, userId, todayKey);
+      const dueToday = resolveTodaySession(sessions, logs, now, restDayDates, override);
       if (!dueToday) return { status: 'already_rest_day' };
 
       if (!input.confirm || !(await verifyConfirmToken(confirmSecret, 'reschedule_today', dueToday.id, input.confirm_token))) {
@@ -1118,6 +1177,18 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
             'session next time they train), then call reschedule_today again with confirm:true and ' +
             'this exact confirm_token.',
         };
+      }
+
+      // An override outranks a rest day by design, so writing one without clearing the override
+      // would leave today still resolving as due — the exact "agreed to rest but Home still shows
+      // a workout" contradiction this tool exists to prevent, just in the other direction.
+      if (override) {
+        const { error: overrideError } = await supabase
+          .from('day_override')
+          .delete()
+          .eq('user_id', userId)
+          .eq('date', todayKey);
+        if (overrideError) throw new Error(`day_override delete: ${overrideError.message}`);
       }
 
       const { error } = await supabase
@@ -1137,6 +1208,110 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
         status: 'rescheduled',
         rest_day_date: todayKey,
         deferred_session: { plan_session_id: dueToday.id, focus: humanizeFocus(dueToday.focus) },
+      };
+    },
+
+    create_custom_session: async (input) => {
+      const timezone = await resolveTimezone(supabase, userId, requestTimezone);
+      const todayKey = nowInTimezone(timezone).toISOString().slice(0, 10);
+
+      const requested = (input.exercises ?? []) as {
+        name: string;
+        sets: number;
+        rep_scheme: string;
+        load_scheme?: string | null;
+      }[];
+      if (requested.length === 0) {
+        return {
+          status: 'rejected',
+          reason: 'No exercises were given. A session needs at least one; nothing was created.',
+        };
+      }
+
+      const names = requested.map((e) => e.name);
+      const [injuries, exerciseByName] = await Promise.all([
+        fetchActiveInjuries(supabase, userId),
+        resolveExercises(supabase, names),
+      ]);
+
+      // Same gate as writePlan, and deliberately returned as a tool result rather than thrown:
+      // the model is expected to revise and call again, which it can only do if it's told exactly
+      // what was wrong. A thrown error reads to it as a broken tool.
+      const unknown = names.filter((name) => !exerciseByName.has(name));
+      if (unknown.length > 0) {
+        return {
+          status: 'rejected',
+          reason:
+            `Not in the catalog: ${unknown.join(', ')}. Nothing was created. Rebuild the session ` +
+            'using only exact catalog names from your instructions and call again.',
+        };
+      }
+
+      const violations = validatePlan(
+        names.map((name) => ({ name, contraindicatedFor: exerciseByName.get(name)?.contraindicated_for ?? [] })),
+        injuries,
+      );
+      if (violations.length > 0) {
+        return {
+          status: 'rejected',
+          reason: `${explainViolations(violations)} Nothing was created — swap those out and call again.`,
+        };
+      }
+
+      const focus = humanizeFocus(input.focus);
+      // Keyed on a fixed literal rather than the payload: an LLM won't reproduce a multi-exercise
+      // structure byte-for-byte between the preview and confirm calls, and only one custom session
+      // is ever pending at a time (same reasoning as writePlan's 'new_plan' key).
+      const tokenKey = 'custom_session';
+      if (!input.confirm || !(await verifyConfirmToken(confirmSecret, 'create_custom_session', tokenKey, input.confirm_token))) {
+        return {
+          status: 'preview',
+          focus,
+          exercises: requested,
+          confirm_token: await issueConfirmToken(confirmSecret, 'create_custom_session', tokenKey),
+          instruction:
+            `NOTHING HAS BEEN CREATED YET — do not tell the user they are all set, do not tell them ` +
+            `to start it, and do not describe this session as existing. Read back the "${focus}" ` +
+            `session (one line per exercise with sets and reps), say it replaces today's scheduled ` +
+            `session and that the weekly plan itself is unchanged, wait for explicit agreement, then ` +
+            `call create_custom_session again with the same fields plus confirm:true and this exact ` +
+            `confirm_token.`,
+        };
+      }
+
+      const { data: sessionId, error: rpcError } = await supabase.rpc('write_custom_session', {
+        p_user_id: userId,
+        p_focus: focus,
+        p_date: todayKey,
+        p_exercises: requested.map((e) => ({
+          exercise_id: exerciseByName.get(e.name)!.id,
+          sets: e.sets,
+          rep_scheme: e.rep_scheme,
+          load_scheme: e.load_scheme ?? null,
+        })),
+      });
+      if (rpcError) throw new Error(`write_custom_session: ${rpcError.message}`);
+
+      // Code-enforced proof, not an assumed side effect — the whole reason this tool exists is
+      // that the coach kept announcing a session that was never created. Re-resolve today the same
+      // way every other consumer will, and only report success if it genuinely comes back as this
+      // session. Anything else is a failure, however cleanly the write appeared to go.
+      const override = await fetchDayOverrideSession(supabase, userId, todayKey);
+      if (!override || override.id !== sessionId) {
+        throw new Error('create_custom_session: session written but today does not resolve to it.');
+      }
+
+      await writeAppAction(supabase, userId, 'refresh_home', { reason: 'custom_session_created' });
+
+      return {
+        status: 'created',
+        plan_session_id: sessionId,
+        focus,
+        exercises: requested,
+        instruction:
+          `The session now exists and is today's session — Home is showing it with a Start button. ` +
+          `Tell them it's ready in one short line. Do not start it for them unless they ask; if they ` +
+          `do ask, use start_todays_workout.`,
       };
     },
 
@@ -1212,9 +1387,7 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
       if (error) throw new Error(`training_plan fetch: ${error.message}`);
 
       const sessions = plan?.plan_session ?? [];
-      if (sessions.length === 0) return { status: 'no_session', reason: 'no_active_plan' };
-
-      const [timezone, { data: recentLogs }] = await Promise.all([
+      const [timezone, { data: recentLogs }, restDayDates] = await Promise.all([
         resolveTimezone(supabase, userId, requestTimezone),
         supabase
           .from('workout_log')
@@ -1222,8 +1395,22 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
           .eq('user_id', userId)
           .order('at', { ascending: false })
           .limit(10),
+        // This call was resolving today with neither rest days nor the override, so the card it
+        // returned could name a session Home had already moved off — the coach showing one
+        // workout while the screen showed another.
+        fetchRestDayDates(supabase, userId, new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10)),
       ]);
-      const today = resolveTodaySession(sessions, logsInTimezone(recentLogs ?? [], timezone), nowInTimezone(timezone));
+      const now = nowInTimezone(timezone);
+      const override = await fetchDayOverrideSession(supabase, userId, now.toISOString().slice(0, 10));
+      if (sessions.length === 0 && !override) return { status: 'no_session', reason: 'no_active_plan' };
+
+      const today = resolveTodaySession(
+        sessions,
+        logsInTimezone(recentLogs ?? [], timezone),
+        now,
+        restDayDates,
+        override,
+      );
       if (!today) return { status: 'no_session', reason: 'rest_day' };
 
       const exercises = (today.plan_exercise ?? [])

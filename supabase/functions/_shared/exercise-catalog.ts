@@ -40,9 +40,32 @@ export const EXERCISE_CATALOG: CatalogExercise[] = [
   { name: 'Seated Row',   movementPattern: 'pull', primaryMuscles: ['back'],   contraindicatedFor: [] },
   { name: 'Face Pull',    movementPattern: 'pull', primaryMuscles: ['rear_delts'], contraindicatedFor: [] },
 
+  // Upper — vertical/horizontal pull, bodyweight
+  { name: 'Pull-up',      movementPattern: 'pull', primaryMuscles: ['lats', 'biceps'], contraindicatedFor: [] },
+  { name: 'Dumbbell Row', movementPattern: 'pull', primaryMuscles: ['back', 'lats'],   contraindicatedFor: [] },
+
+  // Arms. The catalog had no direct arm work at all, so an arms-focused session was literally
+  // impossible to build — every handler rejects a name that isn't in here, so the model could only
+  // fail or invent. Elbow-loading movements are tagged so the injury validator can route around a
+  // reported elbow problem instead of quietly substituting another exercise that loads it just as
+  // hard (see brain-config's pain-report rule).
+  { name: 'Barbell Curl',          movementPattern: 'isolation', primaryMuscles: ['biceps'],  contraindicatedFor: ['deep_elbow_flexion_loaded'] },
+  { name: 'Dumbbell Curl',         movementPattern: 'isolation', primaryMuscles: ['biceps'],  contraindicatedFor: ['deep_elbow_flexion_loaded'] },
+  { name: 'Hammer Curl',           movementPattern: 'isolation', primaryMuscles: ['biceps', 'forearms'], contraindicatedFor: ['deep_elbow_flexion_loaded'] },
+  { name: 'Cable Tricep Pushdown', movementPattern: 'isolation', primaryMuscles: ['triceps'], contraindicatedFor: ['loaded_elbow_extension'] },
+  { name: 'Overhead Tricep Extension', movementPattern: 'isolation', primaryMuscles: ['triceps'], contraindicatedFor: ['loaded_elbow_extension', 'overhead_press'] },
+  { name: 'Tricep Dip',            movementPattern: 'push',      primaryMuscles: ['triceps', 'chest'], contraindicatedFor: ['loaded_elbow_extension'] },
+
+  // Shoulders — isolation, no overhead loading
+  { name: 'Lateral Raise', movementPattern: 'isolation', primaryMuscles: ['shoulders'], contraindicatedFor: [] },
+
+  // Lower — calves
+  { name: 'Calf Raise', movementPattern: 'isolation', primaryMuscles: ['calves'], contraindicatedFor: [] },
+
   // Core
   { name: 'Plank',       movementPattern: 'core', primaryMuscles: ['core'], contraindicatedFor: [] },
   { name: 'Dead Bug',    movementPattern: 'core', primaryMuscles: ['core'], contraindicatedFor: [] },
+  { name: 'Hanging Knee Raise', movementPattern: 'core', primaryMuscles: ['core'], contraindicatedFor: [] },
 ];
 
 export function findExercise(name: string): CatalogExercise | undefined {

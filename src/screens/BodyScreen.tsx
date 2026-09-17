@@ -19,6 +19,7 @@ import {
   TrendingUpIcon,
 } from "../icons";
 import { titleCase } from "../lib/textFormat";
+import { relativeDayLabel } from "../lib/calendarDate";
 
 const CHECKIN_ICON_COLOR = "rgba(251,180,60,0.85)";
 
@@ -32,13 +33,6 @@ const BODY_PARTICLES: ParticleConfig[] = [
 
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
-}
-
-function relativeDay(iso: string): string {
-  const days = Math.floor((Date.now() - new Date(iso).getTime()) / 86_400_000);
-  if (days <= 0) return "today";
-  if (days === 1) return "yesterday";
-  return `${days} days ago`;
 }
 
 export function BodyScreen() {
@@ -88,13 +82,13 @@ export function BodyScreen() {
           icon: <MoonIcon size={20} color={CHECKIN_ICON_COLOR} />,
           greeting: "Body check-in",
           main: `${down ? "Down" : "Up"} ${weekDeltaDisplay} from last week.\n${flaggedZones[0].label} is still flagged — check in with your coach before pushing that area.`,
-          sub: `Body composition · updated ${relativeDay(latestEntry!.date)}`,
+          sub: `Body composition · updated ${relativeDayLabel(latestEntry!.date, { capitalized: false })}`,
         }
       : {
           icon: <SunIcon size={20} color={CHECKIN_ICON_COLOR} />,
           greeting: "Body check-in",
           main: `${down ? "Down" : "Up"} ${weekDeltaDisplay} from last week.\nNothing flagged right now — you're clear to train.`,
-          sub: `Body composition · updated ${relativeDay(latestEntry!.date)}`,
+          sub: `Body composition · updated ${relativeDayLabel(latestEntry!.date, { capitalized: false })}`,
         };
 
   return (

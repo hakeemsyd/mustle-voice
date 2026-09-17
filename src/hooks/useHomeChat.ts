@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { callBrain, COACH_UNREACHABLE_MESSAGE, type ChatCard } from '../lib/brain';
-import { uploadChatFile, uploadChatImage } from '../lib/chatAttachments';
+import { resolveAttachmentUrls, uploadChatFile, uploadChatImage } from '../lib/chatAttachments';
 import { stripNonSpeechArtifacts } from '../lib/elevenLabsVoice';
 
 export interface ChatMessage {
@@ -10,12 +10,47 @@ export interface ChatMessage {
   text: string;
   card?: ChatCard | null;
   imageUrl?: string;
+  /** Upload/analysis state for an attached image. Present only on the local optimistic entry —
+   *  a persisted row that came back from the server is, by definition, 'sent'. Without this the
+   *  bubble showed a thumbnail the instant it was picked and then looked identical whether the
+   *  upload was still running, had finished, or had failed outright: confirmed live, an image
+   *  that never reached the coach was indistinguishable from one that had. */
+  attachmentStatus?: 'uploading' | 'sent' | 'failed';
   /** ISO timestamp — real for a loaded/persisted row, synthesized (Date.now()) for a local
    *  optimistic entry. Sorts correctly either way (ISO strings compare lexicographically in
    *  chronological order); only needed so loadMessageContext can merge an older window into the
    *  transcript in the right place instead of just appending it at the end. */
   at: string;
 }
+
+
+/** Message rows store a storage PATH for an attachment (older rows, an expired absolute URL).
+ *  Neither is renderable as-is, so both load paths resolve them to fresh signed URLs in one
+ *  batched call — otherwise the thumbnail is a permanent grey box.
+ *
+ *  Deliberately applied AFTER the rows are in state, never awaited before them: signing is a
+ *  network round trip, and blocking on it held the entire transcript — every line of text
+ *  included — behind a call that only the images needed. The text lands immediately and each
+ *  thumbnail fills in when its URL arrives. */
+async function patchResolvedAttachments(
+  rows: ChatMessage[],
+  apply: (patch: Map<string, string>) => void,
+) {
+  const refs = rows.map((r) => r.imageUrl).filter((u): u is string => !!u);
+  if (refs.length === 0) return;
+  const resolved = await resolveAttachmentUrls(refs);
+  // Nothing actually needed re-signing (all local previews), so skip the re-render entirely.
+  if (![...resolved].some(([ref, url]) => ref !== url)) return;
+  apply(resolved);
+}
+
+/** Rewrites imageUrl in place for whichever rows were re-signed, leaving the rest untouched. */
+const applyAttachmentPatch = (rows: ChatMessage[], patch: Map<string, string>): ChatMessage[] =>
+  rows.map((r) => {
+    if (!r.imageUrl) return r;
+    const next = patch.get(r.imageUrl);
+    return next && next !== r.imageUrl ? { ...r, imageUrl: next } : r;
+  });
 
 export function useHomeChat(userId: string | null) {
   const [transcript, setTranscript] = useState<ChatMessage[]>([]);
@@ -50,23 +85,26 @@ export function useHomeChat(userId: string | null) {
       if (error) {
         console.error('[useHomeChat] failed to load history:', error.message);
       } else {
-        setTranscript(
-          (data ?? [])
-            .slice()
-            .reverse()
-            // Contentless rows are now dropped before they're ever appended (see useVoiceSession's
-            // onMessage), but rows already persisted from before that fix still need hiding —
-            // an image-only row is the one legitimate case of empty text.
-            .filter((row) => row.attachment_url || /[\p{L}\p{N}]/u.test(row.content ?? ''))
-            .map((row) => ({
-              id: row.id,
-              role: row.role === 'assistant' ? 'assistant' : 'user',
-              text: row.content,
-              card: row.card,
-              imageUrl: row.attachment_url ?? undefined,
-              at: row.at,
-            })),
-        );
+        const rows = (data ?? [])
+          .slice()
+          .reverse()
+          // Contentless rows are now dropped before they're ever appended (see useVoiceSession's
+          // onMessage), but rows already persisted from before that fix still need hiding —
+          // an image-only row is the one legitimate case of empty text.
+          .filter((row) => row.attachment_url || /[\p{L}\p{N}]/u.test(row.content ?? ''))
+          .map((row) => ({
+            id: row.id,
+            role: (row.role === 'assistant' ? 'assistant' : 'user') as ChatMessage['role'],
+            text: row.content,
+            card: row.card,
+            imageUrl: row.attachment_url ?? undefined,
+            at: row.at,
+          }));
+        setTranscript(rows);
+        void patchResolvedAttachments(rows, (patch) => {
+          if (cancelled) return;
+          setTranscript((prev) => applyAttachmentPatch(prev, patch));
+        });
       }
       setLoaded(true);
     })();
@@ -105,7 +143,7 @@ export function useHomeChat(userId: string | null) {
       setCoachTyping(true);
 
       try {
-        const result = await callBrain(userId, trimmed);
+        const result = await callBrain({ userId, message: trimmed });
         if (latestRequestRef.current !== requestId) return;
         setTranscript((prev) => [
           ...prev,
@@ -154,20 +192,27 @@ export function useHomeChat(userId: string | null) {
         return false;
       }
 
+      const incoming: ChatMessage[] = data.map((row) => ({
+        id: row.id,
+        role: (row.role === 'assistant' ? 'assistant' : 'user') as ChatMessage['role'],
+        text: row.content,
+        card: row.card,
+        imageUrl: row.attachment_url ?? undefined,
+        at: row.at,
+      }));
+      // Same as the initial load: merge the text now, sign the attachments after. An older window
+      // is exactly where expired refs live, so this is the path that most needs not to stall.
+      void patchResolvedAttachments(incoming, (patch) =>
+        setTranscript((prev) => applyAttachmentPatch(prev, patch)),
+      );
+
       setTranscript((prev) => {
         const seen = new Set(prev.map((m) => m.id));
         const merged = [...prev];
-        for (const row of data) {
+        for (const row of incoming) {
           if (seen.has(row.id)) continue;
           seen.add(row.id);
-          merged.push({
-            id: row.id,
-            role: row.role === 'assistant' ? 'assistant' : 'user',
-            text: row.content,
-            card: row.card,
-            imageUrl: row.attachment_url ?? undefined,
-            at: row.at,
-          });
+          merged.push(row);
         }
         merged.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
         return merged;
@@ -181,26 +226,52 @@ export function useHomeChat(userId: string | null) {
     async (uri: string) => {
       if (!userId) return;
       const requestId = ++latestRequestRef.current;
+      // The bubble is stamped with a stable id so its status can be updated in place as the
+      // upload progresses, rather than appending a second bubble or leaving the first frozen.
+      const bubbleId = `local-${Date.now()}`;
+      const setStatus = (attachmentStatus: ChatMessage['attachmentStatus']) =>
+        setTranscript((prev) =>
+          prev.map((m) => (m.id === bubbleId ? { ...m, attachmentStatus } : m)),
+        );
+
       setTranscript((prev) => [
         ...prev,
-        { id: `local-${Date.now()}`, role: 'user', text: '', imageUrl: uri, at: new Date().toISOString() },
+        {
+          id: bubbleId,
+          role: 'user',
+          text: '',
+          imageUrl: uri,
+          attachmentStatus: 'uploading',
+          at: new Date().toISOString(),
+        },
       ]);
       setCoachTyping(true);
 
       try {
-        const signedUrl = await uploadChatImage(userId, uri);
-        const result = await callBrain(userId, '', 'image', false, undefined, undefined, signedUrl);
+        const { path, signedUrl } = await uploadChatImage(userId, uri);
         if (latestRequestRef.current !== requestId) return;
+        const result = await callBrain({
+          userId,
+          message: '',
+          modality: 'image',
+          attachmentUrl: signedUrl,
+          attachmentPath: path,
+        });
+        if (latestRequestRef.current !== requestId) return;
+        setStatus('sent');
         setTranscript((prev) => [
           ...prev,
-          { id: `local-${Date.now()}-r`, role: 'assistant', text: result.reply, card: result.card, at: new Date().toISOString() },
+          { id: `${bubbleId}-r`, role: 'assistant', text: result.reply, card: result.card, at: new Date().toISOString() },
         ]);
       } catch (err) {
         console.error('[useHomeChat] attachImage failed:', err);
         if (latestRequestRef.current !== requestId) return;
+        // Marked on the image itself, not only as a coach message — the failure belongs to the
+        // thing that failed, so the user can see WHICH photo didn't make it.
+        setStatus('failed');
         setTranscript((prev) => [
           ...prev,
-          { id: `local-${Date.now()}-e`, role: 'assistant', text: COACH_UNREACHABLE_MESSAGE, at: new Date().toISOString() },
+          { id: `${bubbleId}-e`, role: 'assistant', text: COACH_UNREACHABLE_MESSAGE, at: new Date().toISOString() },
         ]);
       } finally {
         if (latestRequestRef.current === requestId) setCoachTyping(false);
@@ -221,7 +292,7 @@ export function useHomeChat(userId: string | null) {
 
       try {
         await uploadChatFile(userId, uri, name);
-        const result = await callBrain(userId, `Attached a file: ${name}`, 'file');
+        const result = await callBrain({ userId, message: `Attached a file: ${name}`, modality: 'file' });
         if (latestRequestRef.current !== requestId) return;
         setTranscript((prev) => [
           ...prev,

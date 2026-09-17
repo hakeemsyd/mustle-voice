@@ -1,6 +1,8 @@
 import { supabase } from './supabase';
+import { clearDerivedAccountState } from './accountReset';
+import { setCachedDisplayName } from './profileStore';
 import { heightToCm, weightToKg } from './units';
-import { isAppleHealthAvailable, readHealthSnapshot } from './appleHealth';
+import { canReadAppleHealth, readHealthSnapshot } from './appleHealth';
 import type { OnboardingState } from '../onboarding/useOnboardingState';
 
 function logIfError(label: string, error: { message: string } | null) {
@@ -16,6 +18,17 @@ export async function syncOnboarding(userId: string, state: OnboardingState) {
   const heightCm = state.height ? heightToCm(state.height, state.units) : null;
   const weightKg = state.weight ? weightToKg(state.weight, state.units) : null;
 
+  // Finishing onboarding means "this is who I am now", so anything the previous pass left behind
+  // has to go before the new answers land — see clearDerivedAccountState. A genuinely new account
+  // has nothing to delete, so this is a no-op on the normal path. Failures are logged rather than
+  // thrown: losing the user's just-entered answers because a cleanup query failed would be a far
+  // worse outcome than a stale row surviving.
+  try {
+    await clearDerivedAccountState(userId);
+  } catch (err) {
+    console.error('[onboardingSync] failed to clear previous account state:', err);
+  }
+
   const { error: profileError } = await supabase.from('profile').upsert({
     user_id: userId,
     display_name: state.userName || null,
@@ -23,6 +36,10 @@ export async function syncOnboarding(userId: string, state: OnboardingState) {
     timezone,
   });
   logIfError('profile upsert', profileError);
+  // Home reads the name off this cache, and it survives a re-onboarding in memory — so without
+  // this it kept greeting the user by whatever name the previous pass (or a misheard mid-call
+  // update_profile) had left there, rather than the one just typed in.
+  setCachedDisplayName(userId, state.userName || null);
 
   const { error: biometricsError } = await supabase.from('biometrics').upsert({
     user_id: userId,
@@ -47,7 +64,7 @@ export async function syncOnboarding(userId: string, state: OnboardingState) {
   // when they skipped that question or Health has a genuinely more recent reading.
   if (state.healthKitConnected) {
     try {
-      const available = await isAppleHealthAvailable();
+      const available = await canReadAppleHealth();
       if (available) {
         const snapshot = await readHealthSnapshot();
         if (snapshot.weightKg !== null && weightKg === null) {

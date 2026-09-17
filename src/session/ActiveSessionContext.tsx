@@ -271,9 +271,13 @@ export function ActiveSessionProvider({
   // below) — lets start() call it before resetting state without needing writeWorkoutLog defined
   // earlier in this file, and without start()'s own identity needing to depend on it.
   const writeWorkoutLogRef = useRef<((sets: LoggedSet[][], status: SessionStatus) => Promise<void>) | null>(null);
-  // Guards a single workout_log row per session run — logSet's completion branch, skipExercise's
-  // completion branch, and endSession must never all independently insert one for the same run.
+  // Set once a run has been written as finished. A run is written progressively now (every logged
+  // set updates the row), so this no longer guards against duplicate inserts — writeChainRef does
+  // that — it stops a late progress write downgrading a completed workout back to partial.
   const workoutLogWrittenRef = useRef(false);
+  // Serializes writes for a run so the first one inserts and every later one updates that same
+  // row. Without it, two sets logged in quick succession both see an empty logIdRef and insert.
+  const writeChainRef = useRef<Promise<void>>(Promise.resolve());
   // Reentrancy guard for logSet — a duplicated trigger landing in the same tick before a
   // re-render must not double-append or double-write.
   const loggingRef = useRef(false);
@@ -475,6 +479,24 @@ export function ActiveSessionProvider({
     return () => clearInterval(id);
   }, [target, ended, paused]);
 
+  // A workout that finishes by logging or skipping its last exercise never calls endSession, and
+  // the write effect in ActiveSessionScreen stops upserting the moment `ended` flips — so the row
+  // survived the workout, one set short of the truth, and brain-voice went on reading it as a
+  // session in progress for up to an hour. Confirmed live: live_session_state held Plank at 2 sets
+  // while workout_log held 3, and the row was still there after the coach had said goodbye.
+  const clearLiveSessionState = useCallback(() => {
+    const endingUserId = userIdRef.current;
+    if (endingUserId) void supabase.from("live_session_state").delete().eq("user_id", endingUserId);
+  }, []);
+
+  // A workout used to reach workout_log only when it finished, was skipped to the end, was ended
+  // explicitly, or was flushed by the next session starting. Killing the app mid-workout therefore
+  // threw the whole run away: confirmed live, zero workout_log rows existed across every account
+  // for three days of testing while live_session_state held the logged sets. Because a flexible
+  // plan's rotation advances off the last logged session, that also froze every schedule read —
+  // Home, the weekly calendar and "what's still due" all kept answering with the same session.
+  // The row is now written on the first set and updated on every one after, so an interrupted run
+  // survives as a partial exactly as an explicitly abandoned one does.
   const writeWorkoutLog = useCallback(
     async (sets: LoggedSet[][], status: SessionStatus) => {
       const userId = userIdRef.current;
@@ -499,7 +521,7 @@ export function ActiveSessionProvider({
         }));
 
       if (!isCardio && exercisesDone.length === 0) return;
-      workoutLogWrittenRef.current = true;
+      if (status === "completed") workoutLogWrittenRef.current = true;
 
       const vsPlanned = isCardio
         ? null
@@ -515,36 +537,50 @@ export function ActiveSessionProvider({
             })),
           };
 
-      setSaving(true);
-      const { data, error: insertError } = await supabase
-        .from("workout_log")
-        .insert({
-          user_id: userId,
-          plan_session_id:
-            target.type === "strength" ? target.planSessionId : null,
-          switched_from_session_id: target.switchedFromSessionId ?? null,
-          session_type: isCardio ? "cardio" : "strength",
-          cardio_activity: isCardio ? target.activity : null,
-          duration_sec: elapsedSec,
-          exercises_done: exercisesDone,
-          vs_planned: vsPlanned,
-          status,
-          note: null,
-        })
-        .select("id")
-        .maybeSingle();
-      setSaving(false);
+      const row = {
+        user_id: userId,
+        plan_session_id:
+          target.type === "strength" ? target.planSessionId : null,
+        switched_from_session_id: target.switchedFromSessionId ?? null,
+        session_type: isCardio ? "cardio" : "strength",
+        cardio_activity: isCardio ? target.activity : null,
+        duration_sec: elapsedSec,
+        exercises_done: exercisesDone,
+        vs_planned: vsPlanned,
+        status,
+      };
 
-      if (insertError) {
-        workoutLogWrittenRef.current = false; // allow a genuine retry after a real failure
-        console.error(
-          "[active session] failed to log workout:",
-          insertError.message,
-        );
-        return;
-      }
-      logIdRef.current = data?.id ?? null;
-      setWorkoutLogId(data?.id ?? null);
+      const write = async () => {
+        setSaving(true);
+        const existingId = logIdRef.current;
+        const { data, error: writeError } = existingId
+          ? await supabase
+              .from("workout_log")
+              .update(row)
+              .eq("id", existingId)
+              .select("id")
+              .maybeSingle()
+          : await supabase
+              .from("workout_log")
+              .insert({ ...row, note: null })
+              .select("id")
+              .maybeSingle();
+        setSaving(false);
+
+        if (writeError) {
+          if (status === "completed") workoutLogWrittenRef.current = false;
+          console.error(
+            "[active session] failed to log workout:",
+            writeError.message,
+          );
+          return;
+        }
+        logIdRef.current = data?.id ?? existingId;
+        setWorkoutLogId(logIdRef.current);
+      };
+
+      writeChainRef.current = writeChainRef.current.then(write, write);
+      await writeChainRef.current;
     },
     [exercises, target, elapsedSec],
   );
@@ -609,14 +645,17 @@ export function ActiveSessionProvider({
         setResting(true);
         setRestKey((k) => k + 1);
         setRestReasonLabel(restReasonCopy(suggestion.reason));
+        void writeWorkoutLogRef.current?.(next, "partial");
       } else if (currentExerciseIndex === exercises.length - 1) {
         setEnded(true);
         setEndedStatus("completed");
+        clearLiveSessionState();
         void writeWorkoutLog(next, "completed").then(() => {
           if (lastSetSnapshotRef.current) lastSetSnapshotRef.current.createdWorkoutLogId = logIdRef.current;
         });
       } else {
         setCurrentExerciseIndex((i) => i + 1);
+        void writeWorkoutLogRef.current?.(next, "partial");
       }
 
       queueMicrotask(() => {
@@ -633,6 +672,7 @@ export function ActiveSessionProvider({
       restEndAt,
       restPausedRemainingSec,
       writeWorkoutLog,
+      clearLiveSessionState,
     ],
   );
 
@@ -640,11 +680,19 @@ export function ActiveSessionProvider({
     const snap = lastSetSnapshotRef.current;
     if (!snap) return;
     lastSetSnapshotRef.current = null;
-    if (snap.createdWorkoutLogId) {
-      await supabase.from("workout_log").delete().eq("id", snap.createdWorkoutLogId);
-      logIdRef.current = null;
-      setWorkoutLogId(null);
-      workoutLogWrittenRef.current = false; // allow the corrected next set to actually write the row
+    // The row is no longer created by the finishing set — it exists from the first one — so
+    // deleting it here would throw away the whole run rather than the set being undone. It is
+    // rewritten with the pre-set state instead, and only deleted when the undo empties the run.
+    const existingLogId = logIdRef.current;
+    if (existingLogId) {
+      workoutLogWrittenRef.current = false;
+      if (snap.loggedSets.some((sets) => sets.length > 0)) {
+        void writeWorkoutLogRef.current?.(snap.loggedSets, "partial");
+      } else {
+        await supabase.from("workout_log").delete().eq("id", existingLogId);
+        logIdRef.current = null;
+        setWorkoutLogId(null);
+      }
     }
     setLoggedSets(snap.loggedSets);
     setCurrentExerciseIndex(snap.currentExerciseIndex);
@@ -669,11 +717,12 @@ export function ActiveSessionProvider({
       const status: SessionStatus = loggedSets.some((sets) => sets.length > 0) ? "completed" : "partial";
       setEnded(true);
       setEndedStatus(status);
+      clearLiveSessionState();
       void writeWorkoutLog(loggedSets, status);
     } else {
       setCurrentExerciseIndex((i) => i + 1);
     }
-  }, [currentExerciseIndex, exercises.length, loggedSets, writeWorkoutLog]);
+  }, [currentExerciseIndex, exercises.length, loggedSets, writeWorkoutLog, clearLiveSessionState]);
 
   const addSet = useCallback(() => {
     setExercises((prev) => {
@@ -821,7 +870,7 @@ export function ActiveSessionProvider({
           elapsedSec,
         });
         const liveSessionState = snapshot ? describeLiveSessionSnapshot(snapshot) : undefined;
-        const result = await callBrain(userId, text.trim(), "text", false, undefined, liveSessionState);
+        const result = await callBrain({ userId, message: text.trim(), liveSessionState });
         if (latestAskRef.current !== requestId) return;
         setCoachMessage(result.reply);
         appendMessage("coach", result.reply);

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { supabase } from "../lib/supabase";
+import { isUnfinishedWorkout } from "../lib/resolveTodaySession";
 
 export interface DayStatus {
   label: string;
@@ -151,7 +152,7 @@ export function useStatsData(): StatsData {
         const d = new Date();
         d.setDate(d.getDate() - i);
         const completedToday = workouts.some(
-          (w) => w.status !== "partial" && kgKey(new Date(w.at)) === kgKey(d),
+          (w) => !isUnfinishedWorkout(w.status) && kgKey(new Date(w.at)) === kgKey(d),
         );
         if (completedToday) completedThisWeek++;
         const status: DayStatus["status"] = completedToday
@@ -168,12 +169,12 @@ export function useStatsData(): StatsData {
       for (let i = 13; i >= 7; i--) {
         const d = new Date();
         d.setDate(d.getDate() - i);
-        if (workouts.some((w) => w.status !== "partial" && kgKey(new Date(w.at)) === kgKey(d))) completedLastWeek++;
+        if (workouts.some((w) => !isUnfinishedWorkout(w.status) && kgKey(new Date(w.at)) === kgKey(d))) completedLastWeek++;
       }
       const prevPct = planned > 0 ? Math.min(100, Math.round((completedLastWeek / planned) * 100)) : 0;
 
       // ── Streak ───────────────────────────────────────────────────────────
-      const workoutDays = new Set(workouts.filter((w) => w.status !== "partial").map((w) => kgKey(new Date(w.at))));
+      const workoutDays = new Set(workouts.filter((w) => !isUnfinishedWorkout(w.status)).map((w) => kgKey(new Date(w.at))));
       let streakDays = 0;
       const cursor = new Date();
       if (!workoutDays.has(kgKey(cursor))) cursor.setDate(cursor.getDate() - 1);
@@ -270,7 +271,7 @@ export function useStatsData(): StatsData {
         const windowStart = new Date(dayEnd);
         windowStart.setDate(windowStart.getDate() - 6);
         const completedInWindow = workouts.filter(
-          (w) => w.status !== "partial" && new Date(w.at) >= windowStart && new Date(w.at) <= dayEnd,
+          (w) => !isUnfinishedWorkout(w.status) && new Date(w.at) >= windowStart && new Date(w.at) <= dayEnd,
         ).length;
         performanceTrend.push(planned > 0 ? Math.min(100, Math.round((completedInWindow / planned) * 100)) : 0);
       }

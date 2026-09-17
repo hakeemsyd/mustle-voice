@@ -7,6 +7,7 @@ import { titleCase } from '../lib/textFormat';
 import { setCachedDisplayName } from '../lib/profileStore';
 import { isPlanPending, clearPlanPending } from '../lib/planStatus';
 import { MACRO_META, type MacroTarget } from '../screens/homeFormat';
+import { useLocalDayRollover } from './useLocalDayRollover';
 
 export interface TodaySession {
   hasSession: boolean;
@@ -127,10 +128,18 @@ function buildGreetingPrompt(
   const questionNote =
     ' End with one short, specific question about how they\'re doing today (energy, hunger, soreness, ' +
     'how yesterday\'s session felt) — never a purely one-way statement.';
+  // The clock time is stated here outright rather than pointed at ("the current time is in the
+  // context below"). Pointing at it is what produced "I need the current time to greet you
+  // naturally" as the actual greeting on Home: asked for something it believed it was missing,
+  // the model narrated the gap instead of answering. Giving it the value removes the gap.
+  const now = new Date();
+  const clock = now.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  const day = now.toLocaleDateString(undefined, { weekday: 'long' });
   const timeNote =
-    ' The current time is in the context below — let it inform the greeting naturally (never ' +
-    '"good morning" in the evening, and a late-night greeting reads differently than an early one) ' +
-    'without literally stating the clock time.';
+    ` It is currently ${clock} on ${day}. Let that inform the greeting naturally (never "good ` +
+    'morning" in the evening, and a late-night greeting reads differently than an early one) ' +
+    'without literally stating the clock time. Never ask for the time and never mention needing ' +
+    'it — you have it.';
 
   if (!sessionToday) {
     return (
@@ -157,6 +166,29 @@ const CAPTION_MAX_CHARS = 140;
 // — a flat char-slice was chopping words in half whenever two sentences together ran long, which
 // the richer daily-greeting prompt (grounded in real plan + macros) hits far more often than a
 // typical short Q&A reply did.
+// Phrases that mean the model narrated its own process instead of greeting — asking for input it
+// should already have, describing what it needs, or refusing. Home renders this string as the
+// coach's voice with no chat context around it, so a leak like "I need the current time to greet
+// you naturally" reads as the product being broken rather than as a bad turn. Matched on the whole
+// message, and only ever used to fall back to the default greeting, never to edit the text.
+// Deliberately narrow. "I need …" on its own is ordinary coaching ("I need you to slow the
+// eccentric"), so the missing-input patterns only fire when what's wanted is the kind of thing
+// the app supplies rather than the user — time, date, context, data. Over-matching here costs a
+// real greeting and replaces it with a generic one, so precision matters more than coverage.
+const MISSING_INPUT = /\b(?:i (?:need|require|don'?t have|do not have|am missing|'m missing)|could you (?:tell|provide|give) me)\b[^.!?]{0,60}\b(?:current |the )?(?:time|date|day of|clock|context|information|data|details)\b/i;
+
+const META_LEAK_PATTERNS = [
+  MISSING_INPUT,
+  /\b(?:in order )?to greet you (?:naturally|properly|appropriately)\b/i,
+  /\bas an ai\b/i,
+  /\b(?:system|context) (?:note|block|prompt)\b/i,
+  /\[system\b/i,
+];
+
+export function looksLikeMetaLeak(text: string): boolean {
+  return META_LEAK_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 function sanitizeCoachMessage(raw: string): string {
   const stripped = raw
     .replace(/\*\*(.*?)\*\*/g, '$1')
@@ -192,6 +224,11 @@ export function useHomeData(): HomeData {
   });
   const [refetchSignal, setRefetchSignal] = useState(0);
   const refetch = useCallback(() => setRefetchSignal((n) => n + 1), []);
+
+  // Today's session, the greeting, and the nutrition window are all scoped to the user's local
+  // day, so all three have to be re-read the moment that day turns over — not whenever the screen
+  // next happens to regain focus. See useLocalDayRollover.
+  useLocalDayRollover(refetch);
   // Guards against two overlapping refetches (e.g. a fast tab-switch) both seeing "stale" and
   // firing their own generation call — same instance only; a real cross-device race is a
   // fabricated-not-corrupted duplicate greeting at worst, not the P0 class of bug.
@@ -246,7 +283,8 @@ export function useHomeData(): HomeData {
 
       const ninetyDaysAgo = new Date(Date.now() - 90 * 86_400_000);
 
-      const [profileRes, planRes, nutritionRes, foodRes, messageRes, workoutRes, restDayRes] = await Promise.all([
+      const [profileRes, planRes, nutritionRes, foodRes, messageRes, workoutRes, restDayRes, overrideRes] =
+        await Promise.all([
         settled('profile', supabase.from('profile').select('display_name').eq('user_id', userId).maybeSingle()),
         settled(
           'plan',
@@ -275,7 +313,7 @@ export function useHomeData(): HomeData {
           'message',
           supabase
             .from('message')
-            .select('content, at')
+            .select('content, at, greeting_key')
             .eq('user_id', userId)
             .eq('role', 'assistant')
             .eq('hidden', true)
@@ -296,6 +334,15 @@ export function useHomeData(): HomeData {
           'rest_day',
           supabase.from('rest_day').select('date').eq('user_id', userId).gte('date', localDateKey(ninetyDaysAgo)),
         ),
+        settled(
+          'day_override',
+          supabase
+            .from('day_override')
+            .select('plan_session(id, day_order, weekday, focus, plan_exercise(id, ord, exercise:exercise_id(name)))')
+            .eq('user_id', userId)
+            .eq('date', localDateKey(new Date()))
+            .maybeSingle(),
+        ),
       ]);
       if (cancelled) return;
 
@@ -303,6 +350,7 @@ export function useHomeData(): HomeData {
       for (const [label, res] of [
         ['profile', profileRes], ['plan', planRes], ['nutrition', nutritionRes],
         ['food', foodRes], ['message', messageRes], ['workout', workoutRes], ['rest_day', restDayRes],
+        ['day_override', overrideRes],
       ] as const) {
         if (res.error) console.warn(`[home] ${label} error:`, res.error.message ?? res.error);
       }
@@ -312,14 +360,24 @@ export function useHomeData(): HomeData {
 
       const plan = planRes.data;
       const hasPlan = !!plan;
+      // A one-off session the coach built for today (create_custom_session) replaces whatever the
+      // plan says is due — including a rest day — so it's resolved here alongside the plan rather
+      // than as a special case afterwards. It's also why `plan` alone no longer gates this block:
+      // a custom session is due whether or not there's an active plan behind it.
+      const overrideSession = (() => {
+        const row = (overrideRes.data as any)?.plan_session ?? null;
+        return (Array.isArray(row) ? row[0] : row) ?? null;
+      })();
+
       let todaySession: TodaySession | null = null;
       let greetingSession: { focus: string | null; exerciseNames: string[] } | null = null;
-      if (plan) {
+      if (plan || overrideSession) {
         const sessionToday = resolveTodaySession(
-          (plan.plan_session ?? []) as any[],
+          (plan?.plan_session ?? []) as any[],
           (workoutRes.data ?? []) as any[],
           new Date(),
           restDayDates,
+          overrideSession,
         );
         todaySession = sessionToday
           ? {
@@ -356,7 +414,9 @@ export function useHomeData(): HomeData {
           })
         : null;
 
-      const lastGreeting = messageRes.data as { content: string; at: string } | null;
+      const lastGreeting = messageRes.data as
+        | { content: string; at: string; greeting_key: string | null }
+        | null;
       // Same-day isn't enough on its own — completing a session mid-day rotates a flexible
       // plan to the next one (or clears today's session on a pinned plan), and a greeting
       // generated before that still describes the workout that's no longer queued up. A plan
@@ -369,14 +429,24 @@ export function useHomeData(): HomeData {
         null as string | null,
       );
       const planCreatedAt = (plan as any)?.created_at ?? null;
+      // What today's greeting is *about*. A greeting names the session and its exercises, so it
+      // stops being true the moment today resolves to a different session — which the three
+      // time-based checks below cannot see. Confirmed live: the headline read "Upper Pull tonight
+      // — Deadlift, Lat Pulldown, Seated Row, Face Pull" directly above a session chip reading
+      // "LOWER, 4 exercises". A cached greeting with no key at all predates this column, so it is
+      // treated as unverifiable and regenerated once rather than trusted.
+      const greetingKey = todaySession?.hasSession ? todaySession.planSessionId : 'rest';
       const greetingIsFreshToday = lastGreeting
         ? dateKey(new Date(lastGreeting.at)) === dateKey(new Date()) &&
+          lastGreeting.greeting_key === greetingKey &&
           (!mostRecentWorkoutAt || new Date(mostRecentWorkoutAt) <= new Date(lastGreeting.at)) &&
           (!planCreatedAt || new Date(planCreatedAt) <= new Date(lastGreeting.at))
         : false;
 
       let coachMessage: string;
-      if (greetingIsFreshToday && lastGreeting?.content) {
+      // A leaked greeting gets persisted like any other, so it would otherwise keep reappearing
+      // from cache all day — the check has to run on the stored copy too, not just fresh output.
+      if (greetingIsFreshToday && lastGreeting?.content && !looksLikeMetaLeak(lastGreeting.content)) {
         coachMessage = sanitizeCoachMessage(lastGreeting.content);
       } else if (!hasPlan) {
         coachMessage = DEFAULT_COACH_MESSAGE_NO_PLAN;
@@ -394,17 +464,18 @@ export function useHomeData(): HomeData {
                   proteinLeft: Math.max(0, proteinMacro.goal - proteinMacro.current),
                 }
               : null;
-          const generated = await callBrain(
+          const generated = await callBrain({
             userId,
-            buildGreetingPrompt(greetingSession, nutritionForGreeting),
-            'text',
-            true,
-            undefined,
-            undefined,
-            undefined,
-            true,
-          );
-          coachMessage = sanitizeCoachMessage(generated.reply);
+            message: buildGreetingPrompt(greetingSession, nutritionForGreeting),
+            hidden: true,
+            isDailyGreeting: true,
+            greetingKey,
+          });
+          coachMessage = looksLikeMetaLeak(generated.reply)
+            ? hasPlan
+              ? DEFAULT_COACH_MESSAGE_HAS_PLAN
+              : DEFAULT_COACH_MESSAGE_NO_PLAN
+            : sanitizeCoachMessage(generated.reply);
         } catch (err) {
           console.warn('[home] daily greeting generation failed:', err);
           coachMessage = DEFAULT_COACH_MESSAGE_HAS_PLAN;

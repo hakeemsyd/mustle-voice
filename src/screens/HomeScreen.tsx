@@ -26,6 +26,7 @@ import { useHomeChat } from "../hooks/useHomeChat";
 import { colors, fonts } from "../constants/theme";
 import { CalendarIcon, MenuIcon, MoonIcon, SunIcon } from "../icons";
 import { getMomentumLine } from "./homeFormat";
+import { subscribeToHomeRefresh } from "../lib/homeRefreshBridge";
 
 type TimeBand = "Morning" | "Afternoon" | "Evening" | "Night";
 
@@ -95,6 +96,12 @@ export function HomeScreen() {
     if (wasVoiceActive.current && !isActive) refetch();
     wasVoiceActive.current = isActive;
   }, [isActive, refetch]);
+
+  // Neither of the two refreshes around this one covers the case that matters most: the user is
+  // sitting on Home, mid-conversation, and the coach creates today's session. Focus never changes
+  // and the call is still live, so the screen would keep showing "rest day" while the coach says
+  // it's ready. The brain emits refresh_home for exactly that (see AppActionBridge).
+  useEffect(() => subscribeToHomeRefresh(refetch), [refetch]);
 
   // Picks up whatever changed off-screen — e.g. a workout just logged in Active Session —
   // whenever Home regains focus, not just after a voice session ends.

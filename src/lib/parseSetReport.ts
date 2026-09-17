@@ -16,6 +16,9 @@ export interface ParsedSet {
 // A lone bare number is ambiguous — "60" could be a weight or 60 reps — so it's rejected
 // rather than guessed. Guessing it as reps is what silently logged "60 reps, bodyweight"
 // three times against a real session instead of "60kg".
+// The ordinal only, never "3 sets of 10" or "a set of 8", which carry real counts.
+const SET_ORDINAL_PATTERN = /\b(?:sets?\s*#?\s*\d+|\d+(?:st|nd|rd|th)\s+set)\b/gi;
+
 export function parseSetReport(raw: string): ParsedSet | null {
   const normalized = normalizeSpokenNumbers(raw);
 
@@ -29,16 +32,21 @@ export function parseSetReport(raw: string): ParsedSet | null {
     return reps > 0 ? { weight: null, reps, unit: 'seconds' } : null;
   }
 
-  const weightMatch = normalized.match(/(\d+(?:\.\d+)?)\s*(?:kg|kgs|kilos?|lb|lbs|pounds?)\b/i);
+  const weightMatch = normalized.match(/(\d+(?:\.\d+)?)\s*(?:kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?)\b/i);
   const repsMatch = normalized.match(/(\d+)\s*(?:reps?|x)\b/i);
 
   if (weightMatch || repsMatch) {
     const weight = weightMatch ? Number(weightMatch[1]) : null;
     let reps = repsMatch ? Math.round(Number(repsMatch[1])) : null;
 
-    // "60kg 8" — weight was pinned by its unit, so the remaining loose number is the reps.
+    // "60kg 8" — weight was pinned by its unit, so the remaining loose number is the reps. The
+    // set's own ordinal is stripped first: "Set two done, 80 kilograms" normalizes to "Set 2
+    // done, 80 kilograms", and that 2 was read as the rep count, logging an 80kg set as 2 reps.
     if (reps === null && weightMatch) {
-      const leftover = normalized.replace(weightMatch[0], ' ').match(/\d+/);
+      const leftover = normalized
+        .replace(weightMatch[0], ' ')
+        .replace(SET_ORDINAL_PATTERN, ' ')
+        .match(/\d+/);
       if (leftover) reps = Math.round(Number(leftover[0]));
     }
     // "8 reps" alone is a valid bodyweight set; a weight with no reps at all is not.
@@ -60,6 +68,17 @@ export function parseSetReport(raw: string): ParsedSet | null {
   const weight = Number(positional[1]);
   const reps = Math.round(Number(positional[2]));
   return reps > 0 ? { weight, reps } : null;
+}
+
+const STATED_WEIGHT_PATTERN =
+  /^(?:(?:it'?s|its|i'?m\s+using|im\s+using|using|with|at|about|around|roughly|maybe|let'?s\s+do|lets\s+do|do|go\s+with|going\s+with|make\s+it|put\s+on)\s+)?(\d+(?:\.\d+)?)\s*(?:kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?)\s*\.?$/i;
+
+export function parseStatedWeight(raw: string): number | null {
+  if (parseSetReport(raw) !== null) return null;
+  const match = normalizeSpokenNumbers(raw).trim().match(STATED_WEIGHT_PATTERN);
+  if (!match) return null;
+  const weight = Number(match[1]);
+  return weight > 0 ? weight : null;
 }
 
 export function describeParsedSet(parsed: ParsedSet): string {

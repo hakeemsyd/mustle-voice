@@ -18,11 +18,18 @@ import { colors } from './src/constants/theme';
 import { supabase } from './src/lib/supabase';
 import { subscribeToAccountReset } from './src/lib/appResetBridge';
 import { parseRecoveryUrl } from './src/lib/passwordRecovery';
+import * as Sentry from '@sentry/react-native';
+import { initCrashReporting } from './src/lib/crashReporting';
+
+initCrashReporting();
 
 const AGENT_ID = process.env.EXPO_PUBLIC_AGENT_ID;
 if (!AGENT_ID) {
   throw new Error('Missing EXPO_PUBLIC_AGENT_ID');
 }
+
+const ONBOARDING_CHECK_RETRY_MS = 600;
+const ONBOARDING_CHECK_MAX_RETRY_MS = 5_000;
 
 const navTheme: Theme = {
   ...DarkTheme,
@@ -80,16 +87,30 @@ const App = () => {
     }
 
     let cancelled = false;
-    supabase
-      .from('profile')
-      .select('user_id')
-      .eq('user_id', userId)
-      .maybeSingle()
-      .then(({ data, error }) => {
-        if (cancelled) return;
-        if (error) console.error('[App] failed to check onboarding status:', error.message);
-        setOnboarded(!!data);
-      });
+
+    const check = async (attempt: number): Promise<void> => {
+      const { data, error } = await supabase
+        .from('profile')
+        .select('user_id')
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (cancelled) return;
+
+      if (error) {
+        console.error('[App] failed to check onboarding status:', error.message);
+        setTimeout(
+          () => {
+            if (!cancelled) void check(attempt + 1);
+          },
+          Math.min(ONBOARDING_CHECK_RETRY_MS * attempt, ONBOARDING_CHECK_MAX_RETRY_MS),
+        );
+        return;
+      }
+
+      setOnboarded(!!data);
+    };
+
+    void check(1);
 
     return () => {
       cancelled = true;
@@ -186,4 +207,4 @@ const styles = {
   loading: { flex: 1, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' },
 } as const;
 
-export default App;
+export default Sentry.wrap(App);

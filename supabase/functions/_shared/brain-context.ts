@@ -78,6 +78,34 @@ export async function fetchRestDayDates(supabase: any, userId: string, sinceIso:
   return new Set((data ?? []).map((r: any) => r.date));
 }
 
+/** A one-off session pinned to a specific date — what the coach builds when the user wants
+ *  something other than what the plan says today (see write_custom_session). It outranks both the
+ *  plan rotation and a rest day, so every "what's due today" question has to check it FIRST:
+ *  a rest day that has been overridden is no longer a rest day. */
+export async function fetchDayOverrideSession(
+  supabase: any,
+  userId: string,
+  dateKey: string,
+): Promise<PlanSessionRow | null> {
+  const { data, error } = await supabase
+    .from('day_override')
+    // Selects the superset every caller needs (sets/rep_scheme for show_daily_workout's card, the
+    // name for every context line) rather than a per-caller shape — one query, and no caller can
+    // silently get back a session missing the fields it reads.
+    .select(
+      'plan_session(id, day_order, weekday, focus, plan_exercise(ord, sets, rep_scheme, load_scheme, exercise(name)))',
+    )
+    .eq('user_id', userId)
+    .eq('date', dateKey)
+    .maybeSingle();
+  if (error) {
+    console.error('[brain] failed to read day_override:', error.message);
+    return null;
+  }
+  const session = (data as any)?.plan_session ?? null;
+  return Array.isArray(session) ? (session[0] ?? null) : session;
+}
+
 // An 'interrupted' session (see interrupted-session.ts) is just as unresolved as a 'partial' one
 // — neither should advance a flexible rotation or count as "done today" until the coach has
 // actually reconciled what happened, so both are treated identically here.
@@ -94,7 +122,12 @@ export function resolveTodaySession(
   logs: WorkoutLogRow[],
   now: Date,
   restDayDates: Set<string> = new Set(),
+  dayOverride: PlanSessionRow | null = null,
 ): PlanSessionRow | null {
+  // Checked before everything else, including the rest-day short-circuit: an override is the user
+  // explicitly asking for this session today, so it outranks both a rest day and the rotation.
+  // Whether the plan has any sessions at all is irrelevant — a custom session stands on its own.
+  if (dayOverride) return dayOverride;
   if (sessions.length === 0) return null;
   if (restDayDates.has(now.toISOString().slice(0, 10))) return null;
 
@@ -182,7 +215,23 @@ export async function buildContextBlock(
   console.log(`[voice-timing:server] finalizeStaleLiveSession: +${Date.now() - tStale0}ms`);
 
   const ninetyDaysAgo = new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10);
-  const [{ data: profile }, { data: activePlan }, { data: recentLogs }, restDayDates, { data: interrupted }] = await Promise.all([
+  // The override lookup wants today's date in the user's timezone. The client sends its live
+  // timezone on every call and that value wins over the stored one anyway, so on the normal path
+  // it is known before any query runs and this can join the parallel batch. Only a request that
+  // omits it falls back to a serial lookup after `profile` arrives.
+  //
+  // This matters more than it looks: ElevenLabs caps a custom LLM at 15 seconds per turn and
+  // cannot be raised, so every avoidable round trip here is spent against that ceiling. Running
+  // it serially added a whole trip to every single voice turn.
+  const eagerTodayKey = requestTimezone ? nowInTimezone(requestTimezone).toISOString().slice(0, 10) : null;
+  const [
+    { data: profile },
+    { data: activePlan },
+    { data: recentLogs },
+    restDayDates,
+    { data: interrupted },
+    eagerOverride,
+  ] = await Promise.all([
     supabase.from('profile').select('timezone').eq('user_id', userId).maybeSingle(),
     supabase
       .from('training_plan')
@@ -192,7 +241,7 @@ export async function buildContextBlock(
       .maybeSingle(),
     supabase
       .from('workout_log')
-      .select('at, plan_session_id, status')
+      .select('at, plan_session_id, status, plan_session(focus)')
       .eq('user_id', userId)
       .order('at', { ascending: false })
       .limit(10),
@@ -205,12 +254,21 @@ export async function buildContextBlock(
       .order('at', { ascending: false })
       .limit(1)
       .maybeSingle(),
+    eagerTodayKey ? fetchDayOverrideSession(supabase, userId, eagerTodayKey) : Promise.resolve(null),
   ]);
 
   const timezone = requestTimezone || profile?.timezone || null;
+  // Deliberately not awaited. This is an opportunistic refresh of a stored convenience value;
+  // nothing in this turn reads it back, and blocking the reply on a write is latency spent for
+  // no benefit against the 15-second ceiling.
   if (requestTimezone && requestTimezone !== profile?.timezone) {
-    const { error } = await supabase.from('profile').update({ timezone: requestTimezone }).eq('user_id', userId);
-    if (error) console.error('[brain] failed to refresh profile.timezone:', error.message);
+    void supabase
+      .from('profile')
+      .update({ timezone: requestTimezone })
+      .eq('user_id', userId)
+      .then(({ error }: { error: { message: string } | null }) => {
+        if (error) console.error('[brain] failed to refresh profile.timezone:', error.message);
+      });
   }
 
   const now = nowInTimezone(timezone);
@@ -222,20 +280,31 @@ export async function buildContextBlock(
   const dateLine =
     `Right now it is ${timeOfDay} on ${weekday}, ${now.toISOString().slice(0, 10)} (${timezone ?? 'UTC'} time).`;
 
+  const todayKey = now.toISOString().slice(0, 10);
+  const dayOverride =
+    eagerTodayKey === todayKey ? eagerOverride : await fetchDayOverrideSession(supabase, userId, todayKey);
+
   const sessions: PlanSessionRow[] = activePlan?.plan_session ?? [];
   const logs: WorkoutLogRow[] = logsInTimezone(recentLogs ?? [], timezone);
 
   const weeklyPlanLine = sessions.length > 0 ? describeWeeklyPlan(sessions) : null;
 
   let planLine: string;
-  if (sessions.length === 0) {
+  if (sessions.length === 0 && !dayOverride) {
     planLine = 'No active training plan yet.';
   } else {
-    const today = resolveTodaySession(sessions, logs, now, restDayDates);
+    const today = resolveTodaySession(sessions, logs, now, restDayDates, dayOverride);
     if (!today) {
-      planLine = restDayDates.has(now.toISOString().slice(0, 10))
+      planLine = restDayDates.has(todayKey)
         ? 'Today is a rest day — the user chose to skip it.'
         : 'Today is a rest day — no scheduled session.';
+    } else if (dayOverride) {
+      // Spelled out as a one-off so the model doesn't start describing it as part of the program
+      // and contradict the weekly schedule line sitting right next to it.
+      planLine =
+        `Today's session is a ONE-OFF custom session the user asked for, replacing whatever the ` +
+        `plan had scheduled: ${describeSession(today)}. It exists in the app and is showing on ` +
+        `Home with a Start button. The weekly plan itself is unchanged and resumes tomorrow.`;
     } else {
       const alreadyDone = logs.some(
         (log) => log.plan_session_id === today.id && !isPartial(log) && sameLocalDay(new Date(log.at), now),
@@ -247,10 +316,33 @@ export async function buildContextBlock(
     }
   }
 
-  const lastLog = logs[0];
-  const historyLine = lastLog
-    ? `Most recent logged workout: ${new Date(lastLog.at).toISOString().slice(0, 10)} (${lastLog.status ?? 'completed'}).`
-    : 'No workouts logged yet.';
+  // A single "most recent workout" date was all the model ever got, which is not enough to answer
+  // the questions users actually ask — "have I trained this week?", "what did I do last time?" —
+  // so it either called read_state or, confirmed live, asserted the user had never logged anything
+  // and hadn't trained this week. The rows are already fetched; spelling them out costs nothing
+  // and makes the common question answerable without a tool call. The explicit "this is the whole
+  // recent history" line matters as much as the list: without it, an empty list reads as "no data
+  // available" rather than "genuinely none", which is the difference between asking and asserting.
+  const startOfWeek = new Date(now);
+  startOfWeek.setUTCDate(startOfWeek.getUTCDate() - startOfWeek.getUTCDay());
+  startOfWeek.setUTCHours(0, 0, 0, 0);
+  const completedLogs = logs.filter((log) => !isPartial(log));
+  const thisWeekCount = completedLogs.filter((log) => new Date(log.at) >= startOfWeek).length;
+
+  const historyLine =
+    logs.length === 0
+      ? 'Training history: no workouts logged yet, ever. This is confirmed, not missing data — ' +
+        'say so plainly if asked, and never guess that they have trained.'
+      : [
+          `Training history (the ${logs.length} most recent logged workouts — this IS the record, ` +
+            `not a sample; do not claim the user has never trained when rows are listed here):`,
+          ...logs.map((log) => {
+            const focus = humanizeFocus((log as any).plan_session?.focus ?? null);
+            const date = new Date(log.at).toISOString().slice(0, 10);
+            return `  - ${date}: ${focus} (${log.status ?? 'completed'})`;
+          }),
+          `Completed workouts so far this calendar week (since Sunday): ${thisWeekCount}.`,
+        ].join('\n');
 
   // Surfaced every turn (not just the first) so the model can still act on it if the user brings
   // it up mid-conversation — but instructed to only actually RAISE it unprompted once, near the

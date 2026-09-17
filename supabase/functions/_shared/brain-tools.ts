@@ -441,6 +441,59 @@ export const BRAIN_TOOLS = [
     },
   },
   {
+    name: 'create_custom_session',
+    description:
+      'Build a ONE-OFF workout for today that replaces whatever the plan has scheduled — including ' +
+      'a rest day. This is the tool for "swap the rest day for an arms workout", "I want to do legs ' +
+      'instead today", "give me a quick push session". It does NOT change the training plan: the ' +
+      'program is untouched and resumes tomorrow, which is why this is right and update_training_plan ' +
+      '(which replaces the entire plan) is wrong. On success the session becomes today\'s session ' +
+      'everywhere in the app — Home shows it with a Start button, and start_todays_workout will run ' +
+      'it. Every exercise name must come from the catalog listed in your instructions, and every one ' +
+      'is checked against active injuries before anything is saved; if it comes back rejected, revise ' +
+      'and call again. Call WITHOUT confirm first — that returns a preview and saves nothing. Only ' +
+      'call again with confirm:true and the exact confirm_token after the user has explicitly agreed ' +
+      'in their next message. Until it returns status "created", nothing exists: do not tell the user ' +
+      'they are all set, do not tell them to start it, and do not describe the session as real.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        focus: {
+          type: 'string',
+          description: "What this session is, in the user's words — e.g. 'arms', 'legs', 'quick push'.",
+        },
+        exercises: {
+          type: 'array',
+          description: '3-8 exercises, in the order they should be performed.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Exact catalog name.' },
+              sets: { type: 'integer' },
+              rep_scheme: { type: 'string', description: "e.g. '8-10', 'AMRAP'" },
+              load_scheme: {
+                type: 'string',
+                description:
+                  "Never leave blank — their prior numbers if known, otherwise a sensible start " +
+                  "(e.g. 'bodyweight', 'light — find your working weight').",
+              },
+            },
+            required: ['name', 'sets', 'rep_scheme'],
+          },
+        },
+        confirm: { type: 'boolean', description: 'Leave false/omitted to preview; true only after explicit agreement.' },
+        confirm_token: {
+          type: 'string',
+          description:
+            'Required alongside confirm:true — the exact confirm_token string the preview call just ' +
+            'returned. A stale, missing, or invented token is rejected and returns a fresh preview ' +
+            'instead of creating anything.',
+        },
+      },
+      required: ['focus', 'exercises'],
+    },
+  },
+  {
     name: 'show_plan_breakdown',
     description:
       "Show the user's active training plan as a structured breakdown card (program title, each day's focus and exercises, and start/modify actions) instead of describing it in a wall of text. Use this whenever they ask for an overview, breakdown, or \"what's my plan\" — pair it with one short natural sentence, not a text description of the plan itself.",
@@ -497,7 +550,7 @@ export const BRAIN_TOOLS = [
   {
     name: 'skip_exercise',
     description:
-      "Move on from the current exercise in the user's active in-app workout session to the next one, without logging a set for it. Call this for explicit \"skip\"/\"next exercise\" wording, AND for phrases that name a different, later exercise in the session instead of the current one — e.g. \"let's start dumbbell press\" or \"let's do overhead press now\" while bench press is still current — confirmed live: agreeing to that verbally without calling this leaves the app still showing the old exercise as current, out of sync with what you just said. Only works while a session is actually running in the app, and only advances to the exercise that's actually next in this session — never to an arbitrary exercise the user names that isn't queued up.",
+      "ABANDON the current exercise before it is finished, at the user's request, and move to the next one without logging a set for it. NEVER call this to advance after a final set: the app moves to the next exercise BY ITSELF the moment the last set is logged, so calling it there skips an entire exercise and misfiles the set the user is reporting — confirmed live, Hip Thrust was left at 3 of 4 and the user's fourth set landed on Leg Curl. If the user has just reported the last set, say nothing about skipping and call no tool; the app has already moved on. Call this for explicit \"skip\"/\"next exercise\" wording, AND for phrases that name a different, later exercise in the session instead of the current one — e.g. \"let's start dumbbell press\" or \"let's do overhead press now\" while bench press is still current — confirmed live: agreeing to that verbally without calling this leaves the app still showing the old exercise as current, out of sync with what you just said. Only works while a session is actually running in the app, and only advances to the exercise that's actually next in this session — never to an arbitrary exercise the user names that isn't queued up.",
     input_schema: { type: 'object', properties: {} },
   },
   {

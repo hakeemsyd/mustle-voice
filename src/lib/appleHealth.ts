@@ -1,5 +1,7 @@
 import { Platform } from 'react-native';
 import {
+  AuthorizationRequestStatus,
+  getRequestStatusForAuthorization,
   isHealthDataAvailable,
   requestAuthorization,
   getMostRecentQuantitySample,
@@ -68,6 +70,35 @@ export const isAppleHealthAvailable = async (): Promise<boolean> => {
   }
 };
 
+/**
+ * Whether the permission sheet has actually been shown for these types yet.
+ *
+ * isAppleHealthAvailable only reports whether the DEVICE has HealthKit, which is true on every
+ * iPhone and says nothing about this app's access. Reading on that basis alone is what produced
+ * "Authorization not determined" on Calendar: the permission sheet lives in onboarding, so anyone
+ * who skipped that step (or onboarded before it existed) reaches a read that was never authorized.
+ * See also the requestAppleHealthPermission note below, since an unrequested read is documented to
+ * crash rather than reject on some paths, which makes this a stability gate and not just a tidy-up.
+ *
+ * Apple deliberately never reveals whether READ access was granted, only whether it has been
+ * asked for, so `unnecessary` here means "already asked" and not "allowed". A denied type simply
+ * returns no samples, which every reader below already handles as "no data".
+ */
+export const hasRequestedAppleHealthPermission = async (): Promise<boolean> => {
+  if (Platform.OS !== 'ios') return false;
+  try {
+    const status = await getRequestStatusForAuthorization({ toRead: [...READ_IDENTIFIERS] });
+    return status === AuthorizationRequestStatus.unnecessary;
+  } catch (err) {
+    console.error('[appleHealth] request-status check failed:', err);
+    return false;
+  }
+};
+
+/** The gate every reader should use: HealthKit exists AND this app has been through the sheet. */
+export const canReadAppleHealth = async (): Promise<boolean> =>
+  (await isAppleHealthAvailable()) && (await hasRequestedAppleHealthPermission());
+
 /** Prompts the real native permission sheet — same one Settings > Privacy > Health shows. Must
  *  be called before any read below; a read against a type never requested crashes rather than
  *  rejecting cleanly, per the library's own documented behavior. */
@@ -131,6 +162,35 @@ const readTodayQuantityTotal = async (
 /** Standalone export (not just through readHealthSnapshot) so a screen that only cares about
  *  sleep — Calendar's Today card — isn't forced to also query weight/steps/workouts/heart-rate
  *  every time it loads. */
+/**
+ * Minutes asleep for the night that ENDS on the given local date.
+ *
+ * readLastNightSleepMinutes only ever answers "last night" (a fixed 20-hour lookback), so a past
+ * day in Calendar had no way to ask about its own night. The window here runs from the previous
+ * evening to midday, which is how sleep is conventionally attributed: you slept "Tuesday night"
+ * and the hours land on Wednesday.
+ */
+export const readSleepMinutesForNight = async (dateKey: string): Promise<number | null> => {
+  try {
+    const [year, month, day] = dateKey.split('-').map(Number);
+    const start = new Date(year, month - 1, day - 1, 18, 0, 0, 0);
+    const end = new Date(year, month - 1, day, 12, 0, 0, 0);
+    const samples = await queryCategorySamples('HKCategoryTypeIdentifierSleepAnalysis', {
+      filter: { date: { startDate: start, endDate: end } },
+      limit: 100,
+    });
+    if (!samples || samples.length === 0) return null;
+    // Same value filter as readLastNightSleepMinutes: 0 is in-bed-but-awake, 2 is awake.
+    const asleepMinutes = samples
+      .filter((s) => s.value !== 0 && s.value !== 2)
+      .reduce((total, s) => total + (new Date(s.endDate).getTime() - new Date(s.startDate).getTime()) / 60_000, 0);
+    return asleepMinutes > 0 ? Math.round(asleepMinutes) : null;
+  } catch (err) {
+    console.error('[appleHealth] sleep read for night failed:', err);
+    return null;
+  }
+};
+
 export const readLastNightSleepMinutes = async (): Promise<number | null> => {
   try {
     const since = new Date();

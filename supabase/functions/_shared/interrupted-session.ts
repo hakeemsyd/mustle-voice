@@ -47,10 +47,25 @@ export async function finalizeStaleLiveSession(
     if (exercisesDone.length === 0) return { finalized: false, workoutLogId: null };
   }
 
+  // Stamped with when the workout actually happened, not when this cleanup happened to run.
+  // `at` was previously left to default to now(), so a Friday-night session abandoned without a
+  // formal end was logged on whatever later day the next brain request finalized it — confirmed
+  // live: a Friday workout showed as "Last time (Today)" on Sunday. That timestamp is not just a
+  // label: Calendar buckets by it, the streak counts off it, and a flexible rotation advances
+  // from the last logged session, so a misdated row moves the whole schedule. `startedAt` is
+  // written into live_session_state by ActiveSessionScreen for exactly this reason. Falling back
+  // to updated_at (the last time the session was genuinely touched) is still far closer to the
+  // truth than now(); only a row predating this field has neither.
+  const startedAt =
+    typeof state.startedAt === 'string' && !Number.isNaN(Date.parse(state.startedAt))
+      ? state.startedAt
+      : liveRow.updated_at;
+
   const { data, error } = await supabase
     .from('workout_log')
     .insert({
       user_id: userId,
+      at: startedAt,
       plan_session_id: state.target.type === 'strength' ? state.target.planSessionId : null,
       switched_from_session_id: state.target.switchedFromSessionId ?? null,
       session_type: isCardio ? 'cardio' : 'strength',

@@ -15,7 +15,11 @@ const INJURY_FORBIDS: Record<string, string[]> = {
   knee:       ['deep_knee_flexion_loaded', 'high_impact', 'heavy_axial_load'],
   lumbar:     ['heavy_axial_load', 'loaded_spinal_flexion', 'loaded_spinal_extension'],
   shoulder:   ['overhead_press', 'heavy_horizontal_press', 'behind_neck'],
-  elbow:      ['heavy_horizontal_press', 'deep_elbow_flexion_loaded'],
+  // loaded_elbow_extension covers direct triceps work (pushdowns, overhead extensions, dips).
+  // Without it, a reported elbow problem pulled the presses but left every triceps isolation in
+  // place — confirmed live: the coach removed exercises after an elbow complaint and substituted
+  // movements loading the same joint just as hard.
+  elbow:      ['heavy_horizontal_press', 'deep_elbow_flexion_loaded', 'loaded_elbow_extension'],
   wrist:      ['loaded_wrist_extension'],
   hip:        ['deep_hip_flexion_loaded', 'high_impact'],
   ankle:      ['high_impact', 'deep_ankle_dorsiflexion_loaded'],

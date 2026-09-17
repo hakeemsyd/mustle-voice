@@ -1,5 +1,15 @@
 import React, { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
-import { Image, Keyboard, ScrollView, StyleSheet, Text, View } from "react-native";
+import {
+  ActivityIndicator,
+  Image,
+  Keyboard,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { colors, fonts } from "../constants/theme";
 import type { ChatMessage } from "../hooks/useHomeChat";
@@ -12,6 +22,8 @@ import { ReadinessCard } from "./ReadinessCard";
 import { TopLiftsCard } from "./TopLiftsCard";
 import { PreviousWorkoutCard } from "./PreviousWorkoutCard";
 import { CoachMessageText } from "./CoachMessageText";
+
+const BOTTOM_PIN_THRESHOLD = 48;
 
 interface ChatTranscriptProps {
   messages: ChatMessage[];
@@ -38,10 +50,23 @@ export const ChatTranscript = forwardRef<ChatTranscriptHandle, ChatTranscriptPro
     const offsetsRef = useRef<Record<string, number>>({});
     const [highlightId, setHighlightId] = useState<string | null>(null);
 
+    // Only auto-scroll when the user is already sitting at the bottom. This fires on every
+    // coachTyping flicker as well as every new message, so during a live session it was landing
+    // constantly — scrolling up to re-read something got yanked back down within 80ms, which read
+    // as the transcript being frozen until a lull in the conversation let a drag survive.
+    const pinnedToBottomRef = useRef(true);
+
     useEffect(() => {
+      if (!pinnedToBottomRef.current) return;
       const timer = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 80);
       return () => clearTimeout(timer);
     }, [messages.length, coachTyping]);
+
+    const handleScroll = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+      const distanceFromBottom = contentSize.height - contentOffset.y - layoutMeasurement.height;
+      pinnedToBottomRef.current = distanceFromBottom <= BOTTOM_PIN_THRESHOLD;
+    };
 
     // Opening the keyboard shrinks this scroll view's own visible height (KeyboardAvoidingView
     // pads the screen below it) without changing `messages` at all, so the effect above never
@@ -52,7 +77,7 @@ export const ChatTranscript = forwardRef<ChatTranscriptHandle, ChatTranscriptPro
     // before KeyboardAvoidingView's own padding animation has actually shrunk this ScrollView's
     // layout — so `scrollToEnd()` at that point still measures the OLD, taller height and lands
     // short. `keyboardDidShow` fires once the keyboard (and that resize) has actually finished,
-    // so it's the one that lands on the真 correct offset; `keyboardWillShow` is kept alongside it
+    // so it's the one that lands on the correct offset; `keyboardWillShow` is kept alongside it
     // purely so the scroll starts moving immediately instead of visibly waiting for the keyboard
     // to finish first.
     useEffect(() => {
@@ -83,6 +108,8 @@ export const ChatTranscript = forwardRef<ChatTranscriptHandle, ChatTranscriptPro
         contentContainerStyle={styles.content}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="on-drag"
+        onScroll={handleScroll}
+        scrollEventThrottle={64}
       >
         {messages.map((m) =>
           m.role === "user" ? (
@@ -97,7 +124,29 @@ export const ChatTranscript = forwardRef<ChatTranscriptHandle, ChatTranscriptPro
               ]}
             >
               {m.imageUrl ? (
-                <Image source={{ uri: m.imageUrl }} style={styles.userImage} resizeMode="cover" />
+                <View>
+                  <Image
+                    source={{ uri: m.imageUrl }}
+                    style={[styles.userImage, m.attachmentStatus === 'failed' && styles.userImageFailed]}
+                    resizeMode="cover"
+                  />
+                  {/* An attached photo used to look identical whether it had reached the coach or
+                      not — the thumbnail appeared the instant it was picked and never changed.
+                      Confirmed live: an upload that never arrived was indistinguishable from one
+                      that had. 'sent' deliberately shows nothing: a finished upload needs no badge,
+                      the coach's reply underneath is the confirmation. */}
+                  {m.attachmentStatus === 'uploading' && (
+                    <View style={styles.attachBadge}>
+                      <ActivityIndicator size="small" color={colors.accentOn} />
+                      <Text style={styles.attachBadgeText}>Uploading…</Text>
+                    </View>
+                  )}
+                  {m.attachmentStatus === 'failed' && (
+                    <View style={[styles.attachBadge, styles.attachBadgeFailed]}>
+                      <Text style={styles.attachBadgeText}>Upload failed</Text>
+                    </View>
+                  )}
+                </View>
               ) : (
                 <Text style={styles.userText}>{m.text}</Text>
               )}
@@ -201,6 +250,30 @@ const styles = StyleSheet.create({
     width: "100%",
     height: 220,
     borderRadius: 14,
+  },
+  userImageFailed: {
+    opacity: 0.45,
+  },
+  attachBadge: {
+    position: "absolute",
+    left: 8,
+    bottom: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: "rgba(0,0,0,0.72)",
+  },
+  attachBadgeFailed: {
+    backgroundColor: "rgba(198,40,40,0.85)",
+  },
+  attachBadgeText: {
+    fontFamily: fonts.bodyMedium,
+    fontSize: 11,
+    letterSpacing: 0.3,
+    color: colors.text,
   },
   rowHighlight: {
     backgroundColor: "rgba(200,241,53,0.1)",

@@ -144,7 +144,7 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
     typeof sessionStartedAt === 'string'
       ? (history ?? []).filter((m: any) => !m.at || m.at >= sessionStartedAt)
       : (history ?? []);
-  const priorMessages = replayHistory(scopedHistory.reverse());
+  const priorMessages = replayHistory(dropSupersededFromHistory(scopedHistory.slice().reverse(), userText));
   const turnMessages = [...priorMessages, { role: 'user', content: resolveTurnText(userText) }];
   // Greeting is a per-CALL decision ("say hello once when this call starts"), not a per-DAY one —
   // even today's `history` above is non-empty for anyone who already texted or called earlier
@@ -161,6 +161,95 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
   return { supabase, handlers, turnMessages, systemPrompt, askedAt };
 }
 
+// ElevenLabs calls this function more than once for a single spoken turn — first on a preliminary
+// transcript, then again on the corrected one — and only the last reply is ever spoken. Confirmed
+// live: their conversation record held one user turn ("Hip Thrust, set one, done ten reps, 80 kg")
+// where `message` held two, the extra one being a transcript the user never actually produced
+// ("10 reps" vs "ten reps") alongside an answer that was never voiced. That discarded pair is
+// replayed as history on the following turn, so the model sees a set report it never heard and an
+// answer it never gave, and tells the user their set is "already logged". Keeping only the newest
+// transcript of a turn is what stops us feeding it a conversation that did not happen.
+//
+// The turn lock above cannot cover this: those invocations are concurrent retries of one request,
+// while these arrive seconds apart, after the first has already replied and released.
+const SUPERSEDED_TURN_WINDOW_MS = 12_000;
+const SUPERSEDED_TURN_CONTAINMENT = 0.85;
+// Anything shorter is contained in almost any later sentence by accident — "80 kg." sits entirely
+// inside "set one done, ten reps, 80 kg", which is an answer followed by a report, not one turn
+// transcribed twice.
+const SUPERSEDED_TURN_MIN_TOKENS = 4;
+
+const turnTokens = (text: string): string[] =>
+  text.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().split(' ').filter(Boolean);
+
+// Containment rather than Jaccard: a corrected transcript is usually the same words plus a few
+// ("set one done eight reps" -> "set one done eight reps of 50 kg"), which Jaccard scores far too
+// low to catch. Deliberately tight enough that consecutive real sets stay distinct — "set two done
+// eight reps" against "set one done eight reps" scores 0.8 and is left alone.
+function turnContainment(a: string, b: string): number {
+  const first = new Set(turnTokens(a));
+  const second = new Set(turnTokens(b));
+  if (first.size === 0 || second.size === 0) return 0;
+  let shared = 0;
+  for (const token of first) if (second.has(token)) shared += 1;
+  return shared / Math.min(first.size, second.size);
+}
+
+// The delete below keeps the stored record clean, but it runs after the reply has already been
+// generated, so on its own it never stopped the model *seeing* the turn it supersedes. Confirmed
+// live: the duplicate pair was gone from the transcript and the coach still answered "I already
+// have set two logged", because prepareTurn had fetched history before the cleanup ran. This
+// filters the same pair out of the replayed history instead, so the corrected transcript is the
+// only version of that turn the model is ever shown.
+function dropSupersededFromHistory(ordered: any[], userText: string): any[] {
+  if (userText.startsWith(SYSTEM_CUE_PREFIX)) return ordered;
+  if (turnTokens(userText).length < SUPERSEDED_TURN_MIN_TOKENS) return ordered;
+  for (let i = ordered.length - 1; i >= 0; i--) {
+    const message = ordered[i];
+    if (message.role !== 'user') continue;
+    const content = String(message.content ?? '');
+    if (content.startsWith(SYSTEM_CUE_PREFIX)) return ordered;
+    if (turnTokens(content).length < SUPERSEDED_TURN_MIN_TOKENS) return ordered;
+    if (message.at && Date.now() - new Date(message.at).getTime() > SUPERSEDED_TURN_WINDOW_MS) return ordered;
+    if (turnContainment(content, userText) < SUPERSEDED_TURN_CONTAINMENT) return ordered;
+    return ordered.slice(0, i);
+  }
+  return ordered;
+}
+
+async function dropSupersededTurn(supabase: any, userId: string, userText: string, askedAt: Date) {
+  const { data, error } = await supabase
+    .from('message')
+    .select('id, role, content, at')
+    .eq('user_id', userId)
+    .eq('modality', 'voice')
+    .gte('at', new Date(askedAt.getTime() - SUPERSEDED_TURN_WINDOW_MS).toISOString())
+    .order('at', { ascending: false })
+    .limit(4);
+  if (error || !data?.length) return;
+
+  const lastUser = data.find((m: any) => m.role === 'user');
+  if (!lastUser || lastUser.content.startsWith(SYSTEM_CUE_PREFIX)) return;
+  // Both sides, not just the older one. A corrected transcript is the same turn said again, so it
+  // is never much shorter — confirmed live: "Hey, set one is done, 50 kg, eight reps" followed by
+  // a bare "50 kg" scores a perfect containment against the short side and would have deleted a
+  // real, different turn.
+  if (turnTokens(lastUser.content).length < SUPERSEDED_TURN_MIN_TOKENS) return;
+  if (turnTokens(userText).length < SUPERSEDED_TURN_MIN_TOKENS) return;
+  if (turnContainment(lastUser.content, userText) < SUPERSEDED_TURN_CONTAINMENT) return;
+
+  const supersededIds = [
+    lastUser.id,
+    ...data.filter((m: any) => m.role === 'assistant' && m.at > lastUser.at).map((m: any) => m.id),
+  ];
+  const { error: deleteError } = await supabase.from('message').delete().in('id', supersededIds);
+  if (deleteError) {
+    console.error('[brain-voice] failed to drop superseded turn:', deleteError.message);
+    return;
+  }
+  console.log(`[brain-voice] dropped superseded turn (${supersededIds.length} rows): ${lastUser.content}`);
+}
+
 async function logConversation(
   supabase: any,
   userId: string,
@@ -171,6 +260,7 @@ async function logConversation(
 ) {
   const repliedAt = new Date(Math.max(Date.now(), askedAt.getTime() + 1));
   const isSystemCue = userText.startsWith(SYSTEM_CUE_PREFIX);
+  if (!isSystemCue) await dropSupersededTurn(supabase, userId, userText, askedAt);
   const { error } = await supabase.from('message').insert([
     {
       user_id: userId,
@@ -402,31 +492,83 @@ Deno.serve(async (req) => {
         enqueueSafely(encoder.encode(sseChunk(completionId, model, delta, null)));
       };
 
-      // A silence placeholder can only be recognised once enough of the reply has arrived to rule
-      // out a real sentence, but deltas are streamed the moment they land — so the opening of every
-      // reply is held back just long enough to tell the two apart. A placeholder is short by
-      // nature, so anything past this length is real speech and streams from then on untouched;
-      // the hold costs a few characters of latency, never a whole turn.
-      const SILENCE_GATE_CHARS = 24;
-      let gate: string | null = '';
-      const sendGated = (content: string) => {
-        if (gate === null) {
-          send(content);
-          return;
-        }
-        gate += content;
-        if (gate.length <= SILENCE_GATE_CHARS) return;
-        const held = gate;
-        gate = null;
-        send(held);
+      // Deltas are flushed on CLAUSE boundaries, not as they arrive.
+      //
+      // sanitizeForSpeech used to run on each delta in isolation, and a delta boundary falls
+      // wherever the model's tokenizer put it — so "62g" arriving as "62" then "g" was normalized
+      // as two independent fragments, neither of which matches the unit pattern, and TTS said
+      // "sixty-two gee". Confirmed live, and invisible to verbalize-for-speech.test.ts because
+      // every case there is a whole string. The same split breaks "0.5%", "2400 cal/day" and every
+      // other pattern that spans more than one token.
+      //
+      // Holding to a clause boundary guarantees any unit expression is whole before it is
+      // normalized, since none of them contain sentence punctuation. MAX_HOLD_CHARS is the safety
+      // valve for a model that streams a long run without punctuation; it snaps to a space and
+      // refuses to leave a bare number behind, because "62 g" is exactly the split that hurts.
+      const MAX_HOLD_CHARS = 90;
+      let pending = '';
+      let emittedAny = false;
+
+      const emitChunk = (chunk: string) => {
+        if (!chunk) return;
+        // The placeholder check now sees a whole clause rather than the first 24 characters, so
+        // it no longer has to guess from a fragment — but it still only applies before anything
+        // has been spoken, since a later "silence" is part of a real sentence.
+        if (!emittedAny && isSilencePlaceholder(chunk)) return;
+        emittedAny = true;
+        send(sanitizeForSpeech(chunk));
       };
-      // Nothing ever reached the gate, or what did was only a placeholder: emit no text at all, so
-      // ElevenLabs synthesises nothing instead of speaking the word out loud.
-      const flushGate = () => {
-        if (gate === null) return;
-        const held = gate;
-        gate = null;
-        if (!isSilencePlaceholder(held)) send(held);
+
+      const takeFlushable = (force: boolean): string => {
+        if (force) {
+          const all = pending;
+          pending = '';
+          return all;
+        }
+        let cut = -1;
+        for (let i = pending.length - 2; i >= 0; i--) {
+          // Punctuation only counts as a boundary when whitespace follows it, so the decimal
+          // point in "12.9%" and the period in "1.5 kg" are never mistaken for one.
+          if (/[.!?,;:\n]/.test(pending[i]) && /\s/.test(pending[i + 1])) {
+            cut = i + 1;
+            break;
+          }
+        }
+        if (cut === -1) {
+          if (pending.length < MAX_HOLD_CHARS) return '';
+          const space = pending.lastIndexOf(' ');
+          if (space <= 0) return '';
+          let head = pending.slice(0, space);
+          const trailingNumber = head.match(/\s\d+(?:\.\d+)?$/);
+          if (trailingNumber) head = head.slice(0, head.length - trailingNumber[0].length);
+          if (!head) return '';
+          pending = pending.slice(head.length);
+          return head;
+        }
+        const head = pending.slice(0, cut);
+        pending = pending.slice(cut);
+        return head;
+      };
+
+      const flushGate = () => emitChunk(takeFlushable(true));
+
+      // An empty completion is FATAL, not merely quiet. ElevenLabs treats a custom LLM that
+      // streams no content as a generation failure: it terminates the conversation outright with
+      // "custom_llm_error: LLM Cascade Error: Brain returned no response" and the client drops the
+      // call. Confirmed live against the conversation records — status "failed", every time.
+      //
+      // Which means every turn the coach correctly stayed SILENT killed the session. Mid-rest the
+      // app explicitly instructs it not to speak, the model obeyed and produced nothing (or a
+      // placeholder this stream deliberately suppresses), and the call died for doing the right
+      // thing. That is the reconnect loop in the logs, and it made staying quiet during rest
+      // impossible by construction, however the prompt was worded.
+      //
+      // A single space satisfies the non-empty requirement and synthesises to nothing audible, so
+      // silence stays silent and the conversation survives it.
+      const ensureNonEmptyCompletion = () => {
+        if (emittedAny) return;
+        emittedAny = true;
+        send(' ');
       };
 
       try {
@@ -445,19 +587,24 @@ Deno.serve(async (req) => {
               messages: turnMessages,
               handlers,
               callModel,
-              onTextDelta: (delta) => sendGated(sanitizeForSpeech(delta)),
+              onTextDelta: (delta) => {
+                pending += delta;
+                emitChunk(takeFlushable(false));
+              },
             });
             flushGate();
+            ensureNonEmptyCompletion();
             const turnBlocks = result.messages.slice(turnMessages.length);
             await logConversation(supabase, userId, userText, askedAt, result.reply, turnBlocks);
           } catch (err) {
             console.error('[brain-voice] error:', err);
-            gate = null;
+            pending = '';
             send(sanitizeForSpeech(VOICE_ERROR_REPLY));
           }
         }
       } finally {
         flushGate();
+        ensureNonEmptyCompletion();
         if (needsLock) await releaseTurnLock(lockClient, userId!);
       }
 

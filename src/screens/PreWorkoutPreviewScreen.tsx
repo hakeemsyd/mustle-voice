@@ -17,7 +17,11 @@ import { SessionVoiceInputDock } from "../components/session-chat/SessionVoiceIn
 import { useSessionPreview } from "../hooks/useSessionPreview";
 import { useScreenInsets } from "../hooks/useScreenInsets";
 import { usePlanAlternatives } from "../hooks/usePlanAlternatives";
-import { useActiveSessionContext, type SessionTarget } from "../session/ActiveSessionContext";
+import {
+  useActiveSessionContext,
+  type SessionExercise,
+  type SessionTarget,
+} from "../session/ActiveSessionContext";
 import { useSharedVoiceSession } from "../session/VoiceSessionProvider";
 import { getSwapCandidates, type SwapCandidate } from "../session/exerciseSwap";
 import { chooseRestDay } from "../lib/restDay";
@@ -29,6 +33,8 @@ import { BackIcon } from "../icons/BackIcon";
 import { ChevronDownIcon } from "../icons/ChevronDownIcon";
 import { PlayIcon } from "../icons/PlayIcon";
 import type { RootStackParamList } from "../navigation/types";
+import { relativeDayLabel } from "../lib/calendarDate";
+import { buildSecondBeat } from "./previewBeats";
 
 type Props = NativeStackScreenProps<RootStackParamList, "PreWorkoutPreview">;
 
@@ -58,15 +64,6 @@ type ChipsState =
 // three messages appearing in the same frame reads as a wall of text, not a coach talking.
 const INTRO_DELAY_MS = 400;
 const INTRO_GAP_MS = 900;
-
-function relativeDay(iso: string): string {
-  const then = new Date(iso);
-  const days = Math.round((Date.now() - then.getTime()) / 86_400_000);
-  if (days <= 0) return "Today";
-  if (days === 1) return "Yesterday";
-  if (days < 7) return `${days} days ago`;
-  return then.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-}
 
 export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
   const { planSessionId } = route.params;
@@ -102,6 +99,8 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
   const seededRef = useRef(false);
   const pendingTargetRef = useRef<{ target: SessionTarget; resume: boolean } | null>(null);
   const introTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const sessionTargetRef = useRef(session.target);
+  sessionTargetRef.current = session.target;
 
   useEffect(() => {
     return () => {
@@ -133,7 +132,10 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
           user_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         },
       });
-      return () => setMessageHandler(null);
+      return () => {
+        if (sessionTargetRef.current) return;
+        setMessageHandler(null);
+      };
     }, [session.userId, session.userName, appendMessage, setMessageHandler, setSessionConfig]),
   );
 
@@ -158,7 +160,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
       } today.${first ? ` First up: **${first.name}**, ${first.sets} × ${first.repScheme}.` : ""}`,
     ];
 
-    if (lastTime && lastTime.exercises.length > 0) {
+    if (lastTime && lastTime.exercises.length > 0 && canResume) {
       const recap = lastTime.exercises
         .map(
           (done) =>
@@ -168,12 +170,12 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
         )
         .join("\n");
       beats.push(
-        canResume
-          ? `Looks like you stopped partway through last time (${relativeDay(
-              lastTime.at,
-            ).toLowerCase()}):\n${recap}\nWant to continue where you left off?`
-          : `Last time (${relativeDay(lastTime.at)}):\n${recap}`,
+        `Looks like you stopped partway through ${relativeDayLabel(lastTime.at).toLowerCase()}:` +
+          `\n${recap}\nWant to continue where you left off?`,
       );
+    } else {
+      const line = buildSecondBeat(first, lastTime?.exercises ?? []);
+      if (line) beats.push(line);
     }
 
     beats.push(
@@ -335,7 +337,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
     appendMessage("user", text);
     setThinking(true);
     try {
-      const result = await callBrain(session.userId, text, "text");
+      const result = await callBrain({ userId: session.userId, message: text });
       appendMessage("coach", result.reply);
     } catch (err) {
       console.error("[preview] coach call failed:", err);
@@ -378,8 +380,14 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
     appendMessage("user", "", uri);
     setThinking(true);
     try {
-      const signedUrl = await uploadChatImage(session.userId, uri);
-      const result = await callBrain(session.userId, "", "image", false, undefined, undefined, signedUrl);
+      const { path, signedUrl } = await uploadChatImage(session.userId, uri);
+      const result = await callBrain({
+        userId: session.userId,
+        message: "",
+        modality: "image",
+        attachmentUrl: signedUrl,
+        attachmentPath: path,
+      });
       appendMessage("coach", result.reply);
     } catch (err) {
       console.error("[preview] attach image failed:", err);
@@ -395,7 +403,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
     setThinking(true);
     try {
       await uploadChatFile(session.userId, uri, name);
-      const result = await callBrain(session.userId, `Attached a file: ${name}`, "file");
+      const result = await callBrain({ userId: session.userId, message: `Attached a file: ${name}`, modality: "file" });
       appendMessage("coach", result.reply);
     } catch (err) {
       console.error("[preview] attach file failed:", err);

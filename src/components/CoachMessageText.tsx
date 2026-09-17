@@ -15,13 +15,25 @@ interface CoachMessageTextProps {
 // it points at), and the highlight treatment reads as a wall of lime chips there rather than the
 // single-keyword callout it was built for. Matches the reference's own `.threadTextBold`, which
 // is `font-weight: 800` and nothing else.
-export function CoachMessageText({ text, style, variant = "dark" }: CoachMessageTextProps) {
+// RN's Text only breaks at whitespace, so a single unbroken run longer than the line — a URL, a
+// long compound the model ran together, a stream of digits — has nowhere to wrap and simply runs
+// off the right edge and gets clipped (confirmed live on a coach reply). There's no CSS
+// `word-break: break-all` here, so the break opportunities have to be put into the string:
+// U+200B is zero-width, invisible, and only takes effect if the line actually needs to break.
+const SOFT_BREAK_AFTER = 18;
+
+const withSoftBreaks = (text: string): string =>
+  text.replace(new RegExp(`\\S{${SOFT_BREAK_AFTER + 1},}`, "g"), (run) =>
+    run.replace(new RegExp(`(.{${SOFT_BREAK_AFTER}})`, "g"), "$1​"),
+  );
+
+export const CoachMessageText = ({ text, style, variant = "dark" }: CoachMessageTextProps) => {
   const parts = text.split(/(\*\*.+?\*\*)/g);
   return (
     <Text style={style}>
       {parts.map((part, i) => {
         const match = part.match(/^\*\*(.+)\*\*$/);
-        if (!match) return part;
+        if (!match) return withSoftBreaks(part);
         return (
           <Text
             key={i}
@@ -29,13 +41,13 @@ export function CoachMessageText({ text, style, variant = "dark" }: CoachMessage
               variant === "light" ? styles.boldLight : variant === "plain" ? styles.boldPlain : styles.bold
             }
           >
-            {match[1]}
+            {withSoftBreaks(match[1])}
           </Text>
         );
       })}
     </Text>
   );
-}
+};
 
 // RN's inline (nested) Text only reliably supports color/font/backgroundColor on iOS — border
 // properties don't apply to a text run, so the highlight is bg+bold only, not a bordered pill.

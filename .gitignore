@@ -29,3 +29,6 @@ scripts/*.m4a
 *.html
 .expo
 *.md
+.mcp.json
+
+.env.local

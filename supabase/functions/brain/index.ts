@@ -18,7 +18,15 @@ Deno.serve(async (req) => {
       liveSessionState,
       timezone,
       attachmentUrl,
+      // The PATH is what gets persisted; attachmentUrl is a short-lived signed URL that exists
+      // only so the model can fetch the image on this turn. Storing the URL instead is what made
+      // every chat photo expire after a week, with the dead link baked into the row.
+      attachmentPath,
       isDailyGreeting = false,
+      // Which session the greeting is about — stamped onto the assistant row so Home can tell a
+      // still-accurate cached greeting from one the day has moved past. See the greeting_key
+      // column comment. Only ever sent alongside isDailyGreeting.
+      greetingKey = null,
     } = await req.json();
     const hasAttachment = modality === 'image' && typeof attachmentUrl === 'string' && attachmentUrl.length > 0;
     if (!userId || (!message && !hasAttachment)) {
@@ -95,7 +103,7 @@ Deno.serve(async (req) => {
         content: message,
         modality,
         hidden,
-        attachment_url: hasAttachment ? attachmentUrl : null,
+        attachment_url: hasAttachment ? (attachmentPath ?? attachmentUrl) : null,
         at: askedAt.toISOString(),
       },
       {
@@ -106,6 +114,7 @@ Deno.serve(async (req) => {
         hidden,
         blocks: turnBlocks.length > 0 ? turnBlocks : null,
         card,
+        greeting_key: isDailyGreeting ? greetingKey : null,
         at: repliedAt.toISOString(),
       },
     ]);

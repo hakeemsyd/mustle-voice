@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { useFocusEffect } from "@react-navigation/native";
+import { useFocusEffect, useIsFocused } from "@react-navigation/native";
 import {
   Keyboard,
   KeyboardAvoidingView,
@@ -45,14 +45,23 @@ import {
   looksLikeSetReport,
   looksLikeStartSetCommand,
   parseSetReport,
+  parseStatedWeight,
+  type ParsedSet,
 } from "../lib/parseSetReport";
-import { buildLiveSessionSnapshot, describeLiveSessionSnapshot } from "../session/liveSessionState";
 import { chooseRestDay } from "../lib/restDay";
 import { targetRepsFrom } from "../lib/restSuggestion";
 import { titleCase } from "../lib/textFormat";
 import type { RootStackParamList } from "../navigation/types";
 
 type Props = NativeStackScreenProps<RootStackParamList, "ActiveSession">;
+
+const ADVANCE_CUE_GRACE_MS = 3_000;
+
+// "30-45 seconds" is three times the width of "8-10", and the collapsed strip gives Reps whatever
+// it asks for, so a timed exercise squeezed the only shrinkable column until even its "EXERCISE"
+// label clipped to "E...". The full wording still shows on the expanded card, which has room.
+const formatRepScheme = (scheme: string | null): string =>
+  (scheme ?? "—").replace(/\s*seconds?\b/i, "s").replace(/\s*minutes?\b/i, "m");
 
 type ChipsState =
   | { kind: "idle" }
@@ -119,33 +128,29 @@ export function ActiveSessionScreen({ navigation }: Props) {
 
   useEffect(() => {
     if (isCardio) return;
-    // Confirmed live: a single attempt right when the index changes could silently no-op if the
-    // relevant ScrollView's width hadn't been measured yet at that exact moment (e.g. right after
-    // toggling collapsed/expanded) — nothing retried it afterward, so the screen was left showing
-    // an older exercise, correctly marked "COMPLETED", instead of the one actually current. Only
-    // one of swipeWidth/expandedWidth is ever populated at a time (whichever card state is
-    // actually mounted), so this retries until EITHER succeeds, not both.
     let cancelled = false;
     let attempts = 0;
+    let applied = 0;
     const tryScroll = () => {
       if (cancelled) return;
       attempts += 1;
       let scrolled = false;
-      if (swipeWidthRef.current > 0) {
-        chipScrollRef.current?.scrollTo({ x: currentExerciseIndex * swipeWidthRef.current, animated: true });
+      if (chipScrollRef.current && swipeWidthRef.current > 0) {
+        chipScrollRef.current.scrollTo({ x: currentExerciseIndex * swipeWidthRef.current, animated: true });
         scrolled = true;
       }
-      if (expandedWidthRef.current > 0) {
-        expandedScrollRef.current?.scrollTo({ x: currentExerciseIndex * expandedWidthRef.current, animated: true });
+      if (expandedScrollRef.current && expandedWidthRef.current > 0) {
+        expandedScrollRef.current.scrollTo({ x: currentExerciseIndex * expandedWidthRef.current, animated: true });
         scrolled = true;
       }
-      if (!scrolled && attempts < 20) setTimeout(tryScroll, 100);
+      if (scrolled) applied += 1;
+      if (applied < 3 && attempts < 20) setTimeout(tryScroll, scrolled ? 160 : 100);
     };
     tryScroll();
     return () => {
       cancelled = true;
     };
-  }, [currentExerciseIndex, isCardio]);
+  }, [currentExerciseIndex, isCardio, cardCollapsed]);
 
   const restRemaining = useRestRemaining(restEndAt, restPausedRemainingSec);
   const currentSetCount = loggedSets[currentExerciseIndex]?.length ?? 0;
@@ -160,6 +165,18 @@ export function ActiveSessionScreen({ navigation }: Props) {
     lastLoggedWeight != null
       ? `${lastLoggedWeight} KG`
       : (currentExercise?.loadScheme ?? "—");
+  // A weight the user says out loud before their first set ("80 kg", answering the coach's own
+  // question) is not a set report and logs nothing, so it used to be forgotten by the time they
+  // said "set one done" — and with no set yet logged on the exercise there was nothing to carry
+  // forward either, so a real 80kg set was recorded as bodyweight.
+  const statedWeightRef = useRef<{ exerciseIndex: number; weight: number } | null>(null);
+  const carryWeight = (): number | null =>
+    lastLoggedWeight ??
+    (statedWeightRef.current?.exerciseIndex === currentExerciseIndex
+      ? statedWeightRef.current.weight
+      : null);
+  const resolveSetWeight = (parsed: ParsedSet): number | null =>
+    parsed.weight === null && parsed.unit !== "seconds" ? carryWeight() : parsed.weight;
   const { alternatives: switchAlternatives } = usePlanAlternatives(
     target?.type === "strength" ? target.planSessionId : undefined,
   );
@@ -180,15 +197,29 @@ export function ActiveSessionScreen({ navigation }: Props) {
     undoTimerRef.current = setTimeout(() => setUndoVisible(false), 8000);
   };
 
+  //
+  //
+  const isFocused = useIsFocused();
+
   const sendContextRef = useRef<((text: string) => void) | null>(null);
-  const triggerCueRef = useRef<((cue: string) => void) | null>(null);
+  const triggerCueRef = useRef<((cue: string) => boolean) | null>(null);
   const pendingSetCueRef = useRef<"fire" | "skip" | null>(null);
+  // Cancelled if the coach's own reply to the final set report already names the new exercise.
+  // Confirmed live: it announced "Hip Thrust next — four sets of eight to ten" and the cue landed
+  // a second later, so it spoke over itself with a near-duplicate question.
+  const pendingAdvanceRef = useRef<{ timer: ReturnType<typeof setTimeout>; name: string } | null>(null);
+  const restManualFinishRef = useRef(-1);
 
   const {
     orbState, isActive, status: voiceStatus, toggle, sendContextualUpdate, sendUserMessage,
     reconnecting, voiceDropped, idleClosed, connect, isMuted, toggleMute,
-    setMessageHandler, setSessionConfig,
+    setMessageHandler, setSessionConfig, setWorkoutActive,
   } = useSharedVoiceSession();
+
+  useEffect(() => {
+    setWorkoutActive(!ended);
+    return () => setWorkoutActive(false);
+  }, [ended, setWorkoutActive]);
 
   // Claims the shared conversation on focus. Two jobs: open the mic on arrival, and cancel the
   // pending release the screen we came from (Session Preview) scheduled on its way out, so the
@@ -205,6 +236,22 @@ export function ActiveSessionScreen({ navigation }: Props) {
     setMessageHandler((message) => {
       if (!message.text.startsWith(SYSTEM_CUE_PREFIX)) {
         session.appendMessage(message.role === "user" ? "user" : "coach", message.text);
+      }
+      // Cancelled only when the coach both named the new exercise AND asked something — its own
+      // announcement usually ends in "what weight are you using?", and letting the cue follow that
+      // is the double-ask that made it talk over itself. An announcement with no question still
+      // needs the cue: that turn is what actually gets the load asked for, and suppressing it left
+      // the app to log a first set with no weight on record at all.
+      const pendingAdvance = pendingAdvanceRef.current;
+      if (
+        pendingAdvance &&
+        message.role !== "user" &&
+        pendingAdvance.name &&
+        message.text.toLowerCase().includes(pendingAdvance.name.toLowerCase()) &&
+        message.text.includes("?")
+      ) {
+        clearTimeout(pendingAdvance.timer);
+        pendingAdvanceRef.current = null;
       }
       // Checked before the rest guard below: during rest this is the one thing the user can say
       // that must still act on the session, and it's what makes "let's go / next set / start
@@ -232,8 +279,13 @@ export function ActiveSessionScreen({ navigation }: Props) {
         }
         return;
       }
-      if (message.role !== "user" || isCardio || (resting && restRemaining > 0)) return;
+      if (message.role !== "user" || isCardio) return;
+      const statedWeight = parseStatedWeight(message.text);
+      if (statedWeight != null) {
+        statedWeightRef.current = { exerciseIndex: currentExerciseIndex, weight: statedWeight };
+      }
       if (!looksLikeSetReport(message.text)) return;
+      if (resting) session.finishRest();
       const parsed = parseSetReport(message.text);
       if (!parsed) {
         // The single biggest source of coach/app drift: the user reports a set, the coach hears
@@ -242,12 +294,17 @@ export function ActiveSessionScreen({ navigation }: Props) {
         // N was done, and the two never reconciled for the rest of the exercise. Telling the
         // coach nothing was recorded is what keeps the two counts on the same page.
         try {
-          sendContextRef.current?.(
-            `IMPORTANT: that sounded like a set report, but the app could NOT read a weight and rep ` +
-              `count out of it, so NOTHING was logged. The app is still waiting on set ` +
-              `${currentSetCount + 1}${currentExercise ? ` of ${currentExercise.sets} for ${currentExercise.name}` : ""}. ` +
-              `Do not count that set or move on — ask them once, briefly, for the weight and reps.`,
-          );
+          // Sent as a cue, not a contextual update: a cue arrives as a user turn and is therefore
+          // always answered, where the contextual update this replaced reached the model without
+          // demanding a reply and lost the race against the turn already generating.
+          if (!triggerCueRef.current?.("set_not_logged")) {
+            sendContextRef.current?.(
+              `IMPORTANT: that sounded like a set report, but the app could NOT read a weight and rep ` +
+                `count out of it, so NOTHING was logged. The app is still waiting on set ` +
+                `${currentSetCount + 1}${currentExercise ? ` of ${currentExercise.sets} for ${currentExercise.name}` : ""}. ` +
+                `Do not count that set or move on — ask them once, briefly, for the weight and reps.`,
+            );
+          }
         } catch (err) {
           console.error("[active session] failed to tell coach a set report failed to parse:", err);
         }
@@ -258,9 +315,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
       // live: answering the app's own "How many reps?" clarifying question with reps only logged
       // 60kg as bodyweight. Carry forward the last weight actually logged for this exercise
       // instead of trusting "no weight mentioned this sentence" as "true bodyweight movement".
-      const resolvedWeight =
-        parsed.weight === null && parsed.unit !== "seconds" ? (lastLoggedWeight ?? null) : parsed.weight;
-      const parsedForLog = { ...parsed, weight: resolvedWeight };
+      const parsedForLog = { ...parsed, weight: resolveSetWeight(parsed) };
       commitSet(parsedForLog.weight, parsedForLog.reps, true, parsedForLog.unit);
       const setNumber = currentSetCount + 1;
       // A voice-reported set is logged and acknowledged entirely through this inline context
@@ -318,7 +373,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
       },
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isCardio, resting, restRemaining, currentExercise, currentSetCount, session.userId, session.userName]);
+  }, [isFocused, isCardio, resting, currentExercise, currentSetCount, session.userId, session.userName]);
 
   useEffect(() => {
     sendContextRef.current = sendContextualUpdate;
@@ -328,11 +383,13 @@ export function ActiveSessionScreen({ navigation }: Props) {
 
   useEffect(() => {
     triggerCueRef.current = (cue: string) => {
-      if (voiceStatus !== "connected") return;
+      if (voiceStatus !== "connected") return false;
       try {
         sendUserMessage(`${SYSTEM_CUE_PREFIX} ${cue}`);
+        return true;
       } catch (err) {
         console.error("[active session] failed to send coach cue:", err);
+        return false;
       }
     };
   }, [voiceStatus, sendUserMessage]);
@@ -340,30 +397,8 @@ export function ActiveSessionScreen({ navigation }: Props) {
   const toggleRef = useRef(toggle);
   toggleRef.current = toggle;
 
-  useEffect(() => {
-    if (voiceStatus !== "connected") return;
-    const snapshot = buildLiveSessionSnapshot({
-      target,
-      focus,
-      exercises,
-      currentExerciseIndex,
-      loggedSets,
-      resting,
-      restTargetSec,
-      restEndAt: session.restEndAt,
-      restPausedRemainingSec,
-      ended,
-      paused,
-      elapsedSec,
-    });
-    if (!snapshot) return;
-    try {
-      sendContextRef.current?.(describeLiveSessionSnapshot(snapshot));
-    } catch (err) {
-      console.error("[active session] failed to send live state to voice:", err);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [voiceStatus, target, focus, exercises, currentExerciseIndex, loggedSets, resting, restTargetSec, restPausedRemainingSec, paused, ended]);
+  //
+  //
 
   useEffect(() => {
     // Once ended, session.endSession() has already deleted this row outright (see
@@ -436,12 +471,60 @@ export function ActiveSessionScreen({ navigation }: Props) {
     // handles its own acknowledgment, nothing to cue here; neither -> the exercise just advanced
     // with no rest, which needs exercise_advanced's different wording instead.
     if (ended) return;
-    const cue = resting ? "set_logged" : "exercise_advanced";
+    if (!resting) {
+      // Held back briefly rather than fired at once: the coach usually announces the transition
+      // itself when it answers the set report, and this cue landing on top of that is what made it
+      // cut its own sentence off. If that announcement arrives first the message handler cancels
+      // this; if it never comes, this still fires and the transition is announced exactly once.
+      const advancedTo = exercises[currentExerciseIndex]?.name ?? "";
+      if (pendingAdvanceRef.current) clearTimeout(pendingAdvanceRef.current.timer);
+      pendingAdvanceRef.current = {
+        name: advancedTo,
+        timer: setTimeout(() => {
+          pendingAdvanceRef.current = null;
+          void liveStateWriteRef.current.then(
+            () => triggerCueRef.current?.("exercise_advanced"),
+            () => triggerCueRef.current?.("exercise_advanced"),
+          );
+        }, ADVANCE_CUE_GRACE_MS),
+      };
+      return;
+    }
     void liveStateWriteRef.current.then(
-      () => triggerCueRef.current?.(cue),
-      () => triggerCueRef.current?.(cue),
+      () => triggerCueRef.current?.("set_logged"),
+      () => triggerCueRef.current?.("set_logged"),
     );
   }, [totalSetsLogged, resting, ended]);
+
+  useEffect(
+    () => () => {
+      if (pendingAdvanceRef.current) clearTimeout(pendingAdvanceRef.current.timer);
+    },
+    [],
+  );
+
+  // Tapping Start Set ends rest the same way the timer running out does, but it used to skip the
+  // cue that expiry fires, because that one is gated on `resting` still being true when the clock
+  // reaches zero and the tap flips it false immediately. The card advanced and the coach said
+  // nothing until the user asked out loud. Marked here and fired from the effect below so the
+  // live_session_state write for the rest end is already in flight, same as every other cue.
+  const handleStartSetTap = () => {
+    restManualFinishRef.current = restKey;
+    session.finishRest();
+  };
+
+  useEffect(() => {
+    if (resting || voiceStatus !== "connected") return;
+    if (restManualFinishRef.current !== restKey) return;
+    restManualFinishRef.current = -1;
+    const state = restCueStateRef.current;
+    if (state.over) return;
+    state.over = true;
+    void liveStateWriteRef.current.then(
+      () => triggerCueRef.current?.("rest_over"),
+      () => triggerCueRef.current?.("rest_over"),
+    );
+  }, [resting, restKey, voiceStatus]);
 
   // Rest has to end itself. Nothing called finishRest except the expanded card's Continue
   // button, so a finished rest sat at 0:00 forever and the next set could never begin.
@@ -567,7 +650,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
     if (!isCardio && !resting && looksLikeSetReport(text)) {
       const parsed = parseSetReport(text);
       if (parsed) {
-        commitSet(parsed.weight, parsed.reps, false, parsed.unit);
+        commitSet(resolveSetWeight(parsed), parsed.reps, false, parsed.unit);
         return;
       }
     }
@@ -578,7 +661,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
   const handleDoneSet = () => {
     if (resting || !currentExercise) return;
     if (parsedDraft) {
-      commitSet(parsedDraft.weight, parsedDraft.reps, false, parsedDraft.unit);
+      commitSet(resolveSetWeight(parsedDraft), parsedDraft.reps, false, parsedDraft.unit);
       return;
     }
     // Tapped straight from the menu with nothing typed — confirmed live: this used to silently
@@ -588,7 +671,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
     // instead of only working when the user has already typed a report.
     const fallbackReps = targetRepsFrom(currentExercise.repScheme);
     if (fallbackReps != null) {
-      commitSet(lastLoggedWeight ?? null, fallbackReps, false);
+      commitSet(carryWeight(), fallbackReps, false);
       return;
     }
     inputRef.current?.focus();
@@ -872,6 +955,13 @@ export function ActiveSessionScreen({ navigation }: Props) {
                   showsHorizontalScrollIndicator={false}
                   style={styles.chipSwipe}
                   onLayout={(e) => setSwipeWidth(e.nativeEvent.layout.width)}
+                  onContentSizeChange={() => {
+                    if (isCardio || swipeWidthRef.current <= 0) return;
+                    chipScrollRef.current?.scrollTo({
+                      x: currentExerciseIndex * swipeWidthRef.current,
+                      animated: false,
+                    });
+                  }}
                 >
                   {isCardio ? (
                     <View style={[styles.chipSlide, swipeWidth ? { width: swipeWidth } : null]}>
@@ -933,12 +1023,12 @@ export function ActiveSessionScreen({ navigation }: Props) {
                                   </Text>
                                 </View>
                                 <View style={styles.chipDivider} />
-                                <View style={styles.chipInfoCol}>
+                                <View style={styles.chipInfoColReps}>
                                   <Text style={styles.chipInfoLabel} numberOfLines={1}>
                                     REPS
                                   </Text>
                                   <Text style={styles.chipInfoValueSmall} numberOfLines={1}>
-                                    {exercise.repScheme ?? "—"}
+                                    {formatRepScheme(exercise.repScheme)}
                                   </Text>
                                 </View>
                                 <View style={styles.chipDivider} />
@@ -1008,6 +1098,13 @@ export function ActiveSessionScreen({ navigation }: Props) {
                   showsHorizontalScrollIndicator={false}
                   style={styles.expandedSwipe}
                   onLayout={(e) => setExpandedWidth(e.nativeEvent.layout.width)}
+                  onContentSizeChange={() => {
+                    if (isCardio || expandedWidthRef.current <= 0) return;
+                    expandedScrollRef.current?.scrollTo({
+                      x: currentExerciseIndex * expandedWidthRef.current,
+                      animated: false,
+                    });
+                  }}
                 >
                   {isCardio ? (
                     <View style={[styles.expandedSlide, expandedWidth ? { width: expandedWidth } : null]}>
@@ -1103,7 +1200,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
                 <View style={styles.controlsRow}>
                   <View style={styles.controlsRowPrimary}>
                     {resting && !isCardio ? (
-                      <Pressable style={styles.doneBtnSlim} onPress={session.finishRest}>
+                      <Pressable style={styles.doneBtnSlim} onPress={handleStartSetTap}>
                         <PlayIcon size={13} color="#FFFFFF" />
                         <Text style={[styles.doneBtnText, styles.doneBtnTextRest]}>
                           Start Set {currentSetCount + 1}
@@ -1190,7 +1287,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
         open={controlsOpen}
         onClose={() => setControlsOpen(false)}
         onSetDone={!isCardio && !resting ? handleDoneSet : undefined}
-        onStartSet={!isCardio && resting ? session.finishRest : undefined}
+        onStartSet={!isCardio && resting ? handleStartSetTap : undefined}
         startSetLabel={`Start set ${currentSetCount + 1}`}
         onWorkoutDone={() => setEndConfirmOpen(true)}
         onManageWorkout={() => {
@@ -1473,11 +1570,18 @@ const styles = StyleSheet.create({
     gap: 4,
     maxWidth: 92,
   },
+  // Reps is capped for the same reason Weight is: a timed scheme ("30-45 seconds") is far wider
+  // than the "6-8" this column was sized around, and an uncapped one starves the exercise name.
+  chipInfoColReps: {
+    gap: 4,
+    maxWidth: 86,
+  },
   // Only the exercise column may shrink and ellipsize — its length is the unpredictable one,
-  // and Set/Reps/Weight must never be the columns that get truncated.
+  // and Set/Reps/Weight must never be the columns that get truncated. The floor keeps it legible:
+  // shrinking to nothing turned "PLANK" into "PL..." and its own label into "E...".
   chipInfoColExercise: {
     flexShrink: 1,
-    minWidth: 0,
+    minWidth: 68,
     gap: 4,
   },
   chipInfoLabel: {

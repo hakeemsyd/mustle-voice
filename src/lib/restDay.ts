@@ -7,6 +7,17 @@ import { localDateKey } from "./resolveTodaySession";
  *  for the same day just upserts the same row. */
 export async function chooseRestDay(userId: string, deferredPlanSessionId: string | null): Promise<void> {
   const date = localDateKey(new Date());
+
+  // A one-off custom session outranks a rest day (that's the point of it), so choosing rest while
+  // one is pinned to today has to clear it — otherwise the day stays "due" and Home keeps offering
+  // the workout the user just declined.
+  const { error: overrideError } = await supabase
+    .from("day_override")
+    .delete()
+    .eq("user_id", userId)
+    .eq("date", date);
+  if (overrideError) throw new Error(`day_override delete: ${overrideError.message}`);
+
   const { error } = await supabase
     .from("rest_day")
     .upsert(

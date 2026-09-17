@@ -1,9 +1,19 @@
 import { useCallback, useEffect, useState } from "react";
 import { supabase } from "../lib/supabase";
-import { resolveTodaySession, type PlanSessionRow, type WorkoutLogRow } from "../lib/resolveTodaySession";
+import { canReadAppleHealth, readSleepMinutesForNight } from "../lib/appleHealth";
+import {
+  byMostRecentFinishedFirst,
+  holdsRotation,
+  isUnfinishedWorkout,
+  resolveTodaySession,
+  type PlanSessionRow,
+  type WorkoutLogRow,
+} from "../lib/resolveTodaySession";
 import { addDays, localDateKey, startOfLocalDay, startOfWeek } from "../lib/calendarDate";
 import { titleCase } from "../lib/textFormat";
+
 import type { FoodLogEntry } from "./useFuelData";
+import { useLocalDayRollover } from "./useLocalDayRollover";
 
 // A flexible split's exact rest days aren't stored anywhere — only the weekly cadence
 // (days_per_week) is — so this assumes the ordinary real-world reading of "N days a week":
@@ -56,16 +66,42 @@ export interface TodayCalendarData {
   refetch: () => void;
 }
 
+
+/**
+ * What the app itself would have said was due on a PAST day, replayed from the logs that existed
+ * at the time.
+ *
+ * Past days used to be back-projected by marching one rotation step per training slot away from
+ * today, which is a second, independent answer to a question resolveTodaySession already answers —
+ * and the two only agree if the user trains on every single slot. Confirmed live: an interrupted
+ * session on Tuesday held the rotation pointer, so Home said "Upper Pull" all week while Calendar
+ * back-projected Wednesday as "Lower". Replaying the real function against the real logs makes
+ * Calendar agree with what Home actually showed that day, by construction rather than by luck.
+ *
+ * Future days keep the slot projection: nothing is logged yet, so "assuming you train as planned"
+ * is the only sensible read, and it is what a forward schedule is for.
+ */
+const resolvePastDaySession = <T extends PlanSessionRow>(
+  sessions: T[],
+  logs: WorkoutLogRow[],
+  dateKey: string,
+  restDayDates: Set<string>,
+): T | null => {
+  const dayStart = startOfLocalDay(dateKey).getTime();
+  const logsBefore = logs.filter((log) => new Date(log.at).getTime() < dayStart);
+  return resolveTodaySession(sessions, logsBefore, startOfLocalDay(dateKey), restDayDates);
+};
+
 const fetchPlanAndLogs = async (userId: string) => {
   // rest_day rows are always written for "today" at write time (see src/lib/restDay.ts), never
   // a future date, so a 90-day-back window covers every caller (today/week/month/day-detail)
   // without needing a per-caller date range the way logs' own query doesn't have either.
   const ninetyDaysAgo = localDateKey(new Date(Date.now() - 90 * 86_400_000));
-  const [{ data: plan }, { data: logs }, { data: restDays }] = await Promise.all([
+  const [{ data: plan }, { data: logs }, { data: restDays }, { data: override }] = await Promise.all([
     supabase
       .from("training_plan")
       .select(
-        "created_at, plan_session(id, day_order, weekday, focus, plan_exercise(ord, sets, rep_scheme, load_scheme, exercise(name)))",
+        "created_at, days_per_week, plan_session(id, day_order, weekday, focus, plan_exercise(ord, sets, rep_scheme, load_scheme, exercise(name)))",
       )
       .eq("user_id", userId)
       .eq("status", "active")
@@ -77,16 +113,38 @@ const fetchPlanAndLogs = async (userId: string) => {
       .order("at", { ascending: false })
       .limit(30),
     supabase.from("rest_day").select("date").eq("user_id", userId).gte("date", ninetyDaysAgo),
+    // Today's one-off custom session, if the coach built one. Fetched here so Calendar resolves
+    // today exactly the way Home does — two screens disagreeing about what's due today is the
+    // same class of bug as the coach disagreeing with the screen.
+    supabase
+      .from("day_override")
+      .select(
+        "plan_session(id, day_order, weekday, focus, plan_exercise(ord, sets, rep_scheme, load_scheme, exercise(name)))",
+      )
+      .eq("user_id", userId)
+      .eq("date", localDateKey(new Date()))
+      .maybeSingle(),
   ]);
+  const overrideRow = (override as any)?.plan_session ?? null;
   return {
     sessions: (plan?.plan_session ?? []) as unknown as FullPlanSession[],
     logs: (logs ?? []) as WorkoutLogRow[],
     restDayDates: new Set(((restDays ?? []) as any[]).map((r) => r.date as string)),
+    dayOverride: ((Array.isArray(overrideRow) ? overrideRow[0] : overrideRow) ??
+      null) as FullPlanSession | null,
     // A flexible rotation's backward projection (see isTrainingSlot below) has no real rotation
     // to project onto before the plan actually existed — confirmed live: days from before the
     // account/plan was created were being marked "Missed" as if a workout had been skipped that
     // could never have happened.
     planCreatedKey: plan?.created_at ? localDateKey(new Date(plan.created_at)) : null,
+    // How many days a week they actually train, as stored on the plan. Every caller used to
+    // infer this from the number of sessions in the rotation, which is a different quantity
+    // entirely: a 3-session push/pull/legs rotation run six days a week is 3 sessions and 6
+    // training days. Conflating them shifts which weekdays count as training slots, and the
+    // whole forward/backward projection is indexed off those slots — so the error moves every
+    // subsequent day's session, not just the count. Falls back to the rotation length only when
+    // the column is genuinely empty.
+    daysPerWeek: (plan?.days_per_week as number | null) || (plan?.plan_session ?? []).length,
   };
 };
 
@@ -103,6 +161,8 @@ export const useTodayCalendar = (): TodayCalendarData => {
   });
   const [refetchSignal, setRefetchSignal] = useState(0);
   const refetch = useCallback(() => setRefetchSignal((n) => n + 1), []);
+  // Same local-day boundary as Home — the Today tab is entirely "what's due / done today".
+  useLocalDayRollover(refetch);
 
   useEffect(() => {
     let cancelled = false;
@@ -119,7 +179,7 @@ export const useTodayCalendar = (): TodayCalendarData => {
       const startOfDay = new Date();
       startOfDay.setHours(0, 0, 0, 0);
 
-      const [{ sessions, logs, restDayDates }, foodRes] = await Promise.all([
+      const [{ sessions, logs, restDayDates, dayOverride }, foodRes] = await Promise.all([
         fetchPlanAndLogs(userId),
         supabase
           .from("food_log")
@@ -130,7 +190,7 @@ export const useTodayCalendar = (): TodayCalendarData => {
       ]);
       if (cancelled) return;
 
-      const today = resolveTodaySession(sessions, logs, new Date(), restDayDates);
+      const today = resolveTodaySession(sessions, logs, new Date(), restDayDates, dayOverride);
       const todayKey = localDateKey(new Date());
       const isChosenRestDay = restDayDates.has(todayKey);
       // Found independent of `today`/resolveTodaySession on purpose: for a flexible rotation,
@@ -142,8 +202,8 @@ export const useTodayCalendar = (): TodayCalendarData => {
       // identical to one not yet started.
       const completedLog = logs
         .slice()
-        .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
-        .find((log) => log.status !== "partial" && localDateKey(new Date(log.at)) === todayKey);
+        .sort(byMostRecentFinishedFirst)
+        .find((log) => !isUnfinishedWorkout(log.status) && localDateKey(new Date(log.at)) === todayKey);
       const completedSession = completedLog?.plan_session_id
         ? sessions.find((s) => s.id === completedLog.plan_session_id)
         : undefined;
@@ -213,6 +273,8 @@ export const useWeekCalendar = (weekStart: Date): WeekCalendarData => {
   const [days, setDays] = useState<WeekDay[]>([]);
   const [refetchSignal, setRefetchSignal] = useState(0);
   const refetch = useCallback(() => setRefetchSignal((n) => n + 1), []);
+  // Same local-day boundary as Home — the Today tab is entirely "what's due / done today".
+  useLocalDayRollover(refetch);
   const weekStartKey = localDateKey(weekStart);
 
   useEffect(() => {
@@ -230,7 +292,12 @@ export const useWeekCalendar = (weekStart: Date): WeekCalendarData => {
 
       const start = startOfLocalDay(weekStartKey);
       const end = addDays(start, 7);
-      const [{ sessions, logs: allRecentLogs, restDayDates, planCreatedKey }, workoutRes, foodRes] = await Promise.all([
+      const [
+        { sessions, logs: allRecentLogs, restDayDates, dayOverride, planCreatedKey, daysPerWeek },
+        workoutRes,
+        foodRes,
+      ] =
+        await Promise.all([
         fetchPlanAndLogs(userId),
         supabase
           .from("workout_log")
@@ -260,9 +327,7 @@ export const useWeekCalendar = (weekStart: Date): WeekCalendarData => {
       const todayDate = startOfLocalDay(todayKey);
 
       const rotation = sessions.slice().sort((a, b) => a.day_order - b.day_order);
-      const dueToday = resolveTodaySession(sessions, allRecentLogs, new Date(), restDayDates);
-
-      const daysPerWeek = rotation.length;
+      const dueToday = resolveTodaySession(sessions, allRecentLogs, new Date(), restDayDates, dayOverride);
 
       // Index of the next session due once today's (real, resolved) slot is spoken for —
       // same "last logged, advance by one" read resolveTodaySession itself uses internally,
@@ -273,12 +338,12 @@ export const useWeekCalendar = (weekStart: Date): WeekCalendarData => {
         const inPlan = new Set(rotation.map((s) => s.id));
         const lastLogged = allRecentLogs
           .slice()
-          .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
+          .sort(byMostRecentFinishedFirst)
           .find((log) => log.plan_session_id && inPlan.has(log.plan_session_id));
         if (lastLogged) {
           const lastIndex = rotation.findIndex((s) => s.id === lastLogged.plan_session_id);
           pointerIndex =
-            lastIndex === -1 ? 0 : lastLogged.status === "partial" ? lastIndex : (lastIndex + 1) % rotation.length;
+            lastIndex === -1 ? 0 : holdsRotation(lastLogged, new Date()) ? lastIndex : (lastIndex + 1) % rotation.length;
         }
       }
 
@@ -296,16 +361,26 @@ export const useWeekCalendar = (weekStart: Date): WeekCalendarData => {
         // training-slot day needs a "was this completed?" read too, not just future ones.
         let projectedFocus: string | null = null;
         if (isFlexible && !isToday && rotation.length > 0 && isTrainingSlot(date.getDay(), daysPerWeek)) {
-          let trainingSlots = 0;
-          const step = isFuture ? 1 : -1;
-          const cursor = new Date(todayDate);
-          while (localDateKey(cursor) !== dateKey) {
-            cursor.setDate(cursor.getDate() + step);
-            if (isTrainingSlot(cursor.getDay(), daysPerWeek)) trainingSlots++;
+          if (!isFuture) {
+            projectedFocus = resolvePastDaySession(sessions, allRecentLogs, dateKey, restDayDates)?.focus ?? null;
+          } else {
+            let trainingSlots = 0;
+            const cursor = new Date(todayDate);
+            while (localDateKey(cursor) !== dateKey) {
+              cursor.setDate(cursor.getDate() + 1);
+              if (isTrainingSlot(cursor.getDay(), daysPerWeek)) trainingSlots++;
+            }
+            // `pointerIndex` is the session due TODAY. So the Nth training slot ahead is
+            // pointerIndex + N — but only when today is itself a training slot and therefore
+            // already consumes pointerIndex. When today is a rest slot nothing consumes it, and
+            // the next training day IS pointerIndex. The old formula hardcoded the second case,
+            // so on any training day tomorrow was painted with today's own session: confirmed
+            // live, Mon and Tue both read "Upper Pull".
+            const todayIsTrainingSlot = isTrainingSlot(todayDate.getDay(), daysPerWeek);
+            const offset = trainingSlots - (todayIsTrainingSlot ? 0 : 1);
+            const idx = ((pointerIndex + offset) % rotation.length + rotation.length) % rotation.length;
+            projectedFocus = rotation[idx]?.focus ?? null;
           }
-          const offset = isFuture ? trainingSlots - 1 : -trainingSlots;
-          const idx = ((pointerIndex + offset) % rotation.length + rotation.length) % rotation.length;
-          projectedFocus = rotation[idx]?.focus ?? null;
         }
 
         // Nothing was planned (or missed) before the plan itself existed — see useDayDetail's
@@ -324,7 +399,7 @@ export const useWeekCalendar = (weekStart: Date): WeekCalendarData => {
             projectedFocus);
 
         let status: WeekDay["status"];
-        if (workoutThatDay) status = workoutThatDay.status === "partial" ? "partial" : "completed";
+        if (workoutThatDay) status = isUnfinishedWorkout(workoutThatDay.status) ? "partial" : "completed";
         else if (beforePlanExisted) status = "rest";
         else if (isPinnedRest) status = "rest";
         else if (isToday && dueToday) status = "upcoming";
@@ -371,6 +446,8 @@ export const useMonthCalendar = (monthDate: Date): MonthCalendarData => {
   const [plannedDates, setPlannedDates] = useState<Set<string>>(new Set());
   const [refetchSignal, setRefetchSignal] = useState(0);
   const refetch = useCallback(() => setRefetchSignal((n) => n + 1), []);
+  // Same local-day boundary as Home — the Today tab is entirely "what's due / done today".
+  useLocalDayRollover(refetch);
   const monthKey = `${monthDate.getFullYear()}-${monthDate.getMonth()}`;
 
   useEffect(() => {
@@ -388,7 +465,7 @@ export const useMonthCalendar = (monthDate: Date): MonthCalendarData => {
 
       const start = new Date(monthDate.getFullYear(), monthDate.getMonth() - 1, 21);
       const end = new Date(monthDate.getFullYear(), monthDate.getMonth() + 2, 10);
-      const [{ sessions, planCreatedKey }, { data }] = await Promise.all([
+      const [{ sessions, planCreatedKey, daysPerWeek }, { data }] = await Promise.all([
         fetchPlanAndLogs(userId),
         supabase
           .from("workout_log")
@@ -403,7 +480,7 @@ export const useMonthCalendar = (monthDate: Date): MonthCalendarData => {
       const partial = new Set<string>();
       for (const row of (data ?? []) as { at: string; status: string }[]) {
         const key = localDateKey(new Date(row.at));
-        if (row.status === "partial") partial.add(key);
+        if (isUnfinishedWorkout(row.status)) partial.add(key);
         else completed.add(key);
       }
 
@@ -413,7 +490,6 @@ export const useMonthCalendar = (monthDate: Date): MonthCalendarData => {
       const planned = new Set<string>();
       const isFlexible = sessions.length > 0 && sessions.every((s) => s.weekday === null);
       const pinnedWeekdays = new Set(sessions.filter((s) => s.weekday !== null).map((s) => s.weekday as number));
-      const daysPerWeek = sessions.length;
       if (sessions.length > 0) {
         const cursor = new Date(Math.max(start.getTime(), planCreatedKey ? startOfLocalDay(planCreatedKey).getTime() : start.getTime()));
         while (cursor < end) {
@@ -457,6 +533,12 @@ export interface DayDetailMacros {
 
 export interface DayDetail {
   loading: boolean;
+  /** Hours asleep for the night ending on this day. Apple Health when connected, otherwise the
+   *  self-reported figure from a check-in — the coach can record one via log_checkin, and until
+   *  now nothing in the app ever showed it back, so a user could tell the coach they slept seven
+   *  hours and find no trace of it anywhere. */
+  sleepHours: number | null;
+  sleepSource: "health" | "checkin" | null;
   workouts: DayDetailWorkout[];
   meals: { description: string; calories: number }[];
   injuryNotes: { id: string; summary: string }[];
@@ -471,6 +553,8 @@ export interface DayDetail {
 
 const EMPTY_DAY_DETAIL: Omit<DayDetail, "isPast" | "isToday" | "isFuture" | "refetch"> = {
   loading: true,
+  sleepHours: null,
+  sleepSource: null,
   workouts: [],
   meals: [],
   injuryNotes: [],
@@ -485,6 +569,8 @@ export const useDayDetail = (dateKey: string | null): DayDetail => {
   );
   const [refetchSignal, setRefetchSignal] = useState(0);
   const refetch = useCallback(() => setRefetchSignal((n) => n + 1), []);
+  // Same local-day boundary as Home — the Today tab is entirely "what's due / done today".
+  useLocalDayRollover(refetch);
 
   useEffect(() => {
     if (!dateKey) return;
@@ -508,11 +594,12 @@ export const useDayDetail = (dateKey: string | null): DayDetail => {
       const isFuture = dateKey > todayKey;
 
       const [
-        { sessions, logs: recentLogs, restDayDates, planCreatedKey },
+        { sessions, logs: recentLogs, restDayDates, dayOverride, planCreatedKey, daysPerWeek },
         { data: workouts },
         { data: food },
         { data: injuries },
         { data: nutritionTarget },
+        { data: checkin },
       ] = await Promise.all([
           fetchPlanAndLogs(userId),
           supabase
@@ -534,7 +621,32 @@ export const useDayDetail = (dateKey: string | null): DayDetail => {
             .gte("created_at", start.toISOString())
             .lt("created_at", end.toISOString()),
           supabase.from("nutrition_target").select("protein_g, carbs_g, fat_g").eq("user_id", userId).maybeSingle(),
+          supabase
+            .from("checkin_log")
+            .select("sleep_hours, at")
+            .eq("user_id", userId)
+            .gte("at", start.toISOString())
+            .lt("at", end.toISOString())
+            .order("at", { ascending: false })
+            .limit(1)
+            .maybeSingle(),
         ]);
+
+      // Apple Health first when it is connected, since a measured night beats a remembered one.
+      // The check-in figure is the fallback, and is the only source at all for anyone who has not
+      // connected Health — which, until the permission fix, was most people.
+      const healthSleepMinutes = (await canReadAppleHealth())
+        ? await readSleepMinutesForNight(dateKey)
+        : null;
+      const checkinSleepHours = (checkin as { sleep_hours: number | null } | null)?.sleep_hours ?? null;
+      const sleepHours =
+        healthSleepMinutes != null
+          ? Math.round((healthSleepMinutes / 60) * 10) / 10
+          : checkinSleepHours != null
+            ? Math.round(checkinSleepHours * 10) / 10
+            : null;
+      const sleepSource: DayDetail["sleepSource"] =
+        healthSleepMinutes != null ? "health" : checkinSleepHours != null ? "checkin" : null;
       if (cancelled) return;
 
       // Planned focus: a pinned weekday plan says so directly; a flexible rotation only
@@ -559,35 +671,39 @@ export const useDayDetail = (dateKey: string | null): DayDetail => {
         plannedFocus = pinned.focus;
         plannedSessionId = pinned.id;
       } else if (isToday) {
-        const due = resolveTodaySession(sessions, recentLogs, new Date(), restDayDates);
+        const due = resolveTodaySession(sessions, recentLogs, new Date(), restDayDates, dayOverride);
         if (due) {
           plannedFocus = due.focus;
           plannedSessionId = due.id;
         }
+      } else if (isFlexible && rotation.length > 0 && !isFuture) {
+        // Past day: replay what the app would actually have said that morning, from the logs that
+        // existed then. Same function Home and the Today tab use, so they cannot disagree.
+        const past = resolvePastDaySession(sessions, recentLogs, dateKey, restDayDates);
+        plannedFocus = past?.focus ?? null;
+        plannedSessionId = past?.id ?? null;
       } else if (isFlexible && rotation.length > 0) {
-        const daysPerWeek = rotation.length;
         const lastLogged = recentLogs
           .slice()
-          .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
+          .sort(byMostRecentFinishedFirst)
           .find((log) => log.plan_session_id && rotation.some((s) => s.id === log.plan_session_id));
         let pointerIndex = 0;
         if (lastLogged) {
           const lastIndex = rotation.findIndex((s) => s.id === lastLogged.plan_session_id);
-          pointerIndex = lastIndex === -1 ? 0 : lastLogged.status === "partial" ? lastIndex : (lastIndex + 1) % rotation.length;
+          pointerIndex = lastIndex === -1 ? 0 : holdsRotation(lastLogged, new Date()) ? lastIndex : (lastIndex + 1) % rotation.length;
         }
         const target = startOfLocalDay(dateKey);
         if (isTrainingSlot(target.getDay(), daysPerWeek)) {
           let trainingSlots = 0;
-          const step = isFuture ? 1 : -1;
           const cursor = startOfLocalDay(todayKey);
           while (localDateKey(cursor) !== dateKey) {
-            cursor.setDate(cursor.getDate() + step);
+            cursor.setDate(cursor.getDate() + 1);
             if (isTrainingSlot(cursor.getDay(), daysPerWeek)) trainingSlots++;
           }
-          // Future: the next `trainingSlots` rotation entries starting at the pointer.
-          // Past: walking backward the same number of training slots from the pointer —
-          // the most recent past slot is the one right before whatever's due next.
-          const offset = isFuture ? trainingSlots - 1 : -trainingSlots;
+          // Future only now: the Nth training slot ahead is pointerIndex + N, less one when today
+          // is itself a rest slot and so consumes nothing.
+          const todayIsTrainingSlot = isTrainingSlot(startOfLocalDay(todayKey).getDay(), daysPerWeek);
+          const offset = trainingSlots - (todayIsTrainingSlot ? 0 : 1);
           const idx = ((pointerIndex + offset) % rotation.length + rotation.length) % rotation.length;
           const projected = rotation[idx];
           plannedFocus = projected?.focus ?? null;
@@ -617,6 +733,8 @@ export const useDayDetail = (dateKey: string | null): DayDetail => {
 
       setState({
         loading: false,
+        sleepHours,
+        sleepSource,
         workouts: (workouts ?? []).map((w: any) => ({
           workoutLogId: w.id,
           status: w.status,

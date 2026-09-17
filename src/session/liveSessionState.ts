@@ -63,7 +63,9 @@ export function buildLiveSessionSnapshot(input: SnapshotInput): LiveSessionSnaps
           loggedSets: input.loggedSets[input.currentExerciseIndex] ?? [],
         }
       : null,
-    upcomingExercises: input.exercises.slice(input.currentExerciseIndex + 1).map((e) => e.name),
+    upcomingExercises: input.exercises
+      .slice(input.currentExerciseIndex + 1)
+      .map((e) => `${e.name} (${e.sets} sets of ${e.repScheme}${e.loadScheme ? `, ${e.loadScheme}` : ''})`),
     restTargetSec: input.resting ? input.restTargetSec : null,
     restRemainingSec,
   };
@@ -112,8 +114,20 @@ export function describeLiveSessionSnapshot(snapshot: LiveSessionSnapshot): stri
     lines.push('- No current exercise (session not yet loaded or already finished).');
   }
 
-  if (snapshot.status === 'resting' && snapshot.restRemainingSec !== null) {
-    lines.push(`- Resting: ${snapshot.restRemainingSec}s remaining of a ${snapshot.restTargetSec}s target.`);
+  // Deliberately no seconds-remaining figure here. This block is pushed as a contextual update
+  // when session state changes, not on every tick, so any number it carried would be frozen at
+  // rest-start and still be sitting in context minutes later — which is where "ten seconds left"
+  // with thirty on the clock, followed by "fifteen seconds", came from. The per-turn block that
+  // brain-voice builds server-side recomputes the remaining time from the shared end timestamp on
+  // every single turn, so that one is live; leaving a stale copy here only gave the model a second,
+  // contradictory answer to choose from.
+  if (snapshot.status === 'resting') {
+    lines.push(
+      `- Resting, on a ${snapshot.restTargetSec}s timer. The app owns that timer and it is on ` +
+        `screen in front of the user. You have no clock of your own: never say how many seconds ` +
+        `are left, never count down, never claim you are timing anything, and never ask them to ` +
+        `read the timer to you. The app tells you the moment rest ends.`,
+    );
   }
 
   lines.push(

@@ -96,27 +96,58 @@ const BRAIN_TIMEOUT_MS = 25000;
 
 export const COACH_UNREACHABLE_MESSAGE = "Couldn't reach the coach — try again in a moment.";
 
-export async function callBrain(
-  userId: string,
-  message: string,
-  modality: BrainModality = 'text',
-  hidden: boolean = false,
-  timeoutMs: number = BRAIN_TIMEOUT_MS,
-  liveSessionState?: string,
-  attachmentUrl?: string,
-  // Home's daily-greeting call only — tells the server to skip its usual "new vs. ongoing
-  // conversation" note, which otherwise contradicts buildGreetingPrompt's own explicit "say hello"
-  // instruction for any user with prior history (nearly everyone). See buildSystemPrompt's own
-  // comment in brain-config.ts for the full story.
-  isDailyGreeting: boolean = false,
-): Promise<BrainResult> {
+export interface BrainRequest {
+  userId: string;
+  message: string;
+  modality?: BrainModality;
+  /** Scaffolding the app fires on its own (the daily greeting) — kept out of the visible chat. */
+  hidden?: boolean;
+  timeoutMs?: number;
+  liveSessionState?: string;
+  /** Short-lived signed URL, for the model's fetch on this turn only. Never persisted. */
+  attachmentUrl?: string;
+  /** Storage path for the same attachment — persisted, so the photo can be re-signed on every
+   *  later render instead of expiring with the URL above. */
+  attachmentPath?: string;
+  /** Home's daily-greeting call only — tells the server to skip its usual "new vs. ongoing
+   *  conversation" note, which otherwise contradicts buildGreetingPrompt's own explicit "say
+   *  hello" instruction for any user with prior history (nearly everyone). */
+  isDailyGreeting?: boolean;
+  /** Home's daily-greeting call only — the plan_session id the greeting is about (or 'rest'),
+   *  stamped onto the stored reply so a cached greeting is dropped once the due session changes. */
+  greetingKey?: string | null;
+}
+
+/**
+ * One object, not a positional list.
+ *
+ * This took ten positional parameters, and adding an eleventh next to the one it belonged with
+ * silently shifted `isDailyGreeting` and `greetingKey` by one at every call site — a live bug that
+ * surfaced only because two of the shifted types happened to disagree. With names, a new field
+ * can be added anywhere and nothing moves.
+ */
+export async function callBrain({
+  userId,
+  message,
+  modality = 'text',
+  hidden = false,
+  timeoutMs = BRAIN_TIMEOUT_MS,
+  liveSessionState,
+  attachmentUrl,
+  attachmentPath,
+  isDailyGreeting = false,
+  greetingKey = null,
+}: BrainRequest): Promise<BrainResult> {
   // The device's own current timezone, sent every call — profile.timezone is only written once
   // at onboarding and never refreshed, which silently drifted after travel/DST and misclassified
   // which local day a meal or workout fell on (confirmed live). The backend prefers this over the
   // stored value and opportunistically refreshes it too.
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const { data, error } = await supabase.functions.invoke('brain', {
-    body: { userId, message, modality, hidden, liveSessionState, timezone, attachmentUrl, isDailyGreeting },
+    body: {
+      userId, message, modality, hidden, liveSessionState, timezone, attachmentUrl, attachmentPath,
+      isDailyGreeting, greetingKey,
+    },
     timeout: timeoutMs,
   });
   if (error) throw new Error(`brain invoke failed: ${error.message}`);

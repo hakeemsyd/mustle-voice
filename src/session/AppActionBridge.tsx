@@ -2,6 +2,7 @@ import { useCallback, useRef } from 'react';
 import { AppActionListener, type AppAction } from './AppActionListener';
 import { useActiveSessionContext, type SessionStatus } from './ActiveSessionContext';
 import { navigateFromAppAction } from '../navigation/navigationRef';
+import { notifyHomeRefresh } from '../lib/homeRefreshBridge';
 
 interface AppActionBridgeProps {
   userId: string | null;
@@ -54,6 +55,9 @@ export function AppActionBridge({ userId }: AppActionBridgeProps) {
         }
         break;
       }
+      case 'refresh_home':
+        notifyHomeRefresh();
+        break;
       case 'adjust_rest_timer': {
         const restAction = String(action.payload?.action ?? '');
         if (restAction === 'extend') {
