@@ -1,4 +1,7 @@
 import type { LoggedSet, SessionExercise, SessionTarget } from './ActiveSessionContext';
+import { kgToDisplayWeight, type Units } from '../lib/units';
+import { convertLoadScheme } from '../lib/loadScheme';
+import { titleCase } from '../lib/textFormat';
 
 export interface LiveSessionSnapshot {
   target: SessionTarget;
@@ -71,7 +74,10 @@ export function buildLiveSessionSnapshot(input: SnapshotInput): LiveSessionSnaps
   };
 }
 
-export function describeLiveSessionSnapshot(snapshot: LiveSessionSnapshot): string {
+export function describeLiveSessionSnapshot(
+  snapshot: LiveSessionSnapshot,
+  units: Units = 'metric',
+): string {
   if (snapshot.target.type === 'cardio') {
     return (
       `Live session state: cardio (${snapshot.target.activity}), ${snapshot.status}, ` +
@@ -80,7 +86,9 @@ export function describeLiveSessionSnapshot(snapshot: LiveSessionSnapshot): stri
   }
 
   const lines: string[] = [`Live session state (ground truth — the screen the user is looking at right now):`];
-  lines.push(`- Status: ${snapshot.status}${snapshot.focus ? `, focus "${snapshot.focus}"` : ''}.`);
+  lines.push(
+    `- Status: ${snapshot.status}${snapshot.focus ? `, focus "${titleCase(snapshot.focus)}"` : ''}.`,
+  );
 
   if (snapshot.currentExercise) {
     const c = snapshot.currentExercise;
@@ -90,7 +98,7 @@ export function describeLiveSessionSnapshot(snapshot: LiveSessionSnapshot): stri
             .map((s) =>
               s.unit === 'seconds'
                 ? `${s.reps}s held`
-                : `${s.weight != null ? `${s.weight}kg` : 'bodyweight'}×${s.reps}`,
+                : `${s.weight != null ? kgToDisplayWeight(s.weight, units) : 'bodyweight'}×${s.reps}`,
             )
             .join(', ')
         : 'none yet';
@@ -100,13 +108,26 @@ export function describeLiveSessionSnapshot(snapshot: LiveSessionSnapshot): stri
     // live: "set 4 of 4" (3 done, the 4th still to do) was read as "4 of 4 finished", and the
     // coach moved on to the next exercise while the app was still waiting on the last set.
     lines.push(
-      `- Current exercise: "${c.name}" (target ${c.repScheme}${c.loadScheme ? `, ${c.loadScheme}` : ''}).`,
+      `- Current exercise: "${c.name}" — target reps ${c.repScheme}` +
+        `${c.loadScheme ? `, load ${convertLoadScheme(c.loadScheme, units)}` : ''}. When you say the target out loud, say ` +
+        `EXACTLY ${c.repScheme} — never a rep range carried over from an earlier exercise in this ` +
+        `session, however many times you just said it.`,
     );
     lines.push(
       remaining > 0
         ? `- Sets COMPLETED on it: ${done} of ${c.totalSets}. ${remaining} still to do — the next one ` +
             `to perform is set ${done + 1}, which has NOT happened yet. Do not move on to another ` +
-            `exercise until all ${c.totalSets} are completed.`
+            `exercise until all ${c.totalSets} are completed. Announcing a set, or telling them to go, ` +
+            `does NOT complete it, and never count one twice because it was discussed more than once ` +
+            `— confirmed live, the coach treated its own "set three, go" as set three being finished ` +
+            `and challenged the user's real report of it as a duplicate. ` +
+            `IMPORTANT: this count can lag by one set. It is written by the app a moment after a set ` +
+            `is logged, so a set the user reported seconds ago may not be in it yet. If a message in ` +
+            `THIS turn says the app just logged a set, that message is newer than this block and wins ` +
+            `— confirmed live: the coach told a user their set "didn't register" and to tap the screen, ` +
+            `while the app had already logged it and the screen already showed it. Never tell the user ` +
+            `a set failed to register, and never accuse them of repeating one; if the two disagree, ` +
+            `believe the more recent one and move on.`
         : `- Sets COMPLETED on it: ${done} of ${c.totalSets}. This exercise is finished.`,
     );
     lines.push(`- Loads logged so far on this exercise: ${loggedDesc}.`);
@@ -134,6 +155,13 @@ export function describeLiveSessionSnapshot(snapshot: LiveSessionSnapshot): stri
     snapshot.upcomingExercises.length > 0
       ? `- Upcoming exercises: ${snapshot.upcomingExercises.join(', ')}.`
       : '- No exercises left after this one.',
+  );
+
+  lines.push(
+    'Count sets ONLY from this block. Announcing a set is not the same as the user performing it, ' +
+    'and neither is acknowledging one you misheard — your own earlier turns are not a record of ' +
+    'what happened, this block is. If it disagrees with something you said a minute ago, this ' +
+    'block is right and you were wrong.',
   );
 
   lines.push(

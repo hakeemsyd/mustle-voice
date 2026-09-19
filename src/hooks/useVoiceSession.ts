@@ -31,10 +31,24 @@ const RECONNECT_MAX_DELAY_MS = 20_000;
 
 const MUTE_REASSERT_INTERVAL_MS = 2_000;
 
+const TRANSPORT_PROBE_AFTER_MS = 45_000;
+const TRANSPORT_CHECK_INTERVAL_MS = 15_000;
+const TRANSPORT_PROBE = '[system note: connection check only, do not reply or mention this]';
+
+const TRANSPORT_FAILURE = /could not establish pc connection|failed to connect|connection failed/i;
+
 /** Marks a turn the app injected to make the coach speak (greeting, rest countdown), rather than
  *  something the user said. It goes out through sendUserMessage — the only call that makes the
  *  agent actually reply — so it comes back as a user turn and has to be told apart from real
  *  speech on the way in. brain-voice rewrites it server-side (see _shared/system-cue.ts). */
+const AUDIO_SESSION_BUSY = /561017449|cannot ?interrupt ?others/i;
+
+const reportEndSessionFailure = (context: string, err: unknown): void => {
+  const message = err instanceof Error ? err.message : String(err);
+  if (AUDIO_SESSION_BUSY.test(message)) return;
+  console.error(`[voice] failed to end session${context}:`, err);
+};
+
 export const SYSTEM_CUE_PREFIX = '[[SYSTEM_CUE]]';
 
 // A handful of short, deliberate stop phrases — matched as a WHOLE clause, never as a
@@ -86,7 +100,7 @@ function isStopCommand(text: string): boolean {
 // it kept making filler noises and checking in for minutes of silence). Deliberately reset only
 // by the USER's own speech, never the agent's — an agent that itself talks unprompted every
 // 10-20s must not be able to keep resetting its own timeout.
-const SILENCE_TIMEOUT_MS = 60_000;
+const SILENCE_TIMEOUT_MS = 3 * 60_000;
 const WORKOUT_SILENCE_TIMEOUT_MS = 10 * 60_000;
 // How long a blurred screen's pending close waits for the next screen to claim the conversation
 // — long enough to cover a navigation transition, short enough that genuinely leaving voice
@@ -110,7 +124,10 @@ export function useVoiceSession(
   const configRef = useRef(config);
   configRef.current = config;
   const lastUserActivityRef = useRef(Date.now());
+  const lastSdkActivityRef = useRef(Date.now());
   const wasMutedRef = useRef(false);
+  const forceFreshSessionRef = useRef<(reason: string) => void>(() => undefined);
+  const hasConnectedRef = useRef(false);
 
   const [workoutActive, setWorkoutActive] = useState(false);
 
@@ -131,7 +148,14 @@ export function useVoiceSession(
     setMuted,
   } = useConversation({
     micMuted: muted,
-    onError: (message) => console.error('[voice] error:', message),
+    onError: (message) => {
+      if (TRANSPORT_FAILURE.test(String(message))) {
+        console.warn('[voice] transport error, recovering:', message);
+        forceFreshSessionRef.current(String(message));
+        return;
+      }
+      console.error('[voice] error:', message);
+    },
     onMessage: ({ message, role }) => {
       // The SDK emits the occasional contentless turn — room noise heard as speech, or an
       // interim transcript that resolved to nothing. scribe_v1 doesn't always return empty for
@@ -141,6 +165,7 @@ export function useVoiceSession(
       // read the marker back out loud. stripNonSpeechArtifacts (already proven for onboarding's
       // STT, see elevenLabsVoice.ts) strips those annotations first, so only text a person
       // actually said either resets the silence timeout below or reaches the coach.
+      lastSdkActivityRef.current = Date.now();
       const cleaned = stripNonSpeechArtifacts(message);
       if (!cleaned) return;
       if (mutedRef.current && role === 'user') return;
@@ -157,7 +182,7 @@ export function useVoiceSession(
           intentionalEndRef.current = true;
           Promise.resolve(endSession())
             .then(() => setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }))
-            .catch((err) => console.error('[voice] failed to end session on stop command:', err));
+            .catch((err) => reportEndSessionFailure(' on stop command', err));
           return;
         }
       }
@@ -249,6 +274,7 @@ export function useVoiceSession(
 
   useEffect(() => {
     if (status === 'connected') {
+      hasConnectedRef.current = true;
       setVoiceDropped(false);
       setIdleClosed(false);
       // A successful (re)connection resolves whatever drop preceded it — without this, a second,
@@ -274,6 +300,8 @@ export function useVoiceSession(
       try {
         setMuted(mutedRef.current);
       } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/no active conversation/i.test(message)) return;
         console.warn('[voice] failed to re-assert mute state:', err);
       }
     };
@@ -308,10 +336,51 @@ export function useVoiceSession(
       setIdleClosed(true);
       Promise.resolve(endSession())
         .then(() => setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }))
-        .catch((err) => console.error('[voice] failed to end session on silence timeout:', err));
+        .catch((err) => reportEndSessionFailure(' on silence timeout', err));
     }, SILENCE_CHECK_INTERVAL_MS);
     return () => clearInterval(id);
   }, [status, endSession, muted, workoutActive]);
+
+
+  const forceFreshSession = useCallback(
+    (reason: string) => {
+      if (intentionalEndRef.current) return;
+      if (!hasConnectedRef.current) return;
+      lastSdkActivityRef.current = Date.now();
+      if (reconnectAttemptsRef.current >= MAX_AUTO_RECONNECTS) {
+        setVoiceDropped(true);
+        return;
+      }
+      console.warn(`[voice] transport failed (${reason}) — starting a fresh session`);
+      hasConnectedRef.current = false;
+      reconnectAttemptsRef.current += 1;
+      intentionalEndRef.current = true;
+      setReconnecting(true);
+      Promise.resolve(endSession())
+        .catch(() => undefined)
+        .finally(() => setReconnectTrigger((n) => n + 1));
+    },
+    [endSession],
+  );
+  forceFreshSessionRef.current = forceFreshSession;
+
+  useEffect(() => {
+    if (status !== 'connected' || muted) return;
+    const id = setInterval(() => {
+      if (Date.now() - lastSdkActivityRef.current < TRANSPORT_PROBE_AFTER_MS) return;
+      Promise.resolve()
+        .then(() => sendContextualUpdate(TRANSPORT_PROBE))
+        .then(() => {
+          lastSdkActivityRef.current = Date.now();
+        })
+        .catch((err) => {
+          const message = err instanceof Error ? err.message : String(err);
+          if (/no active conversation/i.test(message)) return;
+          forceFreshSession(message);
+        });
+    }, TRANSPORT_CHECK_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [status, muted, sendContextualUpdate, forceFreshSession]);
 
   // Simply backgrounding the app (switching apps, locking the phone, checking a notification)
   // must NOT end the call — the app declares the `audio` UIBackgroundMode specifically so a
@@ -335,7 +404,7 @@ export function useVoiceSession(
         endedByInterruptionRef.current = true;
         Promise.resolve(endSession())
           .then(() => setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }))
-          .catch((err) => console.error('[voice] failed to end session on audio interruption:', err));
+          .catch((err) => reportEndSessionFailure(' on audio interruption', err));
       },
       // Only resumes a call this listener itself closed, so a plain "ended" with nothing to
       // restore (an interruption that arrived while voice was already off) never dials out
@@ -412,7 +481,7 @@ export function useVoiceSession(
     intentionalEndRef.current = true;
     Promise.resolve(endSession())
       .then(() => setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }))
-      .catch((err) => console.error('[voice] failed to end session:', err));
+      .catch((err) => reportEndSessionFailure('', err));
   };
 
   // Screens put these straight into effect dependency arrays to open/close the mic on focus, so
@@ -482,18 +551,22 @@ export function useVoiceSession(
   // "No active conversation. Call startSession() first." outright when there isn't one, which
   // is an uncaught red-screen crash, not a caught rejection like the start/end paths above.
   //
-  const toggleMute = () => {
+  const applyMute = (next: boolean) => {
     if (!isActiveRef.current) return;
-    const next = !mutedRef.current;
+    if (mutedRef.current === next) return;
     mutedRef.current = next;
     setMutedState(next);
     if (status !== 'connected') return;
     try {
       setMuted(next);
     } catch (err) {
-      console.error('[voice] failed to toggle mute:', err);
+      const message = err instanceof Error ? err.message : String(err);
+      if (/no active conversation/i.test(message)) return;
+      console.error('[voice] failed to set mute:', err);
     }
   };
+
+  const toggleMute = () => applyMute(!mutedRef.current);
 
   const sendUserMessageGated = useCallback(
     (text: string) => {
@@ -522,6 +595,7 @@ export function useVoiceSession(
     inputLevel,
     isMuted: muted,
     toggleMute,
+    setMuteState: applyMute,
     setWorkoutActive,
   };
 }

@@ -124,6 +124,7 @@ export const OnboardingFlow = ({ userId, onComplete, skipSplash = false }: Onboa
           message:
             "I just finished onboarding — please set up my training plan and nutrition targets from what you know about me, and briefly explain why you chose this split and these targets.",
           hidden: true,
+          isOnboarding: true,
           timeoutMs: 45000,
         }),
       )
@@ -134,12 +135,12 @@ export const OnboardingFlow = ({ userId, onComplete, skipSplash = false }: Onboa
           .eq('user_id', userId)
           .eq('status', 'active')
           .maybeSingle();
-        if (data) await clearPlanPending();
-        else await markPlanPending();
+        if (data) await clearPlanPending(userId);
+        else await markPlanPending(userId);
       })
       .catch((err) => {
         console.error("[onboarding] sync/plan generation failed:", err);
-        markPlanPending();
+        markPlanPending(userId);
         throw err;
       });
   };

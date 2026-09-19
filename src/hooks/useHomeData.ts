@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../lib/supabase';
 import { callBrain } from '../lib/brain';
 import { resolveTodaySession, localDateKey } from '../lib/resolveTodaySession';
 import { titleCase } from '../lib/textFormat';
+import { canonicalizeExerciseNames } from '../lib/exerciseCatalog';
 import { setCachedDisplayName } from '../lib/profileStore';
 import { isPlanPending, clearPlanPending } from '../lib/planStatus';
-import { MACRO_META, type MacroTarget } from '../screens/homeFormat';
+import { HOME_CACHE_KEY } from '../lib/localUserData';
+import { MACRO_META, getTimeBand, type MacroTarget } from '../screens/homeFormat';
+import { greetingIsFreshToday as isGreetingFreshToday } from '../lib/greetingFreshness';
 import { useLocalDayRollover } from './useLocalDayRollover';
 
 export interface TodaySession {
@@ -34,11 +38,13 @@ export interface HomeData {
    *  generic empty one. */
   planPending: boolean;
   refetch: () => void;
+  retryPlan: () => void;
 }
 
 const QUERY_TIMEOUT_MS = 12000;
-const MAX_PENDING_RETRIES = 4;
-const PENDING_RETRY_DELAY_MS = 6000;
+const PENDING_RETRY_DELAYS_MS = [
+  2000, 3000, 5000, 5000, 8000, 8000, 12000, 15000, 20000, 30000, 30000, 30000,
+];
 
 function timed<T>(label: string, work: PromiseLike<T>): Promise<T> {
   const started = Date.now();
@@ -101,8 +107,7 @@ const DEFAULT_COACH_MESSAGE_HAS_PLAN = 'Tap the orb any time to check in.';
 // lets a relaunch show real (if a few minutes stale) content immediately while the fresh fetch
 // runs quietly underneath; the plain loading state is now only ever seen on a genuine first-ever
 // launch, when there's truly nothing to show.
-type HomeDataCache = Omit<HomeData, 'loading' | 'loadError' | 'refetch'>;
-const HOME_CACHE_KEY = 'home_data_cache_v1';
+type HomeDataCache = Omit<HomeData, 'loading' | 'loadError' | 'refetch' | 'retryPlan'>;
 
 // Fired at most once per real day (see the freshness check below) — hidden so it never shows up
 // as a fake question in the visible chat transcript (see useHomeChat's query), but its reply
@@ -191,12 +196,14 @@ export function looksLikeMetaLeak(text: string): boolean {
 }
 
 function sanitizeCoachMessage(raw: string): string {
-  const stripped = raw
-    .replace(/\*\*(.*?)\*\*/g, '$1')
-    .replace(/\*(.*?)\*/g, '$1')
-    .replace(/`(.*?)`/g, '$1')
-    .replace(/\s*\n+\s*/g, ' ')
-    .trim();
+  const stripped = canonicalizeExerciseNames(
+    raw
+      .replace(/\*\*(.*?)\*\*/g, '$1')
+      .replace(/\*(.*?)\*/g, '$1')
+      .replace(/`(.*?)`/g, '$1')
+      .replace(/\s*\n+\s*/g, ' ')
+      .trim(),
+  );
 
   const sentences = stripped.split(/(?<=[.!?])\s+/);
 
@@ -212,7 +219,7 @@ function sanitizeCoachMessage(raw: string): string {
 }
 
 export function useHomeData(): HomeData {
-  const [state, setState] = useState<Omit<HomeData, 'refetch'>>({
+  const [state, setState] = useState<Omit<HomeData, 'refetch' | 'retryPlan'>>({
     loading: true,
     userId: null,
     userName: null,
@@ -225,6 +232,11 @@ export function useHomeData(): HomeData {
   });
   const [refetchSignal, setRefetchSignal] = useState(0);
   const refetch = useCallback(() => setRefetchSignal((n) => n + 1), []);
+  const pendingRetryCountRef = useRef(0);
+  const retryPlan = useCallback(() => {
+    pendingRetryCountRef.current = 0;
+    setRefetchSignal((n) => n + 1);
+  }, []);
 
   // Today's session, the greeting, and the nutrition window are all scoped to the user's local
   // day, so all three have to be re-read the moment that day turns over — not whenever the screen
@@ -235,11 +247,16 @@ export function useHomeData(): HomeData {
   // fabricated-not-corrupted duplicate greeting at worst, not the P0 class of bug.
   const greetingInFlightRef = useRef(false);
   const loadedFromNetworkRef = useRef(false);
-  // Onboarding's plan-generation call can still be settling when Home first mounts (its own
-  // safety timeout hands off before the call necessarily finishes) — a few short auto-retries
-  // catch that case without the user needing to do anything, capped so a genuinely stuck plan
-  // doesn't poll forever.
-  const pendingRetryCountRef = useRef(0);
+  const planPendingRef = useRef(false);
+  planPendingRef.current = state.planPending;
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (appState) => {
+      if (appState !== 'active' || !planPendingRef.current) return;
+      retryPlan();
+    });
+    return () => subscription.remove();
+  }, [retryPlan]);
 
   // Runs once, in parallel with the real fetch below — an AsyncStorage read resolves in a few ms,
   // long before any network round-trip, so this reliably wins the race and replaces the plain
@@ -248,9 +265,16 @@ export function useHomeData(): HomeData {
   useEffect(() => {
     (async () => {
       try {
-        const raw = await AsyncStorage.getItem(HOME_CACHE_KEY);
+        const [raw, { data: sessionData }] = await Promise.all([
+          AsyncStorage.getItem(HOME_CACHE_KEY),
+          supabase.auth.getSession(),
+        ]);
         if (!raw || loadedFromNetworkRef.current) return;
         const cached: HomeDataCache = JSON.parse(raw);
+        if (!cached.userId || cached.userId !== sessionData.session?.user.id) {
+          await AsyncStorage.removeItem(HOME_CACHE_KEY).catch(() => null);
+          return;
+        }
         setState((prev) => (prev.loading ? { ...cached, loading: false, loadError: null } : prev));
       } catch (err) {
         console.warn('[home] failed to read cached data:', err);
@@ -437,12 +461,12 @@ export function useHomeData(): HomeData {
       // "LOWER, 4 exercises". A cached greeting with no key at all predates this column, so it is
       // treated as unverifiable and regenerated once rather than trusted.
       const greetingKey = todaySession?.hasSession ? todaySession.planSessionId : 'rest';
-      const greetingIsFreshToday = lastGreeting
-        ? dateKey(new Date(lastGreeting.at)) === dateKey(new Date()) &&
-          lastGreeting.greeting_key === greetingKey &&
-          (!mostRecentWorkoutAt || new Date(mostRecentWorkoutAt) <= new Date(lastGreeting.at)) &&
-          (!planCreatedAt || new Date(planCreatedAt) <= new Date(lastGreeting.at))
-        : false;
+      const greetingIsFreshToday = isGreetingFreshToday({
+        lastGreeting,
+        greetingKey,
+        mostRecentWorkoutAt,
+        planCreatedAt,
+      });
 
       let coachMessage: string;
       // A leaked greeting gets persisted like any other, so it would otherwise keep reappearing
@@ -494,15 +518,16 @@ export function useHomeData(): HomeData {
 
       let planPending = false;
       if (hasPlan) {
-        clearPlanPending();
+        clearPlanPending(userId);
         pendingRetryCountRef.current = 0;
       } else {
-        planPending = await isPlanPending();
-        if (planPending && pendingRetryCountRef.current < MAX_PENDING_RETRIES) {
+        planPending = await isPlanPending(userId);
+        const delay = PENDING_RETRY_DELAYS_MS[pendingRetryCountRef.current];
+        if (planPending && delay !== undefined) {
           pendingRetryCountRef.current += 1;
           setTimeout(() => {
             if (!cancelled) refetch();
-          }, PENDING_RETRY_DELAY_MS);
+          }, delay);
         }
       }
       if (cancelled) return;
@@ -523,5 +548,5 @@ export function useHomeData(): HomeData {
     };
   }, [refetchSignal]);
 
-  return { ...state, refetch };
+  return { ...state, refetch, retryPlan };
 }

@@ -1,4 +1,5 @@
 import { humanizeFocus } from './humanize.ts';
+import { convertLoadScheme } from './load-scheme.ts';
 // Server-side port of src/session/liveSessionState.ts's buildLiveSessionSnapshot/
 // describeLiveSessionSnapshot — kept in sync manually since Supabase Edge Functions only bundle
 // supabase/functions/, the same reason resolveTodaySession/estimateRestSeconds are duplicated
@@ -97,7 +98,13 @@ export function buildLiveSessionSnapshot(input: SnapshotInput): LiveSessionSnaps
   };
 }
 
-export function describeLiveSessionSnapshot(snapshot: LiveSessionSnapshot): string {
+const formatWeight = (kg: number, units: 'metric' | 'imperial'): string =>
+  units === 'imperial' ? `${Math.round(kg * 2.20462 * 10) / 10} lb` : `${kg} kg`;
+
+export function describeLiveSessionSnapshot(
+  snapshot: LiveSessionSnapshot,
+  units: 'metric' | 'imperial' = 'metric',
+): string {
   if (snapshot.target.type === 'cardio') {
     return (
       `Live session state: cardio (${snapshot.target.activity}), ${snapshot.status}, ` +
@@ -118,7 +125,7 @@ export function describeLiveSessionSnapshot(snapshot: LiveSessionSnapshot): stri
             .map((s) =>
               s.unit === 'seconds'
                 ? `${s.reps}s held`
-                : `${s.weight != null ? `${s.weight}kg` : 'bodyweight'}×${s.reps}`,
+                : `${s.weight != null ? formatWeight(s.weight, units) : 'bodyweight'}×${s.reps}`,
             )
             .join(', ')
         : 'none yet';
@@ -134,7 +141,7 @@ export function describeLiveSessionSnapshot(snapshot: LiveSessionSnapshot): stri
     // conversation beats a number listed once, unless the listing is explicit that it wins.
     lines.push(
       `- Current exercise: "${c.name}" — target reps ${c.repScheme}` +
-        `${c.loadScheme ? `, load ${c.loadScheme}` : ''}. When you say the target out loud, say ` +
+        `${c.loadScheme ? `, load ${convertLoadScheme(c.loadScheme, units)}` : ''}. When you say the target out loud, say ` +
         `EXACTLY ${c.repScheme} — never a rep range carried over from an earlier exercise in this ` +
         `session, however many times you just said it.`,
     );

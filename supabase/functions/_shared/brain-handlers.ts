@@ -5,6 +5,8 @@
 // ../_shared/brain-orchestrator.test.ts.
 
 import { humanizeFocus } from './humanize.ts';
+import { convertLoadScheme, localizeWeights, normalizeExercisesDone } from './load-scheme.ts';
+import { isBodyweightExercise, loadSchemeForExercise } from './exercise-catalog.ts';
 import { issueConfirmToken, verifyConfirmToken } from './confirm-token.ts';
 import { validatePlan, explainViolations, forbiddenTags, type Injury } from './injury-validator.ts';
 import { validateSplit, explainSplitProblems } from './split-validator.ts';
@@ -59,7 +61,10 @@ function dayKey(d: Date): string {
   return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 }
 
-function topSetLabelFor(exercisesDone: { name: string; sets?: number; reps: string; load: string }[]): string {
+function topSetLabelFor(
+  exercisesDone: { name: string; sets?: number; reps: string; load: string }[],
+  units: 'metric' | 'imperial' = 'metric',
+): string {
   let bestLoaded: { name: string; weight: number; reps: number } | null = null;
   let bestBodyweight: { name: string; reps: number } | null = null;
   for (const ex of exercisesDone) {
@@ -77,7 +82,13 @@ function topSetLabelFor(exercisesDone: { name: string; sets?: number; reps: stri
       if (!bestLoaded || loads[i] > bestLoaded.weight) bestLoaded = { name: ex.name, weight: loads[i], reps: reps[i] };
     }
   }
-  if (bestLoaded) return `${bestLoaded.name} · ${bestLoaded.weight} lb × ${bestLoaded.reps}`;
+  if (bestLoaded) {
+    const weight =
+      units === 'imperial'
+        ? `${Math.round(bestLoaded.weight * 2.20462 * 10) / 10} lb`
+        : `${bestLoaded.weight} kg`;
+    return `${bestLoaded.name} · ${weight} × ${bestLoaded.reps}`;
+  }
   if (bestBodyweight) return `${bestBodyweight.name} · ${bestBodyweight.reps} reps`;
   return '';
 }
@@ -182,8 +193,8 @@ async function computeStatsSnapshot(supabase: any, userId: string, timezone: str
     }
   }
   const topLifts = Array.from(byExercise.entries())
-    .map(([name, weights]) => ({ name, top_weight_lb: Math.max(...weights) }))
-    .sort((a, b) => b.top_weight_lb - a.top_weight_lb)
+    .map(([name, weights]) => ({ name, top_weight_kg: Math.max(...weights) }))
+    .sort((a, b) => b.top_weight_kg - a.top_weight_kg)
     .slice(0, 3);
 
   const proteinByDay = new Map<string, number>();
@@ -405,7 +416,7 @@ async function writePlan(
         exercise_id: exerciseByName.get(e.name)!.id,
         sets: e.sets,
         rep_scheme: e.rep_scheme,
-        load_scheme: e.load_scheme ?? null,
+        load_scheme: loadSchemeForExercise(e.name, e.load_scheme),
       })),
     })),
   };
@@ -487,11 +498,92 @@ async function resolveTimezone(supabase: any, userId: string, requestTimezone?: 
   return timezone;
 }
 
-export function createHandlers(supabase: any, userId: string, requestTimezone?: string | null): ToolHandlers {
+
+interface TodaysExercise {
+  exercise_id: string;
+  name: string;
+  sets: number;
+  rep_scheme: string;
+  load_scheme: string | null;
+}
+
+const resolveTodaysExercises = async (
+  supabase: any,
+  userId: string,
+  timezone: string | null,
+): Promise<{ focus: string; exercises: TodaysExercise[] } | null> => {
+  const now = nowInTimezone(timezone);
+  const todayKey = now.toISOString().slice(0, 10);
+  const [{ data: plan }, { data: recentLogs }, restDayDates, override] = await Promise.all([
+    supabase
+      .from('training_plan')
+      .select('plan_session(id, day_order, weekday, focus)')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .maybeSingle(),
+    supabase
+      .from('workout_log')
+      .select('at, plan_session_id, status')
+      .eq('user_id', userId)
+      .order('at', { ascending: false })
+      .limit(10),
+    fetchRestDayDates(supabase, userId, new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10)),
+    fetchDayOverrideSession(supabase, userId, todayKey),
+  ]);
+
+  const today = resolveTodaySession(
+    plan?.plan_session ?? [],
+    logsInTimezone(recentLogs ?? [], timezone),
+    now,
+    restDayDates,
+    override,
+  );
+  if (!today) return null;
+
+  const { data: full } = await supabase
+    .from('plan_session')
+    .select('focus, plan_exercise(ord, sets, rep_scheme, load_scheme, exercise_id, exercise(name))')
+    .eq('id', today.id)
+    .maybeSingle();
+  if (!full) return null;
+
+  const exercises: TodaysExercise[] = (full.plan_exercise ?? [])
+    .slice()
+    .sort((a: any, b: any) => a.ord - b.ord)
+    .map((e: any) => ({
+      exercise_id: e.exercise_id,
+      name: e.exercise?.name ?? '',
+      sets: e.sets,
+      rep_scheme: e.rep_scheme,
+      load_scheme: e.load_scheme ?? null,
+    }))
+    .filter((e: TodaysExercise) => !!e.name);
+
+  return exercises.length > 0 ? { focus: humanizeFocus(full.focus), exercises } : null;
+};
+
+export function createHandlers(
+  supabase: any,
+  userId: string,
+  requestTimezone?: string | null,
+  options: { planNeedsConfirm?: boolean } = {},
+): ToolHandlers {
   // Secret for confirm-token signing (see confirm-token.ts) — reused rather than a new env
   // var since it's already injected into every edge function and never leaves this process.
   const confirmSecret = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-  return {
+
+  let unitsPromise: Promise<'metric' | 'imperial'> | null = null;
+  const resolveUnits = (): Promise<'metric' | 'imperial'> => {
+    unitsPromise ??= supabase
+      .from('profile')
+      .select('unit_prefs')
+      .eq('user_id', userId)
+      .maybeSingle()
+      .then(({ data }: any) => (data?.unit_prefs === 'imperial' ? 'imperial' : 'metric'));
+    return unitsPromise!;
+  };
+
+  const handlers: ToolHandlers = {
     read_state: async (input) => {
       const scope: string[] = input.scope ?? [];
       const out: Record<string, any> = {};
@@ -523,7 +615,7 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
         // which fetches its own copy — this scope is only ever for "what's next.")
         const sessions = out.plan?.plan_session ?? [];
         if (sessions.length > 0) {
-          const [timezone, { data: recentLogs }] = await Promise.all([
+          const [timezone, { data: recentLogs }, units] = await Promise.all([
             resolveTimezone(supabase, userId, requestTimezone),
             supabase
               .from('workout_log')
@@ -531,6 +623,7 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
               .eq('user_id', userId)
               .order('at', { ascending: false })
               .limit(10),
+            resolveUnits(),
           ]);
           const nextSession = resolveTodaySession(
             sessions,
@@ -548,7 +641,7 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
                     name: e.exercise?.name,
                     sets: e.sets,
                     rep_scheme: e.rep_scheme,
-                    load_scheme: e.load_scheme,
+                    load_scheme: e.load_scheme ? convertLoadScheme(e.load_scheme, units) : e.load_scheme,
                   })),
                 instruction:
                   'This is the only session that is due, and its exercises above are the only ones to name ' +
@@ -568,7 +661,15 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
           out.plan = {
             ...out.plan,
             plan_session: sessions.map((s: any) =>
-              s.id === nextSession?.id ? s : { id: s.id, day_order: s.day_order, weekday: s.weekday, focus: s.focus },
+              s.id === nextSession?.id
+                ? {
+                    ...s,
+                    plan_exercise: (s.plan_exercise ?? []).map((e: any) => ({
+                      ...e,
+                      load_scheme: e.load_scheme ? convertLoadScheme(e.load_scheme, units) : e.load_scheme,
+                    })),
+                  }
+                : { id: s.id, day_order: s.day_order, weekday: s.weekday, focus: s.focus },
             ),
           };
         }
@@ -643,7 +744,11 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
       return out;
     },
 
-    generate_training_plan: (input) => writePlan(supabase, userId, input, { confirmSecret, requireConfirm: true }),
+    generate_training_plan: (input) =>
+      writePlan(supabase, userId, input, {
+        confirmSecret,
+        requireConfirm: options.planNeedsConfirm !== false,
+      }),
     update_training_plan: (input) => writePlan(supabase, userId, input),
 
     generate_nutrition_targets: (input) => writeNutritionTargets(supabase, userId, input.goal),
@@ -784,9 +889,34 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
         };
       }
 
+      const tokenKey = JSON.stringify({
+        d: String(input.description ?? '').trim().toLowerCase(),
+        c: input.calories,
+        p: input.protein_g,
+        cb: input.carbs_g,
+        f: input.fat_g,
+      });
+      if (!input.confirm || !(await verifyConfirmToken(confirmSecret, 'log_food', tokenKey, input.confirm_token))) {
+        return {
+          status: 'preview',
+          description: input.description,
+          calories: input.calories,
+          protein_g: input.protein_g,
+          carbs_g: input.carbs_g,
+          fat_g: input.fat_g,
+          confirm_token: await issueConfirmToken(confirmSecret, 'log_food', tokenKey),
+          instruction:
+            'NOTHING HAS BEEN SAVED. Read the estimate back to the user in one short line (the food, ' +
+            'the calories and the macros), say plainly that it is your estimate, and wait for them to ' +
+            'agree in their NEXT message. Only then call log_food again with the same fields plus ' +
+            'confirm:true and this exact confirm_token. Never say "logged" until that second call ' +
+            'returns status "logged".',
+        };
+      }
+
       // confirmed_new_meal is a tool-input signal only — food_log has no such column, and
       // spreading it into the insert would fail the write outright.
-      const { confirmed_new_meal: _confirmedNewMeal, ...foodRow } = input;
+      const { confirmed_new_meal: _confirmedNewMeal, confirm: _confirm, confirm_token: _confirmToken, ...foodRow } = input;
       const { data, error } = await supabase
         .from('food_log')
         .insert({ user_id: userId, ...foodRow })
@@ -896,7 +1026,7 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
       if (!input.confirm || !(await verifyConfirmToken(confirmSecret, 'log_workout', tokenKey, input.confirm_token))) {
         return {
           status: 'preview',
-          exercises_done: input.exercises_done,
+          exercises_done: normalizeExercisesDone(input.exercises_done),
           confirm_token: await issueConfirmToken(confirmSecret, 'log_workout', tokenKey, LOG_WORKOUT_TOKEN_TTL_MS),
           instruction:
             'Nothing is saved yet. Read back exactly what will be logged and wait for the user to ' +
@@ -906,7 +1036,10 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
       }
       // A whole workout described conversationally, start to finish, was never tracked live —
       // every set here was told to the coach, not captured by logSet during a running session.
-      const exercisesDone = (input.exercises_done ?? []).map((e: any) => ({ ...e, tracked: 'reported' }));
+      const exercisesDone = (normalizeExercisesDone(input.exercises_done ?? []) as any[]).map((e: any) => ({
+        ...e,
+        tracked: 'reported',
+      }));
       const { error } = await supabase.from('workout_log').insert({
         user_id: userId,
         plan_session_id: input.plan_session_id ?? null,
@@ -965,7 +1098,10 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
       // completed_independent — whatever was tracked live before the interruption stays exactly
       // as it was; anything the user reports happened afterward is appended and marked reported,
       // never merged into or replacing the live entries.
-      const additional = (input.additional_exercises_done ?? []).map((e: any) => ({ ...e, tracked: 'reported' }));
+      const additional = (normalizeExercisesDone(input.additional_exercises_done ?? []) as any[]).map((e: any) => ({
+        ...e,
+        tracked: 'reported',
+      }));
       const merged = [...(row.exercises_done ?? []), ...additional];
       const { error: updError } = await supabase
         .from('workout_log')
@@ -1229,6 +1365,16 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
       }
 
       const names = requested.map((e) => e.name);
+      const duplicates = names.filter((name, i) => names.findIndex((n) => n.toLowerCase() === name.toLowerCase()) !== i);
+      if (duplicates.length > 0) {
+        return {
+          status: 'rejected',
+          reason:
+            `The same exercise appears more than once: ${[...new Set(duplicates)].join(', ')}. ` +
+            'A session must list each exercise exactly once. Nothing was created — rebuild it with ' +
+            'no repeats and call again.',
+        };
+      }
       const [injuries, exerciseByName] = await Promise.all([
         fetchActiveInjuries(supabase, userId),
         resolveExercises(supabase, names),
@@ -1287,7 +1433,7 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
           exercise_id: exerciseByName.get(e.name)!.id,
           sets: e.sets,
           rep_scheme: e.rep_scheme,
-          load_scheme: e.load_scheme ?? null,
+          load_scheme: loadSchemeForExercise(e.name, e.load_scheme),
         })),
       });
       if (rpcError) throw new Error(`write_custom_session: ${rpcError.message}`);
@@ -1509,15 +1655,21 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
 
     show_top_lifts: async () => {
       const snapshot = await computeStatsSnapshot(supabase, userId, await resolveTimezone(supabase, userId, requestTimezone));
+      const units = await resolveUnits();
+      const lifts = snapshot.topLifts.map((lift: { name: string; top_weight_kg: number }) => ({
+        name: lift.name,
+        top_weight_label:
+          units === 'imperial'
+            ? `${Math.round(lift.top_weight_kg * 2.20462 * 10) / 10} lb`
+            : `${lift.top_weight_kg} kg`,
+      }));
       const insight =
-        snapshot.topLifts.length > 0
-          ? `${snapshot.topLifts[0].name} is leading the pack — keep chasing progressive overload.`
-          : '';
+        lifts.length > 0 ? `${lifts[0].name} is leading the pack — keep chasing progressive overload.` : '';
       return {
         status: 'shown',
         card: {
           type: 'top_lifts',
-          lifts: snapshot.topLifts,
+          lifts,
           insight,
         },
       };
@@ -1562,7 +1714,7 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
           status,
           total_sets: totalSets,
           target_sets: targetSets,
-          top_set_label: topSetLabelFor(exercisesDone),
+          top_set_label: topSetLabelFor(exercisesDone, await resolveUnits()),
           duration_sec: log.duration_sec ?? null,
         },
       };
@@ -1585,17 +1737,145 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
         .eq('movement_pattern', current.movement_pattern)
         .neq('id', current.id);
 
-      const safe = (candidates ?? []).find(
-        (c: any) => !(c.contraindicated_for ?? []).some((tag: string) => forbidden.has(tag)),
-      );
-      if (!safe) return { status: 'no_safe_alternative' };
+      const isSafe = (c: any) => !(c.contraindicated_for ?? []).some((tag: string) => forbidden.has(tag));
 
-      await writeAppAction(supabase, userId, 'swap_exercise', {
-        from_name: input.current_exercise_name,
-        to_exercise_id: safe.id,
-        to_name: safe.name,
+      let chosen: any = null;
+      const requestedName = String(input.replacement_exercise_name ?? '').trim();
+      if (requestedName) {
+        const requested = (candidates ?? []).find(
+          (c: any) => String(c.name).toLowerCase() === requestedName.toLowerCase(),
+        );
+        if (!requested) {
+          return {
+            status: 'replacement_not_available',
+            requested: requestedName,
+            alternatives: (candidates ?? []).filter(isSafe).map((c: any) => c.name),
+            instruction:
+              `Nothing was changed. "${requestedName}" is not a catalog exercise that trains the same ` +
+              `pattern as ${input.current_exercise_name}. Tell the user that plainly, offer the ` +
+              `alternatives listed here, and call swap_exercise again once they pick one.`,
+          };
+        }
+        if (!isSafe(requested)) {
+          return {
+            status: 'replacement_unsafe',
+            requested: requestedName,
+            alternatives: (candidates ?? []).filter(isSafe).map((c: any) => c.name),
+            instruction:
+              `Nothing was changed. "${requestedName}" loads an area the user is currently injured in. ` +
+              `Say so plainly, offer the alternatives listed here, and call swap_exercise again once ` +
+              `they pick one.`,
+          };
+        }
+        chosen = requested;
+      } else {
+        chosen = (candidates ?? []).find(isSafe);
+      }
+      if (!chosen) return { status: 'no_safe_alternative' };
+
+      const { data: liveRow } = await supabase
+        .from('live_session_state')
+        .select('updated_at, state')
+        .eq('user_id', userId)
+        .maybeSingle();
+      const liveStatus = liveRow?.state?.status;
+      const sessionIsRunning =
+        !!liveRow &&
+        Date.now() - new Date(liveRow.updated_at).getTime() < LIVE_STATE_MAX_AGE_MS &&
+        (liveStatus === 'training' || liveStatus === 'resting' || liveStatus === 'paused');
+
+      if (sessionIsRunning) {
+        await writeAppAction(supabase, userId, 'swap_exercise', {
+          from_name: input.current_exercise_name,
+          to_exercise_id: chosen.id,
+          to_name: chosen.name,
+        });
+        return { status: 'requested', replacement: chosen.name, was_user_choice: !!requestedName };
+      }
+
+      const timezone = await resolveTimezone(supabase, userId, requestTimezone);
+      const todayKey = nowInTimezone(timezone).toISOString().slice(0, 10);
+      const today = await resolveTodaysExercises(supabase, userId, timezone);
+      if (!today) {
+        return {
+          status: 'no_session_today',
+          instruction:
+            'Nothing was changed. There is no session scheduled today to swap an exercise in. Tell the ' +
+            'user that, and offer create_custom_session if they want a one-off workout instead.',
+        };
+      }
+
+      const target = today.exercises.find(
+        (e: TodaysExercise) => e.name.toLowerCase() === String(input.current_exercise_name).toLowerCase(),
+      );
+      if (!target) {
+        return {
+          status: 'not_in_todays_session',
+          todays_exercises: today.exercises.map((e: TodaysExercise) => e.name),
+          instruction:
+            `Nothing was changed. "${input.current_exercise_name}" is not in today's session. Tell the ` +
+            'user what today actually has (listed here) and ask which one they meant.',
+        };
+      }
+
+      if (today.exercises.some((e: TodaysExercise) => e.name.toLowerCase() === chosen.name.toLowerCase())) {
+        return {
+          status: 'already_in_session',
+          replacement: chosen.name,
+          instruction:
+            `Nothing was changed. ${chosen.name} is already in today's session, so swapping ` +
+            `${input.current_exercise_name} to it would list it twice. Offer a different replacement.`,
+        };
+      }
+
+      const loadSchemeFor = (replacement: string, previous: string | null): string | null => {
+        if (isBodyweightExercise(replacement)) return 'bodyweight';
+        if (previous && previous.trim().toLowerCase() === 'bodyweight') {
+          return 'light — find your working weight';
+        }
+        return previous;
+      };
+
+      const swapped = today.exercises.map((e: TodaysExercise) =>
+        e.name.toLowerCase() === target.name.toLowerCase()
+          ? {
+              ...e,
+              exercise_id: chosen.id,
+              name: chosen.name,
+              load_scheme: loadSchemeFor(chosen.name, e.load_scheme),
+            }
+          : e,
+      );
+
+      const { data: sessionId, error: swapRpcError } = await supabase.rpc('write_custom_session', {
+        p_user_id: userId,
+        p_focus: today.focus,
+        p_date: todayKey,
+        p_exercises: swapped.map((e: TodaysExercise) => ({
+          exercise_id: e.exercise_id,
+          sets: e.sets,
+          rep_scheme: e.rep_scheme,
+          load_scheme: e.load_scheme ?? null,
+        })),
       });
-      return { status: 'requested', replacement: safe.name };
+      if (swapRpcError) throw new Error(`swap_exercise write_custom_session: ${swapRpcError.message}`);
+
+      const override = await fetchDayOverrideSession(supabase, userId, todayKey);
+      if (!override || override.id !== sessionId) {
+        throw new Error('swap_exercise: session written but today does not resolve to it.');
+      }
+
+      return {
+        status: 'swapped_for_today',
+        replaced: target.name,
+        replacement: chosen.name,
+        was_user_choice: !!requestedName,
+        todays_exercises: swapped.map((e: TodaysExercise) => e.name),
+        instruction:
+          `Today's session now has ${chosen.name} in place of ${target.name}; everything else is ` +
+          'unchanged and the training plan itself is untouched. Confirm just that one change in a ' +
+          'single short sentence. Do NOT list the whole session back.',
+      };
     },
 
     skip_exercise: async () => {
@@ -1633,7 +1913,10 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
         };
       }
 
-      await writeAppAction(supabase, userId, 'end_workout', { status: input.completed ? 'completed' : 'partial' });
+      await writeAppAction(supabase, userId, 'end_workout', {
+        status: input.completed ? 'completed' : 'partial',
+        reason: String(input.reason ?? '').trim() || null,
+      });
       return { status: 'requested' };
     },
 
@@ -1653,4 +1936,11 @@ export function createHandlers(supabase: any, userId: string, requestTimezone?: 
       return { status: 'updated', display_name: input.display_name };
     },
   };
+
+  return Object.fromEntries(
+    Object.entries(handlers).map(([name, run]) => [
+      name,
+      async (input: any) => localizeWeights(await run(input), await resolveUnits()),
+    ]),
+  );
 }

@@ -17,6 +17,26 @@ function scriptedModel(turns: any[]): CallModel {
   };
 }
 
+function streamingModel(turns: any[]): CallModel {
+  let i = 0;
+  return async (_messages, _system, onTextDelta) => {
+    if (i >= turns.length) throw new Error('streamingModel ran out of turns');
+    const turn = turns[i++];
+    for (const block of turn.content) {
+      if (block.type === 'text') for (const word of block.text.split(/(?<= )/)) onTextDelta?.(word);
+    }
+    return turn;
+  };
+}
+
+const narrateThenToolUse = (text: string, id: string, name: string, input: any) => ({
+  stop_reason: 'tool_use' as const,
+  content: [
+    { type: 'text' as const, text },
+    { type: 'tool_use' as const, id, name, input },
+  ],
+});
+
 const toolUse = (id: string, name: string, input: any) => ({
   stop_reason: 'tool_use' as const,
   content: [{ type: 'tool_use' as const, id, name, input }],
@@ -103,6 +123,66 @@ test('unknown tool name is reported back as an error, not thrown', async () => {
 
   assert.equal(result.toolCalls[0].error, 'unknown tool');
   assert.equal(result.reply, 'ok');
+});
+
+test('text the model writes before a tool call is never streamed to the user', async () => {
+  const handlers = { generate_training_plan: async () => ({ status: 'preview', confirm_token: 'abc' }) };
+  const callModel = streamingModel([
+    narrateThenToolUse(
+      'I got a fresh token, let me confirm this again with the new one.',
+      't1',
+      'generate_training_plan',
+      {},
+    ),
+    endTurn('Done. Your six-day split is live starting tomorrow.'),
+  ]);
+
+  const streamed: string[] = [];
+  const result = await runBrainTurn({
+    systemPrompt: 'sys',
+    messages: [],
+    handlers,
+    callModel,
+    onTextDelta: (d) => void streamed.push(d),
+  });
+
+  assert.equal(streamed.join(''), 'Done. Your six-day split is live starting tomorrow.');
+  assert.ok(!streamed.join('').includes('fresh token'));
+});
+
+test('what is streamed is exactly what is returned as the reply', async () => {
+  const handlers = { log_checkin: async () => ({ status: 'ok' }) };
+  const callModel = streamingModel([
+    narrateThenToolUse('Let me note that down.', 't1', 'log_checkin', { weight_kg: 82 }),
+    endTurn('Logged, 82 kilograms today.'),
+  ]);
+
+  const streamed: string[] = [];
+  const result = await runBrainTurn({
+    systemPrompt: 'sys',
+    messages: [],
+    handlers,
+    callModel,
+    onTextDelta: (d) => void streamed.push(d),
+  });
+
+  assert.equal(streamed.join(''), result.reply);
+});
+
+test('a turn that gives up still streams the reply it returns', async () => {
+  const handlers = { log_checkin: async () => ({ status: 'ok' }) };
+  const turns = Array.from({ length: 20 }, (_, i) => toolUse(`t${i}`, 'log_checkin', {}));
+
+  const streamed: string[] = [];
+  const result = await runBrainTurn({
+    systemPrompt: 'sys',
+    messages: [],
+    handlers,
+    callModel: streamingModel(turns),
+    onTextDelta: (d) => void streamed.push(d),
+  });
+
+  assert.equal(streamed.join(''), result.reply);
 });
 
 test('gives up gracefully if the model never stops calling tools', async () => {

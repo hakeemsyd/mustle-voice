@@ -1,3 +1,4 @@
+import { kgToDisplayWeight, type Units } from './units';
 export interface LoggedExercise {
   name: string;
   sets: number;
@@ -112,6 +113,9 @@ function isBodyweight(load: string | null | undefined): boolean {
   return !load || load.trim().toLowerCase() === 'bodyweight';
 }
 
+const valueForSet = (values: (number | null)[], index: number): number | null =>
+  values.length === 1 ? (values[0] ?? null) : (values[index] ?? null);
+
 export function buildSetLog(exercises: LoggedExercise[]): SetLogRow[] {
   const rows: SetLogRow[] = [];
   for (const exercise of exercises) {
@@ -122,8 +126,8 @@ export function buildSetLog(exercises: LoggedExercise[]): SetLogRow[] {
       rows.push({
         exerciseName: exercise.name,
         setNumber: i + 1,
-        weight: weights[i] ?? null,
-        reps: reps[i] ?? null,
+        weight: valueForSet(weights, i),
+        reps: valueForSet(reps, i),
         tracked: exercise.tracked ?? "live",
       });
     }
@@ -135,7 +139,7 @@ export function computeVolume(setLog: SetLogRow[]): number {
   return setLog.reduce((sum, row) => sum + (row.weight ?? 0) * (row.reps ?? 0), 0);
 }
 
-export function buildTopSetLabel(setLog: SetLogRow[]): string {
+export function buildTopSetLabel(setLog: SetLogRow[], units: Units = 'metric'): string {
   if (setLog.length === 0) return '—';
   const weighted = setLog.filter((row) => row.weight !== null);
   if (weighted.length === 0) {
@@ -146,7 +150,8 @@ export function buildTopSetLabel(setLog: SetLogRow[]): string {
     if ((row.weight ?? 0) !== (best.weight ?? 0)) return (row.weight ?? 0) > (best.weight ?? 0) ? row : best;
     return (row.reps ?? 0) > (best.reps ?? 0) ? row : best;
   });
-  return top.reps === null ? `${top.weight} kg` : `${top.weight} kg × ${top.reps}`;
+  const label = kgToDisplayWeight(top.weight ?? 0, units);
+  return top.reps === null ? label : `${label} × ${top.reps}`;
 }
 
 /**
@@ -250,11 +255,17 @@ export function buildDebrief(
         : `Volume's down ${Math.abs(volumeDeltaPct)}% from last time — not a problem on its own, but let's see it climb back.`;
 
   if (isPartial) {
-    const owed = targetSets - totalSets;
+    const remaining = targetSets - totalSets;
+    const statedReason = note?.trim() ? note.trim() : null;
     return {
-      summary: `Closed this one out early after ${totalSets} of ${targetSets} planned sets on ${exerciseLabel.toLowerCase()}. Better to stop clean than push into a bad rep. ${deltaLine}`,
-      whatWorked: ['Stopped on your own terms instead of grinding out a bad set.'],
-      whatToFix: owed > 0 ? [`${owed} set${owed === 1 ? '' : 's'} still owed — pick it back up next session.`] : [],
+      summary: statedReason
+        ? `Ended early after ${totalSets} of ${targetSets} planned sets on ${exerciseLabel.toLowerCase()} — ${statedReason} ${deltaLine}`
+        : `Ended early after ${totalSets} of ${targetSets} planned sets on ${exerciseLabel.toLowerCase()}. ${deltaLine}`,
+      whatWorked: [`Logged ${totalSets} set${totalSets === 1 ? '' : 's'} before stopping.`],
+      whatToFix:
+        remaining > 0
+          ? [`${remaining} set${remaining === 1 ? '' : 's'} left unlogged from the plan.`]
+          : [],
       injuryCheck,
       blueprint: [
         `Resume ${exerciseLabel.toLowerCase()} at the same working weight — no need to reset progress over a short session.`,
@@ -292,6 +303,7 @@ export function buildSessionReport(
   priorLogs: WorkoutLogRecord[],
   streakDays: number,
   nutrition: NutritionContext | null,
+  units: Units = 'metric',
 ): SessionReport {
   const isCardio = log.session_type === 'cardio';
   const exercises = log.exercises_done ?? [];
@@ -328,7 +340,7 @@ export function buildSessionReport(
     targetSets,
     volume,
     volumeDeltaPct,
-    topSetLabel: buildTopSetLabel(setLog),
+    topSetLabel: buildTopSetLabel(setLog, units),
     streakDays,
     setLog,
     exerciseCount: exercises.length,
@@ -346,7 +358,7 @@ export function buildSessionReport(
       totalSets,
       targetSets,
       volumeDeltaPct,
-      buildTopSetLabel(setLog),
+      buildTopSetLabel(setLog, units),
       log.note,
       log.feedback_tags ?? [],
     ),

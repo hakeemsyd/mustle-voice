@@ -39,7 +39,7 @@ export function TopLiftsCard({ card, variant = "dark" }: TopLiftsCardProps) {
                   {String(i + 1).padStart(2, "0")}
                 </Text>
                 <Text style={[styles.liftName, isLight && styles.liftNameLight]}>{lift.name}</Text>
-                <Text style={[styles.liftWeight, isLight && styles.liftWeightLight]}>{lift.top_weight_lb} lb</Text>
+                <Text style={[styles.liftWeight, isLight && styles.liftWeightLight]}>{lift.top_weight_label}</Text>
               </View>
             ))}
           </View>

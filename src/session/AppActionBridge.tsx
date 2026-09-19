@@ -32,7 +32,10 @@ export function AppActionBridge({ userId }: AppActionBridgeProps) {
         session.undoLastSet();
         break;
       case 'end_workout':
-        session.endSession((action.payload?.status as SessionStatus) ?? 'completed');
+        session.endSession(
+          (action.payload?.status as SessionStatus) ?? 'completed',
+          (action.payload?.reason as string | null) ?? null,
+        );
         break;
       case 'start_workout': {
         const planSessionId = String(action.payload?.plan_session_id ?? '');

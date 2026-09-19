@@ -43,6 +43,11 @@ const navTheme: Theme = {
   },
 };
 
+const isDeletedUserError = (error: { message?: string; code?: string; status?: number } | null): boolean =>
+  !!error &&
+  (error.code === 'user_not_found' ||
+    /user from sub claim in jwt does not exist/i.test(error.message ?? ''));
+
 const App = () => {
   const fontsLoaded = useAppFonts();
   const [userId, setUserId] = useState<string | null>(null);
@@ -77,6 +82,22 @@ const App = () => {
       setSessionReady(true);
     });
     return () => sub.subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const { data } = await supabase.auth.getSession();
+      if (cancelled || !data.session) return;
+      const { error } = await supabase.auth.getUser();
+      if (cancelled || !isDeletedUserError(error)) return;
+      console.warn('[App] stored session belongs to a deleted account — clearing it');
+      await supabase.auth.signOut({ scope: 'local' });
+      if (!cancelled) await supabase.auth.signInAnonymously();
+    })().catch((err) => console.error('[App] failed to validate stored session:', err));
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {

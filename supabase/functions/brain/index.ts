@@ -5,6 +5,8 @@ import { dropLeadingConcession } from '../_shared/humanize.ts';
 import { buildSystemPrompt, callModel, MESSAGE_HISTORY_LIMIT } from '../_shared/brain-config.ts';
 import { buildContextBlock, startOfLocalDayUtc } from '../_shared/brain-context.ts';
 import { createHandlers } from '../_shared/brain-handlers.ts';
+import { isOnboardingSetupTurn } from '../_shared/onboarding-turn.ts';
+import { stripSystemNote } from '../_shared/strip-system-note.ts';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SUPABASE_SECRET_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -28,6 +30,7 @@ Deno.serve(async (req) => {
       // still-accurate cached greeting from one the day has moved past. See the greeting_key
       // column comment. Only ever sent alongside isDailyGreeting.
       greetingKey = null,
+      isOnboarding = false,
     } = await req.json();
     const hasAttachment = modality === 'image' && typeof attachmentUrl === 'string' && attachmentUrl.length > 0;
     if (!userId || (!message && !hasAttachment)) {
@@ -35,7 +38,8 @@ Deno.serve(async (req) => {
     }
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
-    const handlers = createHandlers(supabase, userId, timezone);
+    const isPlanSetupTurn = isOnboarding || isOnboardingSetupTurn(message, hidden, isDailyGreeting);
+    const handlers = createHandlers(supabase, userId, timezone, { planNeedsConfirm: !isPlanSetupTurn });
 
     const askedAt = new Date();
     // Global Chat is a continuous scrollback with no session boundary of its own, so without a
@@ -97,7 +101,7 @@ Deno.serve(async (req) => {
     );
     const updatedDisplayName = profileUpdateCall?.result.display_name ?? null;
 
-    const reply = dropLeadingConcession(result.reply);
+    const reply = dropLeadingConcession(stripSystemNote(result.reply));
 
     const { error: logError } = await supabase.from('message').insert([
       {

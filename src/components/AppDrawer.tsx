@@ -20,6 +20,7 @@ import {
   useTodayCalendar,
   useMonthCalendar,
   useDayDetail,
+  type DayDetail,
 } from "../hooks/useCalendarData";
 import { useFuelData } from "../hooks/useFuelData";
 import { localDateKey, addDays, startOfLocalDay } from "../lib/calendarDate";
@@ -51,6 +52,7 @@ import {
 import { supabase } from "../lib/supabase";
 import { setCachedDisplayName } from "../lib/profileStore";
 import { titleCase } from "../lib/textFormat";
+import { clearLocalUserData } from "../lib/localUserData";
 
 type DrawerView = "index" | "history" | "calendar" | "profile";
 
@@ -425,13 +427,12 @@ const EmptyState = ({ title, subtitle }: { title: string; subtitle: string }) =>
 // ---------- Calendar detail ----------
 
 const CalendarTimelineDay = ({
-  dateKey,
+  detail,
   onOpenSessionReport,
 }: {
-  dateKey: string;
+  detail: DayDetail;
   onOpenSessionReport?: (workoutLogId: string) => void;
 }) => {
-  const detail = useDayDetail(dateKey);
   if (detail.loading) return <ActivityIndicator color={colors.accent} style={{ marginTop: 24 }} />;
 
   const loggedWorkout = detail.workouts[0] ?? null;
@@ -504,8 +505,21 @@ const CalendarDetail = ({
   const [timelineDateKey, setTimelineDateKey] = useState(localDateKey(new Date()));
 
   const today = useTodayCalendar();
+  const selectedDay = useDayDetail(timelineDateKey);
   const fuel = useFuelData();
   const month = useMonthCalendar(monthCursor);
+
+  const selectedWorkout = selectedDay.workouts[0] ?? null;
+  const selectedFocus = selectedWorkout?.focus ?? selectedDay.plannedFocus ?? null;
+  const heroEyebrow = selectedWorkout
+    ? selectedDay.isToday
+      ? "COMPLETED TODAY"
+      : "COMPLETED"
+    : selectedDay.isToday
+      ? "TODAY'S SESSION"
+      : selectedDay.isFuture
+        ? "PLANNED"
+        : "NOT LOGGED";
 
   const caloriesMacro = fuel.macros?.find((m) => m.key === "calories");
   const proteinMacro = fuel.macros?.find((m) => m.key === "protein");
@@ -526,24 +540,22 @@ const CalendarDetail = ({
         {heroView === "session" ? (
           <>
             <View style={styles.calHeroTop}>
-              <Text style={styles.calHeroEyebrow}>TODAY'S SESSION</Text>
+              <Text style={styles.calHeroEyebrow}>{heroEyebrow}</Text>
               <View style={styles.calHeroIconBadge}>
                 <DumbbellIcon size={18} color={lightCard.iconOn} />
               </View>
             </View>
             <Text style={styles.calHeroTitle}>
-              {today.completedWorkout?.focus
-                ? titleCase(today.completedWorkout.focus)
-                : today.isRestDay
-                  ? "Rest Day"
-                  : today.session
-                    ? titleCase(today.session.focus)
-                    : "No Session"}
+              {selectedFocus ? titleCase(selectedFocus) : "Rest Day"}
             </Text>
             <Text style={styles.calHeroDate}>
-              {new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}
+              {startOfLocalDay(timelineDateKey).toLocaleDateString("en-US", {
+                weekday: "long",
+                month: "long",
+                day: "numeric",
+              })}
             </Text>
-            {today.session && !today.completedWorkout && (
+            {selectedDay.isToday && today.session && !today.completedWorkout && (
               <View style={styles.calHeroStatsRow}>
                 <View style={styles.calHeroStat}>
                   <Text style={styles.calHeroStatValue}>{today.session.exercises.length}</Text>
@@ -659,7 +671,7 @@ const CalendarDetail = ({
             onNext={() => setTimelineDateKey((d) => localDateKey(addDays(startOfLocalDay(d), 1)))}
             nextDisabled={timelineDateKey >= localDateKey(new Date())}
           />
-          <CalendarTimelineDay dateKey={timelineDateKey} onOpenSessionReport={onOpenSessionReport} />
+          <CalendarTimelineDay detail={selectedDay} onOpenSessionReport={onOpenSessionReport} />
         </>
       ) : (
         <>
@@ -767,6 +779,7 @@ const ProfileDetail = ({ userId, userName }: { userId: string | null; userName: 
   const [savingName, setSavingName] = useState(false);
   const [nameSaved, setNameSaved] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
+  const [deletingAccount, setDeletingAccount] = useState(false);
 
   useEffect(() => {
     if (!userId) return;
@@ -825,12 +838,63 @@ const ProfileDetail = ({ userId, userName }: { userId: string | null; userName: 
           const { error } = await supabase.auth.signOut();
           if (error) {
             console.error("[drawer] failed to log out:", error.message);
-            Alert.alert("Log out failed", "Check your connection and try again.");
-            setLoggingOut(false);
+            const { error: localError } = await supabase.auth.signOut({ scope: "local" });
+            if (localError) {
+              console.error("[drawer] failed to clear local session:", localError.message);
+              Alert.alert("Log out failed", "Check your connection and try again.");
+              setLoggingOut(false);
+            }
           }
         },
       },
     ]);
+  };
+
+  const runAccountDeletion = async () => {
+    setDeletingAccount(true);
+    try {
+      const { error } = await supabase.functions.invoke("delete-account");
+      if (error) throw new Error(error.message);
+      await supabase.auth.signOut({ scope: "local" });
+      await clearLocalUserData(userId);
+    } catch (err) {
+      console.error("[drawer] failed to delete account:", err);
+      Alert.alert("Couldn't delete your account", "Check your connection and try again.");
+      setDeletingAccount(false);
+    }
+  };
+
+  const askToTypeDelete = () => {
+    Alert.prompt(
+      "Type DELETE to confirm",
+      "This cannot be undone.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete Permanently",
+          style: "destructive",
+          onPress: (typed?: string) => {
+            if ((typed ?? "").trim().toUpperCase() !== "DELETE") {
+              Alert.alert("Not deleted", "You didn't type DELETE, so nothing was changed.");
+              return;
+            }
+            runAccountDeletion();
+          },
+        },
+      ],
+      "plain-text",
+    );
+  };
+
+  const confirmDeleteAccount = () => {
+    Alert.alert(
+      "Delete account?",
+      "This permanently deletes your account, your training plan, and every workout and meal you've logged. It can't be undone.",
+      [
+        { text: "Cancel", style: "cancel" },
+        { text: "Continue", style: "destructive", onPress: askToTypeDelete },
+      ],
+    );
   };
 
   const initial = (userName || "?").trim().charAt(0).toUpperCase();
@@ -931,6 +995,19 @@ const ProfileDetail = ({ userId, userName }: { userId: string | null; userName: 
         )}
       </Pressable>
 
+      <Pressable
+        style={styles.deleteAccountBtn}
+        onPress={confirmDeleteAccount}
+        disabled={deletingAccount}
+        hitSlop={8}
+      >
+        {deletingAccount ? (
+          <ActivityIndicator size="small" color={colors.muted} />
+        ) : (
+          <Text style={styles.deleteAccountText}>Delete account</Text>
+        )}
+      </Pressable>
+
       <Text style={styles.profileFooter}>Mustle · v1.0.0</Text>
     </ScrollView>
   );
@@ -995,7 +1072,11 @@ export const AppDrawer = ({
   const historyCount = historyGroups.reduce((n, g) => n + g.entries.length, 0);
   const lastEntry = historyGroups[0]?.entries[historyGroups[0].entries.length - 1];
   const historySummary = historyCount === 0 ? "No conversations yet" : `${historyCount} conversations · last one ${lastEntry ? relativeTime(lastEntry.at) : ""}`;
-  const calendarSummary = `${today.completedWorkout?.focus ? titleCase(today.completedWorkout.focus) : today.session ? titleCase(today.session.focus) : "Training"} · today`;
+  const calendarSummary = today.completedWorkout
+    ? `${today.completedWorkout.focus ? titleCase(today.completedWorkout.focus) : "Training"} · done today`
+    : today.session
+      ? `${titleCase(today.session.focus)} · today`
+      : "Rest day · today";
   const profileSummary = userName ? `${userName} · Coached by MUSTLE` : "Coached by MUSTLE";
 
   if (!mounted) return null;
@@ -1451,5 +1532,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   logoutBtnText: { fontFamily: fonts.bodySemiBold, fontSize: 13, color: "#F2503D" },
+  deleteAccountBtn: { marginTop: 10, alignItems: "center", paddingVertical: 10 },
+  deleteAccountText: { fontFamily: fonts.bodyMedium, fontSize: 12, color: colors.muted },
   profileFooter: { marginTop: 14, fontFamily: fonts.bodyLight, fontSize: 12, color: colors.muted, textAlign: "center" },
 });

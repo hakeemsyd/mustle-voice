@@ -71,3 +71,22 @@ export const EXERCISE_CATALOG: CatalogExercise[] = [
 export function findExercise(name: string): CatalogExercise | undefined {
   return EXERCISE_CATALOG.find(e => e.name.toLowerCase() === name.toLowerCase());
 }
+
+export const BODYWEIGHT_EXERCISES = new Set([
+  'Push-up',
+  'Pull-up',
+  'Tricep Dip',
+  'Plank',
+  'Dead Bug',
+  'Hanging Knee Raise',
+  'Glute Bridge',
+  'Box Jump',
+]);
+
+export const isBodyweightExercise = (name: string): boolean =>
+  BODYWEIGHT_EXERCISES.has(name.trim());
+
+export const loadSchemeForExercise = (
+  name: string,
+  requested: string | null | undefined,
+): string | null => (isBodyweightExercise(name) ? 'bodyweight' : (requested ?? null));

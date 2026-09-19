@@ -25,18 +25,8 @@ import { useHomeData } from "../hooks/useHomeData";
 import { useHomeChat } from "../hooks/useHomeChat";
 import { colors, fonts } from "../constants/theme";
 import { CalendarIcon, MenuIcon, MoonIcon, SunIcon } from "../icons";
-import { getMomentumLine } from "./homeFormat";
+import { getMomentumLine, getTimeBand, type TimeBand } from "./homeFormat";
 import { subscribeToHomeRefresh } from "../lib/homeRefreshBridge";
-
-type TimeBand = "Morning" | "Afternoon" | "Evening" | "Night";
-
-function getTimeBand(hour: number): TimeBand {
-  if (hour < 5) return "Night";
-  if (hour < 12) return "Morning";
-  if (hour < 18) return "Afternoon";
-  if (hour < 22) return "Evening";
-  return "Night";
-}
 
 function getGreeting(band: TimeBand, name: string | null): string {
   return name ? `${band}, ${name}.` : `${band}.`;
@@ -62,6 +52,7 @@ export function HomeScreen() {
     loadError,
     planPending,
     refetch,
+    retryPlan,
   } = useHomeData();
   const { appendLocal } = useHomeChat(userId);
   const activeSession = useActiveSessionContext();
@@ -216,7 +207,7 @@ export function HomeScreen() {
                         </Text>
                       </Pressable>
                     ) : todaySession === null && planPending ? (
-                      <Pressable style={styles.restLine} onPress={refetch}>
+                      <Pressable style={styles.restLine} onPress={retryPlan}>
                         <View style={styles.restLineDot} />
                         <Text style={styles.restLineText}>
                           Still setting up your plan — tap to check

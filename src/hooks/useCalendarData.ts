@@ -604,10 +604,11 @@ export const useDayDetail = (dateKey: string | null): DayDetail => {
           fetchPlanAndLogs(userId),
           supabase
             .from("workout_log")
-            .select("id, status, source, exercises_done, plan_session_id, plan_session(focus)")
+            .select("id, at, status, source, exercises_done, plan_session_id, plan_session!workout_log_plan_session_id_fkey(focus)")
             .eq("user_id", userId)
             .gte("at", start.toISOString())
-            .lt("at", end.toISOString()),
+            .lt("at", end.toISOString())
+            .order("at", { ascending: false }),
           supabase
             .from("food_log")
             .select("description, calories, protein_g, carbs_g, fat_g")
@@ -735,7 +736,14 @@ export const useDayDetail = (dateKey: string | null): DayDetail => {
         loading: false,
         sleepHours,
         sleepSource,
-        workouts: (workouts ?? []).map((w: any) => ({
+        workouts: (workouts ?? [])
+          .slice()
+          .sort((a: any, b: any) => {
+            const byFinished = Number(isUnfinishedWorkout(a.status)) - Number(isUnfinishedWorkout(b.status));
+            if (byFinished !== 0) return byFinished;
+            return new Date(b.at).getTime() - new Date(a.at).getTime();
+          })
+          .map((w: any) => ({
           workoutLogId: w.id,
           status: w.status,
           source: w.source === "independent" ? "independent" : "mustle",

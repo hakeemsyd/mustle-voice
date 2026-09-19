@@ -13,6 +13,7 @@ import { StartingWorkoutOverlay } from "../components/StartingWorkoutOverlay";
 import { SessionChatThread } from "../components/session-chat/SessionChatThread";
 import { ChatChipRow, type ChatChip } from "../components/session-chat/ChatChipRow";
 import { CollapsibleSessionCard } from "../components/session-chat/CollapsibleSessionCard";
+import { useKeyboardOpen } from "../hooks/useKeyboardOpen";
 import { SessionVoiceInputDock } from "../components/session-chat/SessionVoiceInputDock";
 import { useSessionPreview } from "../hooks/useSessionPreview";
 import { useScreenInsets } from "../hooks/useScreenInsets";
@@ -27,6 +28,10 @@ import { getSwapCandidates, type SwapCandidate } from "../session/exerciseSwap";
 import { chooseRestDay } from "../lib/restDay";
 import { titleCase } from "../lib/textFormat";
 import { callBrain, COACH_UNREACHABLE_MESSAGE } from "../lib/brain";
+import { supabase } from "../lib/supabase";
+import { kgToDisplayWeight, type Units } from "../lib/units";
+import { useUnitPrefsState } from "../hooks/useUnitPrefs";
+import { convertLoadScheme } from "../lib/loadScheme";
 import { uploadChatFile, uploadChatImage } from "../lib/chatAttachments";
 import { colors, fonts, lightCard } from "../constants/theme";
 import { BackIcon } from "../icons/BackIcon";
@@ -65,6 +70,11 @@ type ChipsState =
 const INTRO_DELAY_MS = 400;
 const INTRO_GAP_MS = 900;
 
+const formatLoad = (load: string, units: Units): string => {
+  const kg = Number(load);
+  return Number.isFinite(kg) && kg > 0 ? kgToDisplayWeight(kg, units) : load;
+};
+
 export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
   const { planSessionId } = route.params;
   const { loading, error, focus, exercises, lastTime } = useSessionPreview(planSessionId);
@@ -72,7 +82,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
   const session = useActiveSessionContext();
   const {
     orbState, isActive, toggle, connect, release, status: voiceStatus, reconnecting,
-    isMuted, toggleMute, setMessageHandler, setSessionConfig,
+    isMuted, toggleMute, setMuteState, setMessageHandler, setSessionConfig,
   } = useSharedVoiceSession();
   const { alternatives: switchAlternatives } = usePlanAlternatives(planSessionId);
 
@@ -82,9 +92,30 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
   // Mic-first, matching the design: this is a voice-led surface, so the bar lands as the
   // centred toggle with no text field rather than an open keyboard composer. Tapping the
   // keyboard glyph swaps in the input pill.
+  const { units, ready: unitsReady } = useUnitPrefsState();
   const [inputMode, setInputMode] = useState<"mic" | "keyboard">("mic");
+  const autoMutedRef = useRef(false);
+  useEffect(() => {
+    if (inputMode === "keyboard") {
+      if (!isMuted) {
+        autoMutedRef.current = true;
+        setMuteState(true);
+      }
+      return;
+    }
+    if (autoMutedRef.current) {
+      autoMutedRef.current = false;
+      setMuteState(false);
+    }
+  }, [inputMode, isMuted, setMuteState]);
+
   const [chips, setChips] = useState<ChipsState>({ kind: "none" });
   const [cardCollapsed, setCardCollapsed] = useState(true);
+  const keyboardOpen = useKeyboardOpen();
+
+  useEffect(() => {
+    if (keyboardOpen) setCardCollapsed(true);
+  }, [keyboardOpen]);
   const [switchOpen, setSwitchOpen] = useState(false);
   const [attachOpen, setAttachOpen] = useState(false);
   const [guideExercise, setGuideExercise] = useState<{
@@ -103,6 +134,11 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
   sessionTargetRef.current = session.target;
 
   useEffect(() => {
+    if (session.target || !session.userId) return;
+    void supabase.from("live_session_state").delete().eq("user_id", session.userId);
+  }, [session.target, session.userId]);
+
+  useEffect(() => {
     return () => {
       introTimersRef.current.forEach(clearTimeout);
     };
@@ -114,7 +150,8 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
 
   const appendMessage = React.useCallback((role: "coach" | "user", text: string, imageUrl?: string) => {
     globalMessageCounter += 1;
-    setMessages((prev) => [...prev, { id: `${Date.now()}-${globalMessageCounter}`, role, text, imageUrl }]);
+    const id = `${Date.now()}-${globalMessageCounter}`;
+    setMessages((prev) => [...prev, { id, role, text, imageUrl }]);
   }, []);
 
   // This screen never claimed the shared conversation, so anything spoken here was still being
@@ -150,7 +187,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
   );
 
   useEffect(() => {
-    if (seededRef.current || loading || error || isEmpty) return;
+    if (seededRef.current || loading || error || isEmpty || !unitsReady) return;
     seededRef.current = true;
 
     const first = exercises[0];
@@ -165,7 +202,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
         .map(
           (done) =>
             `${done.name} — ${done.sets} sets · ${done.reps} reps${
-              done.load && done.load !== "bodyweight" ? ` · ${done.load}` : ""
+              done.load && done.load !== "bodyweight" ? ` · ${formatLoad(done.load, units)}` : ""
             }`,
         )
         .join("\n");
@@ -174,7 +211,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
           `\n${recap}\nWant to continue where you left off?`,
       );
     } else {
-      const line = buildSecondBeat(first, lastTime?.exercises ?? []);
+      const line = buildSecondBeat(first, lastTime?.exercises ?? [], units);
       if (line) beats.push(line);
     }
 
@@ -192,7 +229,24 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
       setTimeout(() => setChips({ kind: "idle" }), INTRO_DELAY_MS + beats.length * INTRO_GAP_MS),
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loading, error, isEmpty]);
+  }, [loading, error, isEmpty, units, unitsReady]);
+
+
+  const resyncTodaysSession = async () => {
+    const userId = session.userId;
+    if (!userId) return;
+    const todayKey = new Date(Date.now() - new Date().getTimezoneOffset() * 60_000).toISOString().slice(0, 10);
+    const { data } = await supabase
+      .from("day_override")
+      .select("plan_session_id")
+      .eq("user_id", userId)
+      .eq("date", todayKey)
+      .maybeSingle();
+    const nextId = data?.plan_session_id;
+    if (nextId && nextId !== planSessionId) {
+      navigation.replace("PreWorkoutPreview", { planSessionId: nextId });
+    }
+  };
 
   const startSession = (target: SessionTarget, resume = false) => {
     pendingTargetRef.current = { target, resume };
@@ -305,7 +359,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
         id: exercise.exerciseId,
         name: exercise.name,
         repScheme: exercise.repScheme,
-        loadScheme: exercise.loadScheme ?? undefined,
+        loadScheme: exercise.loadScheme ? convertLoadScheme(exercise.loadScheme, units) : undefined,
       });
       resetChips();
       return;
@@ -339,6 +393,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
     try {
       const result = await callBrain({ userId: session.userId, message: text });
       appendMessage("coach", result.reply);
+      await resyncTodaysSession();
     } catch (err) {
       console.error("[preview] coach call failed:", err);
       appendMessage("coach", COACH_UNREACHABLE_MESSAGE);

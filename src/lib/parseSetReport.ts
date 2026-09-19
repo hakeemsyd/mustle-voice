@@ -1,4 +1,5 @@
 import { normalizeSpokenNumbers } from '../onboarding/normalizeSpokenNumbers';
+import { kgToDisplayWeight, type Units } from './units';
 
 export interface ParsedSet {
   weight: number | null;
@@ -19,7 +20,14 @@ export interface ParsedSet {
 // The ordinal only, never "3 sets of 10" or "a set of 8", which carry real counts.
 const SET_ORDINAL_PATTERN = /\b(?:sets?\s*#?\s*\d+|\d+(?:st|nd|rd|th)\s+set)\b/gi;
 
-export function parseSetReport(raw: string): ParsedSet | null {
+const POUND_UNIT = /pound|lb/i;
+
+const toKg = (value: number, statedUnit: string | null, units: Units): number => {
+  const isPounds = statedUnit ? POUND_UNIT.test(statedUnit) : units === 'imperial';
+  return isPounds ? Math.round(value * 0.453592 * 10) / 10 : value;
+};
+
+export function parseSetReport(raw: string, units: Units = 'metric'): ParsedSet | null {
   const normalized = normalizeSpokenNumbers(raw);
 
   // Isometric/timed exercises (Plank, holds) report a duration, not a rep count — confirmed
@@ -32,11 +40,11 @@ export function parseSetReport(raw: string): ParsedSet | null {
     return reps > 0 ? { weight: null, reps, unit: 'seconds' } : null;
   }
 
-  const weightMatch = normalized.match(/(\d+(?:\.\d+)?)\s*(?:kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?)\b/i);
+  const weightMatch = normalized.match(/(\d+(?:\.\d+)?)\s*(kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?)\b/i);
   const repsMatch = normalized.match(/(\d+)\s*(?:reps?|x)\b/i);
 
   if (weightMatch || repsMatch) {
-    const weight = weightMatch ? Number(weightMatch[1]) : null;
+    const weight = weightMatch ? toKg(Number(weightMatch[1]), weightMatch[2], units) : null;
     let reps = repsMatch ? Math.round(Number(repsMatch[1])) : null;
 
     // "60kg 8" — weight was pinned by its unit, so the remaining loose number is the reps. The
@@ -65,34 +73,34 @@ export function parseSetReport(raw: string): ParsedSet | null {
   );
   if (!positional) return null;
 
-  const weight = Number(positional[1]);
+  const weight = toKg(Number(positional[1]), null, units);
   const reps = Math.round(Number(positional[2]));
   return reps > 0 ? { weight, reps } : null;
 }
 
 const STATED_WEIGHT_PATTERN =
-  /^(?:(?:it'?s|its|i'?m\s+using|im\s+using|using|with|at|about|around|roughly|maybe|let'?s\s+do|lets\s+do|do|go\s+with|going\s+with|make\s+it|put\s+on)\s+)?(\d+(?:\.\d+)?)\s*(?:kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?)\s*\.?$/i;
+  /^(?:(?:it'?s|its|i'?m\s+using|im\s+using|using|with|at|about|around|roughly|maybe|let'?s\s+do|lets\s+do|do|go\s+with|going\s+with|make\s+it|put\s+on)\s+)?(\d+(?:\.\d+)?)\s*(kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?)\s*\.?$/i;
 
-export function parseStatedWeight(raw: string): number | null {
-  if (parseSetReport(raw) !== null) return null;
+export function parseStatedWeight(raw: string, units: Units = 'metric'): number | null {
+  if (parseSetReport(raw, units) !== null) return null;
   const match = normalizeSpokenNumbers(raw).trim().match(STATED_WEIGHT_PATTERN);
   if (!match) return null;
-  const weight = Number(match[1]);
+  const weight = toKg(Number(match[1]), match[2] ?? null, units);
   return weight > 0 ? weight : null;
 }
 
-export function describeParsedSet(parsed: ParsedSet): string {
+export function describeParsedSet(parsed: ParsedSet, units: Units = 'metric'): string {
   if (parsed.unit === 'seconds') return `${parsed.reps}s held`;
   return parsed.weight === null
     ? `${parsed.reps} reps · bodyweight`
-    : `${parsed.weight}kg × ${parsed.reps} reps`;
+    : `${kgToDisplayWeight(parsed.weight, units)} × ${parsed.reps} reps`;
 }
 
 // Distinguishes "I did a set" from "hey coach, question" — the same split the design
 // makes, so one field serves both without a mode toggle. Anything with a unit/rep
 // keyword or a completion word is a report; everything else goes to the coach.
-export function looksLikeSetReport(raw: string): boolean {
-  if (parseSetReport(raw) !== null) return true;
+export function looksLikeSetReport(raw: string, units: Units = 'metric'): boolean {
+  if (parseSetReport(raw, units) !== null) return true;
   return /\b(done|complete|completed|finished)\b/i.test(raw);
 }
 

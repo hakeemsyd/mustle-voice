@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { buildSessionReport, type SessionReport, type WorkoutLogRecord } from '../lib/sessionReport';
+import type { Units } from '../lib/units';
 
 interface State {
   loading: boolean;
@@ -24,7 +25,7 @@ function computeStreak(logTimestamps: string[], uptoAt: string): number {
   return streak;
 }
 
-export function useSessionReport(workoutLogId: string): State {
+export function useSessionReport(workoutLogId: string, units: Units = 'metric'): State {
   const [state, setState] = useState<State>({ loading: true, error: null, report: null });
   const [refetchSignal, setRefetchSignal] = useState(0);
   const refetch = useCallback(() => setRefetchSignal((n) => n + 1), []);
@@ -120,6 +121,7 @@ export function useSessionReport(workoutLogId: string): State {
         (priorLogsRes.data ?? []) as WorkoutLogRecord[],
         streakDays,
         nutrition,
+        units,
       );
 
       setState({ loading: false, error: null, report });
@@ -128,7 +130,7 @@ export function useSessionReport(workoutLogId: string): State {
     return () => {
       cancelled = true;
     };
-  }, [workoutLogId, refetchSignal]);
+  }, [workoutLogId, refetchSignal, units]);
 
   return { ...state, refetch } as State & { refetch: () => void };
 }

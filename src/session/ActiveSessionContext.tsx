@@ -13,6 +13,7 @@ import { callBrain, COACH_UNREACHABLE_MESSAGE } from "../lib/brain";
 import { DEFAULT_REST_SEC, suggestRestSeconds, type RestSuggestionReason } from "../lib/restSuggestion";
 import { useProfileName } from "../hooks/useProfileName";
 import { buildLiveSessionSnapshot, describeLiveSessionSnapshot } from "./liveSessionState";
+import { useUnitPrefs } from "../hooks/useUnitPrefs";
 
 // Previously a module-level counter combined with Date.now() — confirmed live: two messages
 // landed with the exact same generated id ("<same millisecond>-13"). Module scope fixed the
@@ -201,11 +202,12 @@ interface ActiveSessionValue {
   removeQueuedExercise: (exerciseRowId: string) => void;
   swapQueuedExercise: (exerciseRowId: string, replacement: { id: string; name: string }) => void;
   finishRest: () => void;
-  endSession: (status: SessionStatus) => Promise<void>;
+  endSession: (status: SessionStatus, reason?: string | null) => Promise<void>;
   submitFeedback: (note: string, tags: string[]) => Promise<void>;
   askCoach: (text: string) => Promise<void>;
   noteSetLogged: (summary: string) => void;
   announce: (text: string) => void;
+  describeForCoach: () => string | undefined;
   setPaused: (paused: boolean) => void;
   clear: () => void;
 }
@@ -808,7 +810,7 @@ export function ActiveSessionProvider({
   }, [restPausedRemainingSec, pauseRest, resumeRest]);
 
   const endSession = useCallback(
-    async (status: SessionStatus) => {
+    async (status: SessionStatus, reason?: string | null) => {
       lastSetSnapshotRef.current = null;
       setEnded(true);
       setEndedStatus(status);
@@ -822,6 +824,10 @@ export function ActiveSessionProvider({
       const endingUserId = userIdRef.current;
       if (endingUserId) void supabase.from("live_session_state").delete().eq("user_id", endingUserId);
       await writeWorkoutLog(loggedSets, status);
+      const logId = logIdRef.current;
+      if (logId && reason?.trim()) {
+        void supabase.from("workout_log").update({ note: reason.trim() }).eq("id", logId);
+      }
     },
     [loggedSets, writeWorkoutLog],
   );
@@ -846,6 +852,40 @@ export function ActiveSessionProvider({
   // Coach Q&A mid-session — same real brain the Home chat uses. The reply is also filed
   // against the current exercise so the Guide sheet's notes are real conversation
   // history rather than authored content.
+  const units = useUnitPrefs();
+
+  const describeForCoach = useCallback((): string | undefined => {
+    const snapshot = buildLiveSessionSnapshot({
+      target,
+      focus,
+      exercises,
+      currentExerciseIndex,
+      loggedSets,
+      resting,
+      restTargetSec,
+      restEndAt,
+      restPausedRemainingSec,
+      ended,
+      paused,
+      elapsedSec,
+    });
+    return snapshot ? describeLiveSessionSnapshot(snapshot, units) : undefined;
+  }, [
+    target,
+    focus,
+    exercises,
+    currentExerciseIndex,
+    loggedSets,
+    resting,
+    restTargetSec,
+    restEndAt,
+    restPausedRemainingSec,
+    ended,
+    paused,
+    elapsedSec,
+    units,
+  ]);
+
   const latestAskRef = useRef(0);
   const askCoach = useCallback(
     async (text: string) => {
@@ -869,7 +909,7 @@ export function ActiveSessionProvider({
           paused,
           elapsedSec,
         });
-        const liveSessionState = snapshot ? describeLiveSessionSnapshot(snapshot) : undefined;
+        const liveSessionState = snapshot ? describeLiveSessionSnapshot(snapshot, units) : undefined;
         const result = await callBrain({ userId, message: text.trim(), liveSessionState });
         if (latestAskRef.current !== requestId) return;
         setCoachMessage(result.reply);
@@ -912,6 +952,7 @@ export function ActiveSessionProvider({
       ended,
       paused,
       elapsedSec,
+      units,
       appendMessage,
     ],
   );
@@ -979,6 +1020,7 @@ export function ActiveSessionProvider({
       askCoach,
       noteSetLogged,
       announce,
+      describeForCoach,
       setPaused,
       clear,
       toggleRestPause,
@@ -1030,6 +1072,7 @@ export function ActiveSessionProvider({
       askCoach,
       noteSetLogged,
       announce,
+      describeForCoach,
       clear,
       toggleRestPause,
       extendRest,

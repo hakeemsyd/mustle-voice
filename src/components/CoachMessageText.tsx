@@ -1,5 +1,6 @@
 import { Text, type StyleProp, type TextStyle } from "react-native";
 import { colors, fonts, lightCard } from "../constants/theme";
+import { canonicalizeExerciseNames } from "../lib/exerciseCatalog";
 
 interface CoachMessageTextProps {
   text: string;
@@ -28,7 +29,7 @@ const withSoftBreaks = (text: string): string =>
   );
 
 export const CoachMessageText = ({ text, style, variant = "dark" }: CoachMessageTextProps) => {
-  const parts = text.split(/(\*\*.+?\*\*)/g);
+  const parts = canonicalizeExerciseNames(text).split(/(\*\*.+?\*\*)/g);
   return (
     <Text style={style}>
       {parts.map((part, i) => {

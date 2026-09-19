@@ -54,8 +54,8 @@ export function nowInTimezone(timezone: string | null | undefined): Date {
 // query-safe UTC Date for "midnight, in this timezone, today": the gap between `now` and its
 // fake-UTC form is exactly the timezone's current offset, so subtracting that same gap from
 // fake-UTC midnight gives the real UTC instant that midnight actually falls at.
-export function startOfLocalDayUtc(timezone: string | null | undefined): Date {
-  const now = new Date();
+export function startOfLocalDayUtc(timezone: string | null | undefined, at: Date = new Date()): Date {
+  const now = at;
   const fakeUtcNow = toTimezone(now, timezone);
   const offsetMs = fakeUtcNow.getTime() - now.getTime();
   const fakeUtcMidnight = new Date(fakeUtcNow);
@@ -117,6 +117,15 @@ function sameLocalDay(a: Date, b: Date): boolean {
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }
 
+const holdsRotation = (log: WorkoutLogRow, now: Date): boolean =>
+  isPartial(log) && sameLocalDay(new Date(log.at), now);
+
+const byMostRecentFinishedFirst = (a: WorkoutLogRow, b: WorkoutLogRow): number => {
+  const byTime = new Date(b.at).getTime() - new Date(a.at).getTime();
+  if (byTime !== 0) return byTime;
+  return Number(isPartial(a)) - Number(isPartial(b));
+};
+
 export function resolveTodaySession(
   sessions: PlanSessionRow[],
   logs: WorkoutLogRow[],
@@ -145,14 +154,14 @@ export function resolveTodaySession(
 
   const lastLogged = logs
     .slice()
-    .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
+    .sort(byMostRecentFinishedFirst)
     .find((log) => log.plan_session_id && inPlan.has(log.plan_session_id));
 
   if (!lastLogged) return rotation[0];
 
   const lastIndex = rotation.findIndex((s) => s.id === lastLogged.plan_session_id);
   if (lastIndex === -1) return rotation[0];
-  if (isPartial(lastLogged)) return rotation[lastIndex];
+  if (holdsRotation(lastLogged, now)) return rotation[lastIndex];
   return rotation[(lastIndex + 1) % rotation.length];
 }
 
@@ -232,7 +241,7 @@ export async function buildContextBlock(
     { data: interrupted },
     eagerOverride,
   ] = await Promise.all([
-    supabase.from('profile').select('timezone').eq('user_id', userId).maybeSingle(),
+    supabase.from('profile').select('timezone, unit_prefs').eq('user_id', userId).maybeSingle(),
     supabase
       .from('training_plan')
       .select('plan_session(id, day_order, weekday, focus, plan_exercise(ord, exercise(name)))')
@@ -241,14 +250,14 @@ export async function buildContextBlock(
       .maybeSingle(),
     supabase
       .from('workout_log')
-      .select('at, plan_session_id, status, plan_session(focus)')
+      .select('at, plan_session_id, status, plan_session!workout_log_plan_session_id_fkey(focus)')
       .eq('user_id', userId)
       .order('at', { ascending: false })
       .limit(10),
     fetchRestDayDates(supabase, userId, ninetyDaysAgo),
     supabase
       .from('workout_log')
-      .select('id, at, exercises_done, plan_session(focus)')
+      .select('id, at, exercises_done, plan_session!workout_log_plan_session_id_fkey(focus)')
       .eq('user_id', userId)
       .eq('status', 'interrupted')
       .order('at', { ascending: false })
@@ -279,6 +288,13 @@ export async function buildContextBlock(
   const timeOfDay = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'UTC' });
   const dateLine =
     `Right now it is ${timeOfDay} on ${weekday}, ${now.toISOString().slice(0, 10)} (${timezone ?? 'UTC'} time).`;
+
+  const units = profile?.unit_prefs === 'imperial' ? 'imperial' : 'metric';
+  const unitsLine =
+    units === 'imperial'
+      ? 'The user reads and speaks in POUNDS (lb). Every weight you say out loud or write must be in pounds, ' +
+        'even though tools and stored data use kilograms. Convert before you speak: lb = kg x 2.205.'
+      : 'The user reads and speaks in KILOGRAMS (kg). State every weight in kilograms.';
 
   const todayKey = now.toISOString().slice(0, 10);
   const dayOverride =
@@ -360,7 +376,7 @@ export async function buildContextBlock(
 
   return (
     "Current context — you already know this, never ask the user for it:\n" +
-    `- ${dateLine}\n- ${planLine}\n` +
+    `- ${dateLine}\n- ${unitsLine}\n- ${planLine}\n` +
     (weeklyPlanLine ? `- ${weeklyPlanLine}\n` : '') +
     (interruptedLine ? `- ${interruptedLine}\n` : '') +
     `- ${historyLine}`

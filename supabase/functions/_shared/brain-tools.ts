@@ -7,7 +7,19 @@ const exerciseSchema = {
     name: { type: 'string', description: 'Exercise name, matched against the catalog.' },
     sets: { type: 'integer' },
     rep_scheme: { type: 'string', description: "e.g. '8-10', 'AMRAP'" },
-    load_scheme: { type: 'string', description: "e.g. '%1RM', 'RPE 8'" },
+    load_scheme: {
+      type: 'string',
+      description:
+        "What weight to use, written for someone standing in front of the bar. Never leave blank. " +
+        "Use their real numbers when read_state has them, written in the units the context block says " +
+        "the user reads in (e.g. '60 kg' / '135 lb', 'last time: 22.5 kg each'). " +
+        "When it does not — which is every brand-new user — give a concrete starting point instead: " +
+        "'bodyweight', 'empty bar to start', 'light — find your working weight'. NEVER a percentage " +
+        "of one-rep max ('70-80% 1RM') or an RPE unless read_state actually shows a tested 1RM or " +
+        "prior working sets for this exercise: a beginner does not know their 1RM, so it displays on " +
+        "their workout screen as a number they cannot act on. Confirmed live on a fresh signup, " +
+        "which was handed '70-80% 1RM' for Overhead Press with no lifting history on record at all.",
+    },
   },
   required: ['name', 'sets', 'rep_scheme'],
 };
@@ -195,6 +207,19 @@ export const BRAIN_TOOLS = [
             'the similar one already logged, not a correction to it. Never set this on a first ' +
             'attempt — only after a prior call returned "likely_correction" and you asked.',
         },
+        confirm: {
+          type: 'boolean',
+          description:
+            'Leave unset on the first call: that returns a preview and saves NOTHING. Set true only ' +
+            'after you have read the estimate back and the user agreed in their next message.',
+        },
+        confirm_token: {
+          type: 'string',
+          description:
+            'Required alongside confirm:true — the exact confirm_token string the preview call just ' +
+            'returned. It is bound to these exact macro values, so a token from a different estimate ' +
+            'will not verify.',
+        },
       },
       required: ['description', 'calories', 'protein_g', 'carbs_g', 'fat_g'],
     },
@@ -282,7 +307,14 @@ export const BRAIN_TOOLS = [
               name: { type: 'string' },
               sets: { type: 'integer' },
               reps: { type: 'string' },
-              load: { type: 'string' },
+              load: {
+                type: 'string',
+                description:
+                  'Comma-separated KILOGRAM numbers, one per set, with NO unit text — "60,60,62.5". ' +
+                  'Storage is always kilograms even when you speak to the user in pounds: convert first ' +
+                  '(kg = lb / 2.205). Never write "95 lb" or any other unit into this field. Use the ' +
+                  'literal string "bodyweight" when no weight was used.',
+              },
             },
             required: ['name'],
           },
@@ -339,7 +371,14 @@ export const BRAIN_TOOLS = [
               name: { type: 'string' },
               sets: { type: 'integer' },
               reps: { type: 'string' },
-              load: { type: 'string' },
+              load: {
+                type: 'string',
+                description:
+                  'Comma-separated KILOGRAM numbers, one per set, with NO unit text — "60,60,62.5". ' +
+                  'Storage is always kilograms even when you speak to the user in pounds: convert first ' +
+                  '(kg = lb / 2.205). Never write "95 lb" or any other unit into this field. Use the ' +
+                  'literal string "bodyweight" when no weight was used.',
+              },
             },
             required: ['name', 'sets', 'reps', 'load'],
           },
@@ -356,7 +395,12 @@ export const BRAIN_TOOLS = [
     input_schema: {
       type: 'object',
       properties: {
-        weight_kg: { type: 'number' },
+        weight_kg: {
+          type: 'number',
+          description:
+            'Bodyweight in KILOGRAMS, always. If the user states pounds, convert before calling: ' +
+            'kg = lb / 2.205. Never pass a pound figure through unchanged.',
+        },
         mood: { type: 'integer' },
         sleep_hours: { type: 'number' },
         soreness: { type: 'integer' },
@@ -538,11 +582,29 @@ export const BRAIN_TOOLS = [
   {
     name: 'swap_exercise',
     description:
-      "Swap an upcoming exercise in the user's active in-app session for a same-muscle-group, injury-safe alternative from the catalog (e.g. \"swap out face pulls, my shoulder's bothering me\"). Only works while a session is actually running and the exercise hasn't started yet.",
+      "Replace ONE exercise in today's workout with a same-muscle-group, injury-safe alternative from " +
+      "the catalog (e.g. \"swap out face pulls, my shoulder's bothering me\", \"the bench is taken, give me " +
+      "push-ups instead\"). THIS IS THE TOOL FOR ANY SINGLE-EXERCISE SUBSTITUTION, whether the session is " +
+      "already running or the user is still on the workout preview before starting — it handles both. " +
+      "NEVER use create_custom_session to substitute one exercise: that rebuilds the entire session and " +
+      "has listed an exercise twice doing it (confirmed live). Everything except the named exercise stays " +
+      "exactly as it was, and the training plan itself is never changed. " +
+      'IF THE USER NAMED WHAT THEY WANT INSTEAD, pass it as replacement_exercise_name — leaving it out ' +
+      'lets the app pick any same-pattern exercise, which is how a user who asked for Incline Dumbbell ' +
+      'Press was given Overhead Press instead (confirmed live). Only omit it when they asked you to ' +
+      'choose. Never tell the user what it was swapped to until this returns "requested" — report the ' +
+      '`replacement` value it gives back, not the name you had in mind.',
     input_schema: {
       type: 'object',
       properties: {
         current_exercise_name: { type: 'string', description: 'Exact catalog name of the exercise to replace.' },
+        replacement_exercise_name: {
+          type: 'string',
+          description:
+            'Exact catalog name the user asked to swap TO. Required whenever they named one. If it is ' +
+            'not a valid same-pattern option, or is unsafe for their injuries, nothing is changed and ' +
+            'you get back the safe alternatives to offer them.',
+        },
       },
       required: ['current_exercise_name'],
     },
@@ -579,6 +641,15 @@ export const BRAIN_TOOLS = [
       type: 'object',
       properties: {
         completed: { type: 'boolean', description: 'true if they finished as planned, false if cutting it short' },
+        reason: {
+          type: 'string',
+          description:
+            'Why it is ending, in the user\'s own terms — "the bench was taken and the swap did not ' +
+            'apply", "shoulder started hurting", "ran out of time". Required whenever completed is ' +
+            'false. This is what the session report shows them afterwards, so if you leave it out the ' +
+            'report has no reason to give and the user is asked to explain something you already knew. ' +
+            'Never ask them to re-state a reason they have already given you in this conversation.',
+        },
         confirm: {
           type: 'boolean',
           description: 'Leave false/omitted to preview what would happen with nothing ended. Set true only after explicit agreement in their next message.',

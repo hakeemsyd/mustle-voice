@@ -1,5 +1,6 @@
 import { supabase } from './supabase';
 import { setCachedDisplayName } from './profileStore';
+import { looksRecoverable } from './recoverableError';
 
 export type BrainModality = 'voice' | 'text' | 'image' | 'file' | 'live_photo';
 
@@ -62,7 +63,7 @@ export interface ReadinessCard {
 
 export interface TopLiftsCard {
   type: 'top_lifts';
-  lifts: { name: string; top_weight_lb: number }[];
+  lifts: { name: string; top_weight_label: string }[];
   insight: string;
 }
 
@@ -116,6 +117,7 @@ export interface BrainRequest {
   /** Home's daily-greeting call only — the plan_session id the greeting is about (or 'rest'),
    *  stamped onto the stored reply so a cached greeting is dropped once the due session changes. */
   greetingKey?: string | null;
+  isOnboarding?: boolean;
 }
 
 /**
@@ -126,6 +128,42 @@ export interface BrainRequest {
  * surfaced only because two of the shifted types happened to disagree. With names, a new field
  * can be added anywhere and nothing moves.
  */
+const RECOVERY_POLL_MS = 2000;
+const RECOVERY_WINDOW_MS = 45000;
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const recoverPersistedReply = async (userId: string, sentText: string): Promise<BrainResult | null> => {
+  const deadline = Date.now() + RECOVERY_WINDOW_MS;
+  while (Date.now() < deadline) {
+    await sleep(RECOVERY_POLL_MS);
+    const { data: askedRow } = await supabase
+      .from('message')
+      .select('at')
+      .eq('user_id', userId)
+      .eq('role', 'user')
+      .eq('content', sentText)
+      .order('at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (!askedRow?.at) continue;
+
+    const { data: replyRow } = await supabase
+      .from('message')
+      .select('content, card')
+      .eq('user_id', userId)
+      .eq('role', 'assistant')
+      .gt('at', askedRow.at)
+      .order('at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (replyRow?.content) {
+      return { reply: replyRow.content, toolCalls: [], card: (replyRow.card ?? null) as ChatCard | null };
+    }
+  }
+  return null;
+};
+
 export async function callBrain({
   userId,
   message,
@@ -137,6 +175,7 @@ export async function callBrain({
   attachmentPath,
   isDailyGreeting = false,
   greetingKey = null,
+  isOnboarding = false,
 }: BrainRequest): Promise<BrainResult> {
   // The device's own current timezone, sent every call — profile.timezone is only written once
   // at onboarding and never refreshed, which silently drifted after travel/DST and misclassified
@@ -146,11 +185,15 @@ export async function callBrain({
   const { data, error } = await supabase.functions.invoke('brain', {
     body: {
       userId, message, modality, hidden, liveSessionState, timezone, attachmentUrl, attachmentPath,
-      isDailyGreeting, greetingKey,
+      isDailyGreeting, greetingKey, isOnboarding,
     },
     timeout: timeoutMs,
   });
-  if (error) throw new Error(`brain invoke failed: ${error.message}`);
+  if (error) {
+    const recovered = looksRecoverable(error.message) ? await recoverPersistedReply(userId, message) : null;
+    if (recovered) return recovered;
+    throw new Error(`brain invoke failed: ${error.message}`);
+  }
   const result = data as BrainResult;
   // Only a real correction should touch the cache — updatedDisplayName is present but null on
   // every ordinary reply, and writing null would wipe an already-correct cached name.

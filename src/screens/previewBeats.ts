@@ -1,4 +1,6 @@
 import type { SessionExercise } from "../session/ActiveSessionContext";
+import { kgToDisplayWeight, type Units } from "../lib/units";
+import { isBodyweightWork } from "../lib/exerciseCatalog";
 
 /** Reads the heaviest load off a logged exercise's comma-joined load string ("60,60,60,60").
  *  Returns null for bodyweight work, or anything that doesn't parse as numbers. */
@@ -38,6 +40,7 @@ const repList = (reps: string | null | undefined): string | null => {
 export function buildSecondBeat(
   first: SessionExercise | undefined,
   done: { name: string; reps: string; load: string }[],
+  units: Units = "metric",
 ): string | null {
   if (!first) return null;
 
@@ -51,7 +54,7 @@ export function buildSecondBeat(
   const firstHistory = historyFor(first.name);
   if (firstHistory) {
     return firstHistory.load != null
-      ? `Last session on **${first.name}** you worked at ${firstHistory.load}kg for ${firstHistory.reps}. ` +
+      ? `Last session on **${first.name}** you worked at ${kgToDisplayWeight(firstHistory.load, units)} for ${firstHistory.reps}. ` +
           `Hold that weight today and chase one more clean rep per set.`
       : `Last session on **${first.name}** you got ${firstHistory.reps}. Chase one more clean rep per set today.`;
   }
@@ -62,18 +65,25 @@ export function buildSecondBeat(
     const load = topLoad(entry.load);
     return load != null
       ? `**${first.name}** is new for you here — start conservative. Last time on **${entry.name}** ` +
-          `you worked at ${load}kg for ${reps}, so you've got a reference point later in the session.`
+          `you worked at ${kgToDisplayWeight(load, units)} for ${reps}, so you've got a reference point later in the session.`
       : `**${first.name}** is new for you here — start conservative. Last time on **${entry.name}** ` +
           `you got ${reps}.`;
   }
 
   // Deliberately no load_scheme here. It's a raw programming string ("%1RM", "RPE 8") that reads
-  // as jargon in a coach's sentence, and the intro bubble above already states sets × reps. Nor
-  // does this say "weight": the first movement may well be bodyweight, and there's no way to tell
-  // from the plan alone. Nothing is invented — the honest answer to no history is to say so.
+  // as jargon in a coach's sentence, and the intro bubble above already states sets × reps.
+  // Nothing is invented — the honest answer to no history is to say so.
+  if (isBodyweightWork(first.name, first.loadScheme)) {
+    return (
+      `First time logging **${first.name}** — no numbers on record yet. It's bodyweight, so ` +
+      `there's nothing to load: take the first set easy and see how many clean reps you get ` +
+      `across all ${first.sets}. That's your baseline.`
+    );
+  }
+
   return (
     `First time logging **${first.name}** — no numbers on record yet. Take the first set easy, ` +
-    `find something you can control for all ${first.sets}, and you'll have a real baseline to ` +
+    `find a weight you can control for all ${first.sets}, and you'll have a real baseline to ` +
     `build on next time.`
   );
 }

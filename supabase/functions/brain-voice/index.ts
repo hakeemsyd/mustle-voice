@@ -14,6 +14,7 @@ import { VOICE_TOOLS } from '../_shared/brain-tools.ts';
 import { buildLiveSessionSnapshot, describeLiveSessionSnapshot, LIVE_STATE_MAX_AGE_MS } from '../_shared/live-session-format.ts';
 import { resolveTurnText } from '../_shared/system-cue.ts';
 import { verbalizeUnitsForSpeech } from '../_shared/verbalize-for-speech.ts';
+import { stripSystemNote, createSystemNoteFilter } from '../_shared/strip-system-note.ts';
 
 const callModel = createCallModel(VOICE_TOOLS);
 
@@ -35,6 +36,7 @@ const SYSTEM_CUE_PREFIX = '[[SYSTEM_CUE]]';
 // A small window is kept, not zero, so cues like silence_after_rest_final ("don't repeat the same
 // phrasing as before") can still see what was just said.
 const CUE_MESSAGE_HISTORY_LIMIT = 12;
+const HISTORY_LOOKBACK_MS = 30 * 60 * 60 * 1000;
 // session_start is the exception that gets NO history at all. It opens a brand new workout, so
 // every fact it needs is in the context block and the live session state block — while the most
 // recent messages are, by definition, the *previous* workout, and they read as though they are
@@ -115,21 +117,24 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
           .from('message')
           .select('role,content,blocks,at')
           .eq('user_id', userId)
-          .gte('at', startOfLocalDayUtc(timezone).toISOString())
+          .gte('at', new Date(Date.now() - HISTORY_LOOKBACK_MS).toISOString())
           .order('at', { ascending: false })
           .order('role', { ascending: true })
           .limit(historyLimit);
-  const [{ data: history, error: historyError }, contextBlock, { data: liveRow }] = await Promise.all([
-    historyQuery,
-    buildContextBlock(supabase, userId, timezone),
-    supabase.from('live_session_state').select('state, updated_at').eq('user_id', userId).maybeSingle(),
-  ]);
+  const [{ data: history, error: historyError }, contextBlock, { data: liveRow }, { data: profileRow }] =
+    await Promise.all([
+      historyQuery,
+      buildContextBlock(supabase, userId, timezone),
+      supabase.from('live_session_state').select('state, updated_at').eq('user_id', userId).maybeSingle(),
+      supabase.from('profile').select('timezone, unit_prefs').eq('user_id', userId).maybeSingle(),
+    ]);
   console.log(`[voice-timing:server] prepareTurn: parallel fetch done, +${Date.now() - tPrepare0}ms`);
   if (historyError) throw new Error(`message fetch: ${historyError.message}`);
 
   const isLiveStateFresh = !!liveRow && Date.now() - new Date(liveRow.updated_at).getTime() < LIVE_STATE_MAX_AGE_MS;
   const liveSnapshot = isLiveStateFresh ? buildLiveSessionSnapshot(liveRow!.state) : null;
-  const liveBlock = liveSnapshot ? describeLiveSessionSnapshot(liveSnapshot) : null;
+  const units = profileRow?.unit_prefs === 'imperial' ? 'imperial' : 'metric';
+  const liveBlock = liveSnapshot ? describeLiveSessionSnapshot(liveSnapshot, units) : null;
   const fullContextBlock = liveBlock ? `${contextBlock}\n\n${liveBlock}` : contextBlock;
 
   // A workout's conversation must not leak into the next one. The app stamps live_session_state
@@ -141,10 +146,12 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
   // Home's in-progress card is the same session and remembers the weight, while killing the app
   // starts a new one and forgets what the UI forgot.
   const sessionStartedAt = isLiveStateFresh ? (liveRow!.state as any)?.startedAt : null;
+  const dayStart = startOfLocalDayUtc(timezone || profileRow?.timezone || null).getTime();
+  const todayHistory = (history ?? []).filter((m: any) => !m.at || new Date(m.at).getTime() >= dayStart);
   const scopedHistory =
     typeof sessionStartedAt === 'string'
-      ? (history ?? []).filter((m: any) => !m.at || m.at >= sessionStartedAt)
-      : (history ?? []);
+      ? todayHistory.filter((m: any) => !m.at || m.at >= sessionStartedAt)
+      : todayHistory;
   const priorMessages = replayHistory(dropSupersededFromHistory(scopedHistory.slice().reverse(), userText));
   const turnMessages = [...priorMessages, { role: 'user', content: resolveTurnText(userText) }];
   // Greeting is a per-CALL decision ("say hello once when this call starts"), not a per-DAY one —
@@ -256,9 +263,10 @@ async function logConversation(
   userId: string,
   userText: string,
   askedAt: Date,
-  reply: string,
+  rawReply: string,
   turnBlocks: any[],
 ) {
+  const reply = stripSystemNote(rawReply);
   const repliedAt = new Date(Math.max(Date.now(), askedAt.getTime() + 1));
   const isSystemCue = userText.startsWith(SYSTEM_CUE_PREFIX);
   if (!isSystemCue) await dropSupersededTurn(supabase, userId, userText, askedAt);
@@ -464,7 +472,9 @@ Deno.serve(async (req) => {
 
   if (!stream) {
     try {
-      const reply = sanitizeForSpeech(await resolveReplyBuffered(userId, userText, timezone, isFirstTurnOfCall));
+      const reply = sanitizeForSpeech(
+        stripSystemNote(await resolveReplyBuffered(userId, userText, timezone, isFirstTurnOfCall)),
+      );
       return jsonReply(reply);
     } finally {
       if (needsLock) await releaseTurnLock(lockClient, userId!);
@@ -509,15 +519,18 @@ Deno.serve(async (req) => {
       const MAX_HOLD_CHARS = 90;
       let pending = '';
       let emittedAny = false;
+      const filterSystemNote = createSystemNoteFilter();
 
       const emitChunk = (chunk: string) => {
         if (!chunk) return;
+        const visible = filterSystemNote(chunk);
+        if (!visible) return;
         // The placeholder check now sees a whole clause rather than the first 24 characters, so
         // it no longer has to guess from a fragment — but it still only applies before anything
         // has been spoken, since a later "silence" is part of a real sentence.
-        if (!emittedAny && isSilencePlaceholder(chunk)) return;
+        if (!emittedAny && isSilencePlaceholder(visible)) return;
         emittedAny = true;
-        send(sanitizeForSpeech(chunk));
+        send(sanitizeForSpeech(visible));
       };
 
       const takeFlushable = (force: boolean): string => {

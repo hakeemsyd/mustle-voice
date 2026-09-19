@@ -22,14 +22,19 @@ import { PostWorkoutFeedback } from "../components/PostWorkoutFeedback";
 import { SessionChatThread } from "../components/session-chat/SessionChatThread";
 import { ChatChipRow, type ChatChip } from "../components/session-chat/ChatChipRow";
 import { CollapsibleSessionCard } from "../components/session-chat/CollapsibleSessionCard";
+import { useKeyboardOpen } from "../hooks/useKeyboardOpen";
 import { SessionVoiceInputDock } from "../components/session-chat/SessionVoiceInputDock";
 import { CARDIO_ACTIVITIES } from "../components/SwitchWorkoutSheet";
 import { formatClock } from "../lib/formatClock";
 import { useScreenInsets } from "../hooks/useScreenInsets";
 import { useSharedVoiceSession } from "../session/VoiceSessionProvider";
 import { SYSTEM_CUE_PREFIX } from "../hooks/useVoiceSession";
+import { callBrain } from "../lib/brain";
 import { useActiveSessionContext, type SessionTarget } from "../session/ActiveSessionContext";
 import { usePlanAlternatives } from "../hooks/usePlanAlternatives";
+import { useUnitPrefs } from "../hooks/useUnitPrefs";
+import { convertLoadScheme } from "../lib/loadScheme";
+import { kgToDisplayWeight } from "../lib/units";
 import { getSwapCandidates, type SwapCandidate } from "../session/exerciseSwap";
 import { supabase } from "../lib/supabase";
 import { colors, fonts, sessionColors } from "../constants/theme";
@@ -86,6 +91,11 @@ export function ActiveSessionScreen({ navigation }: Props) {
   const [undoVisible, setUndoVisible] = useState(false);
   const [chatChips, setChatChips] = useState<ChipsState>({ kind: "idle" });
   const [cardCollapsed, setCardCollapsed] = useState(true);
+  const keyboardOpen = useKeyboardOpen();
+
+  useEffect(() => {
+    if (keyboardOpen) setCardCollapsed(true);
+  }, [keyboardOpen]);
   // Mic-first: this screen auto-connects on focus and the whole point is reporting sets by
   // voice, so it lands on the speak surface rather than an open keyboard composer.
   const [inputMode, setInputMode] = useState<"mic" | "keyboard">("mic");
@@ -152,6 +162,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
     };
   }, [currentExerciseIndex, isCardio, cardCollapsed]);
 
+  const units = useUnitPrefs();
   const restRemaining = useRestRemaining(restEndAt, restPausedRemainingSec);
   const currentSetCount = loggedSets[currentExerciseIndex]?.length ?? 0;
   const nextExerciseName = exercises[currentExerciseIndex + 1]?.name ?? null;
@@ -163,8 +174,10 @@ export function ActiveSessionScreen({ navigation }: Props) {
     .find((set) => set.weight !== null)?.weight;
   const currentWeightLabel =
     lastLoggedWeight != null
-      ? `${lastLoggedWeight} KG`
-      : (currentExercise?.loadScheme ?? "—");
+      ? kgToDisplayWeight(lastLoggedWeight, units).toUpperCase()
+      : currentExercise?.loadScheme
+        ? convertLoadScheme(currentExercise.loadScheme, units)
+        : "—";
   // A weight the user says out loud before their first set ("80 kg", answering the coach's own
   // question) is not a set report and logs nothing, so it used to be forgotten by the time they
   // said "set one done" — and with no set yet logged on the exercise there was nothing to carry
@@ -183,7 +196,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
 
   const commitSet = (weight: number | null, reps: number, viaVoice = false, unit?: "seconds") => {
     session.logSet(weight, reps, unit);
-    session.noteSetLogged(describeParsedSet({ weight, reps, unit }));
+    session.noteSetLogged(describeParsedSet({ weight, reps, unit }, units));
     setDraft("");
     // Recorded, not fired here — the "set_logged" cue needs the live_session_state write for
     // THIS set to land first (see the effect below), and that write hasn't even been scheduled
@@ -212,9 +225,24 @@ export function ActiveSessionScreen({ navigation }: Props) {
 
   const {
     orbState, isActive, status: voiceStatus, toggle, sendContextualUpdate, sendUserMessage,
-    reconnecting, voiceDropped, idleClosed, connect, isMuted, toggleMute,
+    reconnecting, voiceDropped, idleClosed, connect, isMuted, toggleMute, setMuteState,
     setMessageHandler, setSessionConfig, setWorkoutActive,
   } = useSharedVoiceSession();
+
+  const autoMutedRef = useRef(false);
+  useEffect(() => {
+    if (inputMode === "keyboard") {
+      if (!isMuted) {
+        autoMutedRef.current = true;
+        setMuteState(true);
+      }
+      return;
+    }
+    if (autoMutedRef.current) {
+      autoMutedRef.current = false;
+      setMuteState(false);
+    }
+  }, [inputMode, isMuted, setMuteState]);
 
   useEffect(() => {
     setWorkoutActive(!ended);
@@ -280,13 +308,13 @@ export function ActiveSessionScreen({ navigation }: Props) {
         return;
       }
       if (message.role !== "user" || isCardio) return;
-      const statedWeight = parseStatedWeight(message.text);
+      const statedWeight = parseStatedWeight(message.text, units);
       if (statedWeight != null) {
         statedWeightRef.current = { exerciseIndex: currentExerciseIndex, weight: statedWeight };
       }
-      if (!looksLikeSetReport(message.text)) return;
+      if (!looksLikeSetReport(message.text, units)) return;
       if (resting) session.finishRest();
-      const parsed = parseSetReport(message.text);
+      const parsed = parseSetReport(message.text, units);
       if (!parsed) {
         // The single biggest source of coach/app drift: the user reports a set, the coach hears
         // and counts it conversationally, but the local parser can't read the numbers out of it
@@ -345,7 +373,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
       try {
         sendContextRef.current?.(
           `The app just logged this set directly from what the user said: ${currentExercise?.name ?? "the current exercise"}, ` +
-            `set ${setNumber}${currentExercise ? ` of ${currentExercise.sets}` : ""}, ${describeParsedSet(parsedForLog)}. ` +
+            `set ${setNumber}${currentExercise ? ` of ${currentExercise.sets}` : ""}, ${describeParsedSet(parsedForLog, units)}. ` +
             `It's already recorded — don't ask what exercise it was, whether they've done it before, or ask them to confirm ` +
             `any of these details, and if they say it was wrong or misheard, call undo_last_set instead of just apologizing ` +
             `in text. Acknowledge in one short sentence and move the conversation forward.` +
@@ -353,7 +381,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
               ? nextExercise
                 ? ` That was the last set of ${currentExercise!.name} — the app has already moved on to the next ` +
                   `exercise: ${nextExercise.name}, ${nextExercise.sets} sets of ${nextExercise.repScheme}` +
-                  `${nextExercise.loadScheme ? ` at ${nextExercise.loadScheme}` : ""}. There is no rest timer between ` +
+                  `${nextExercise.loadScheme ? ` at ${convertLoadScheme(nextExercise.loadScheme, units)}` : ""}. There is no rest timer between ` +
                   `exercises, so name the new exercise and its real target next — these exact numbers, never ` +
                   `${currentExercise!.name}'s.`
                 : ` That was the last set of the last exercise — the workout is complete. Wrap it up; don't reference ` +
@@ -381,18 +409,42 @@ export function ActiveSessionScreen({ navigation }: Props) {
 
   const liveStateWriteRef = useRef<PromiseLike<unknown>>(Promise.resolve());
 
+  const cueOverTextRef = useRef<(cue: string) => void>(() => undefined);
+  cueOverTextRef.current = (cue: string) => {
+    const userId = session.userId;
+    if (!userId) return;
+    void (async () => {
+      try {
+        const result = await callBrain({
+          userId,
+          message: `${SYSTEM_CUE_PREFIX} ${cue}`,
+          hidden: true,
+          liveSessionState: session.describeForCoach(),
+        });
+        const reply = result.reply?.trim();
+        if (reply) session.announce(reply);
+      } catch (err) {
+        console.error("[active session] text fallback for coach cue failed:", err);
+      }
+    })();
+  };
+
   useEffect(() => {
     triggerCueRef.current = (cue: string) => {
-      if (voiceStatus !== "connected") return false;
+      if (voiceStatus !== "connected" || isMuted) {
+        cueOverTextRef.current(cue);
+        return true;
+      }
       try {
         sendUserMessage(`${SYSTEM_CUE_PREFIX} ${cue}`);
         return true;
       } catch (err) {
         console.error("[active session] failed to send coach cue:", err);
-        return false;
+        cueOverTextRef.current(cue);
+        return true;
       }
     };
-  }, [voiceStatus, sendUserMessage]);
+  }, [voiceStatus, isMuted, sendUserMessage]);
 
   const toggleRef = useRef(toggle);
   toggleRef.current = toggle;
@@ -435,7 +487,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
 
   const greetedSessionRef = useRef<typeof target>(null);
   useEffect(() => {
-    if (!target || ended || voiceStatus !== "connected") return;
+    if (!target || ended) return;
     if (!isCardio && !currentExercise) return;
     if (greetedSessionRef.current === target) return;
     greetedSessionRef.current = target;
@@ -614,9 +666,19 @@ export function ActiveSessionScreen({ navigation }: Props) {
     session.restore();
   }, []);
 
+  const wasReconnectingRef = useRef(false);
   useEffect(() => {
-    if (reconnecting) session.announce("Voice connection dropped — reconnecting…");
-  }, [reconnecting]);
+    if (reconnecting) {
+      wasReconnectingRef.current = true;
+      session.announce("Voice connection dropped — reconnecting…");
+      return;
+    }
+    if (!wasReconnectingRef.current) return;
+    wasReconnectingRef.current = false;
+    if (voiceStatus !== "connected") {
+      session.announce("Couldn't get voice back. Tap to talk to retry — you can keep typing in the meantime.");
+    }
+  }, [reconnecting, voiceStatus]);
 
   useEffect(() => {
     if (voiceDropped) session.announce("Voice disconnected. Tap to talk and repeat your last set.");
@@ -642,13 +704,13 @@ export function ActiveSessionScreen({ navigation }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ended]);
 
-  const parsedDraft = parseSetReport(draft);
+  const parsedDraft = parseSetReport(draft, units);
 
   const handleSend = () => {
     const text = draft.trim();
     if (!text) return;
-    if (!isCardio && !resting && looksLikeSetReport(text)) {
-      const parsed = parseSetReport(text);
+    if (!isCardio && !resting && looksLikeSetReport(text, units)) {
+      const parsed = parseSetReport(text, units);
       if (parsed) {
         commitSet(resolveSetWeight(parsed), parsed.reps, false, parsed.unit);
         return;
@@ -664,14 +726,15 @@ export function ActiveSessionScreen({ navigation }: Props) {
       commitSet(resolveSetWeight(parsedDraft), parsedDraft.reps, false, parsedDraft.unit);
       return;
     }
-    // Tapped straight from the menu with nothing typed — confirmed live: this used to silently
-    // no-op (just focus the input), which read as the button doing nothing at all. Falls back to
-    // the exercise's own target reps and whatever weight was last logged for it this session
-    // (null/bodyweight if this is the first set) so the tap always records something real,
-    // instead of only working when the user has already typed a report.
     const fallbackReps = targetRepsFrom(currentExercise.repScheme);
     if (fallbackReps != null) {
-      commitSet(carryWeight(), fallbackReps, false);
+      const carried = carryWeight();
+      setDraft(
+        carried != null
+          ? `${kgToDisplayWeight(carried, units)} ${fallbackReps} reps`
+          : `${fallbackReps} reps`,
+      );
+      inputRef.current?.focus();
       return;
     }
     inputRef.current?.focus();
@@ -1213,7 +1276,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
                         disabled={isCardio}
                       >
                         <CheckIcon size={14} color={sessionColors.active} />
-                        <Text style={styles.doneBtnText}>Set done</Text>
+                        <Text style={styles.doneBtnText}>{parsedDraft ? "Confirm set" : "Set done"}</Text>
                       </Pressable>
                     )}
                     <Pressable style={styles.workoutDoneBtn} onPress={() => setEndConfirmOpen(true)}>
@@ -1256,7 +1319,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
             onToggleMute={toggleMute}
             parsePreview={
               !isCardio && parsedDraft
-                ? describeParsedSet(parsedDraft)
+                ? describeParsedSet(parsedDraft, units)
                 : inputHint
                   ? 'Type weight and reps here — e.g. "60kg 8 reps"'
                   : null
@@ -1274,7 +1337,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
             ? `You've been going for ${formatClock(elapsedSec)}. Ending now saves this session as completed.`
             : hasLoggedAnySet
               ? "Ending now saves the sets you've logged as a partial session."
-              : "Nothing's been logged yet — ending now saves this as a partial session."
+              : "Nothing's been logged yet, so there's nothing to save — ending now just closes the session."
         }
         confirmLabel="End workout"
         cancelLabel="Keep going"
@@ -1302,7 +1365,9 @@ export function ActiveSessionScreen({ navigation }: Props) {
         exerciseId={currentExercise?.exerciseId ?? null}
         exerciseName={currentExercise?.name ?? null}
         repScheme={currentExercise?.repScheme}
-        loadScheme={currentExercise?.loadScheme ?? undefined}
+        loadScheme={
+          currentExercise?.loadScheme ? convertLoadScheme(currentExercise.loadScheme, units) : undefined
+        }
       />
     </KeyboardAvoidingView>
   );

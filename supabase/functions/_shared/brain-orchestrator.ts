@@ -64,10 +64,16 @@ export async function runBrainTurn(opts: {
   const toolCalls: ToolCallRecord[] = [];
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const turn = await callModel(messages, systemPrompt, onTextDelta);
+    const buffered: string[] = [];
+    const turn = await callModel(
+      messages,
+      systemPrompt,
+      onTextDelta ? (delta) => void buffered.push(delta) : undefined,
+    );
     messages = [...messages, { role: 'assistant', content: turn.content }];
 
     if (turn.stop_reason !== 'tool_use') {
+      for (const delta of buffered) onTextDelta?.(delta);
       const reply = turn.content
         .filter((b) => b.type === 'text')
         .map((b) => b.text)
@@ -117,5 +123,6 @@ export async function runBrainTurn(opts: {
     messages = [...messages, { role: 'user', content: toolResults }];
   }
 
+  onTextDelta?.(STUCK_REPLY);
   return { reply: STUCK_REPLY, toolCalls, messages };
 }

@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Alert, Pressable, StyleSheet, Text, View } from "react-native";
+import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import Svg, { Path } from "react-native-svg";
 
@@ -85,7 +85,11 @@ export const ScreenHealthKit = ({ onNext, onBack }: ScreenHealthKitProps) => {
         <View style={styles.topBarSpacer} />
       </View>
 
-      <View style={styles.content}>
+      <ScrollView
+        style={styles.content}
+        contentContainerStyle={styles.contentInner}
+        showsVerticalScrollIndicator={false}
+      >
         <View style={styles.iconWrap}>
           <View style={styles.iconRing}>
             <Svg width={40} height={40} viewBox="0 0 40 40" fill="none">
@@ -118,7 +122,7 @@ export const ScreenHealthKit = ({ onNext, onBack }: ScreenHealthKitProps) => {
             </View>
           ))}
         </View>
-      </View>
+      </ScrollView>
 
       <View style={styles.cta}>
         <Pressable
@@ -157,8 +161,12 @@ const styles = StyleSheet.create({
 
   content: {
     flex: 1,
+  },
+
+  contentInner: {
     paddingHorizontal: 24,
     paddingTop: 42,
+    paddingBottom: 24,
   },
 
   iconWrap: {

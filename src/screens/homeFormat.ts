@@ -1,5 +1,15 @@
 import { colors } from '../constants/theme';
 
+export type TimeBand = 'Morning' | 'Afternoon' | 'Evening' | 'Night';
+
+export const getTimeBand = (hour: number): TimeBand => {
+  if (hour < 5) return 'Night';
+  if (hour < 12) return 'Morning';
+  if (hour < 18) return 'Afternoon';
+  if (hour < 22) return 'Evening';
+  return 'Night';
+};
+
 export interface MacroTarget {
   key: 'protein' | 'carbs' | 'fat' | 'calories';
   label: string;

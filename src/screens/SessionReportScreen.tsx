@@ -4,6 +4,8 @@ import * as Clipboard from "expo-clipboard";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import { useSessionReport } from "../hooks/useSessionReport";
+import { useUnitPrefs } from "../hooks/useUnitPrefs";
+import { kgToDisplayWeight, kgToDisplayWeightValue } from "../lib/units";
 import { formatDuration } from "../lib/sessionReport";
 import { useScreenInsets } from "../hooks/useScreenInsets";
 import { SessionChatThread } from "../components/session-chat/SessionChatThread";
@@ -15,7 +17,8 @@ type Props = NativeStackScreenProps<RootStackParamList, "SessionReport">;
 
 export function SessionReportScreen({ route, navigation }: Props) {
   const insets = useScreenInsets();
-  const { loading, error, report } = useSessionReport(route.params.workoutLogId);
+  const units = useUnitPrefs();
+  const { loading, error, report } = useSessionReport(route.params.workoutLogId, units);
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
   const [chatOpen, setChatOpen] = useState(false);
   const sessionMessages = route.params.sessionMessages ?? [];
@@ -105,7 +108,7 @@ export function SessionReportScreen({ route, navigation }: Props) {
                   <Text style={styles.coachAvatarText}>M</Text>
                 </View>
                 <View>
-                  <Text style={styles.coachName}>Muscle</Text>
+                  <Text style={styles.coachName}>MUSTLE</Text>
                   <Text style={[styles.sectionLabel, styles.debriefSectionLabel]}>Post-Session Debrief</Text>
                 </View>
               </View>
@@ -128,7 +131,7 @@ export function SessionReportScreen({ route, navigation }: Props) {
                   <>
                     <StatChip
                       label="Volume"
-                      value={`${report.volume.toLocaleString()} kg`}
+                      value={`${kgToDisplayWeightValue(report.volume, units).toLocaleString()} ${units === "metric" ? "kg" : "lb"}`}
                       delta={
                         report.volumeDeltaPct === null
                           ? "First session"
@@ -163,7 +166,7 @@ export function SessionReportScreen({ route, navigation }: Props) {
                         {row.tracked === "reported" && <Text style={styles.reportedMark}> · reported</Text>}
                       </Text>
                       <Text style={[styles.tableCell, styles.colSet, styles.tableCellMuted]}>{row.setNumber}</Text>
-                      <Text style={[styles.tableCell, styles.colValue]}>{row.weight !== null ? `${row.weight} kg` : "—"}</Text>
+                      <Text style={[styles.tableCell, styles.colValue]}>{row.weight !== null ? kgToDisplayWeight(row.weight, units) : "—"}</Text>
                       <Text style={[styles.tableCell, styles.colValue]}>{row.reps ?? "—"}</Text>
                     </View>
                   ))}
@@ -316,7 +319,9 @@ function ScoreBar({ label, value, max }: { label: string; value: number; max: nu
   const pct = Math.max(0, Math.min(100, (value / max) * 100));
   return (
     <View style={styles.scoreBarRow}>
-      <Text style={styles.scoreBarLabel}>{label}</Text>
+      <Text style={styles.scoreBarLabel} numberOfLines={1}>
+        {label}
+      </Text>
       <View style={styles.scoreBarTrack}>
         <View style={[styles.scoreBarFill, { width: `${pct}%` }]} />
       </View>
@@ -541,7 +546,7 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
   },
   scoreBarRow: { flexDirection: "row", alignItems: "center", gap: 10 },
-  scoreBarLabel: { width: 64, fontFamily: fonts.body, fontSize: 11.5, color: colors.muted },
+  scoreBarLabel: { width: 82, fontFamily: fonts.body, fontSize: 11.5, color: colors.muted },
   scoreBarTrack: { flex: 1, height: 5, borderRadius: 4, backgroundColor: colors.border, overflow: "hidden" },
   scoreBarFill: { height: "100%", borderRadius: 4, backgroundColor: colors.accent },
   scoreBarValue: { width: 32, textAlign: "right", fontFamily: fonts.mono, fontSize: 11, color: colors.text },
