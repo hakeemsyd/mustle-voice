@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../lib/supabase';
 import { callBrain } from '../lib/brain';
-import { resolveTodaySession, localDateKey } from '../lib/resolveTodaySession';
+import {
+  resolveTodaySession,
+  localDateKey,
+  isUnfinishedWorkout,
+  byMostRecentFinishedFirst,
+} from '../lib/resolveTodaySession';
 import { titleCase } from '../lib/textFormat';
 import { canonicalizeExerciseNames } from '../lib/exerciseCatalog';
 import { setCachedDisplayName } from '../lib/profileStore';
-import { isPlanPending, clearPlanPending } from '../lib/planStatus';
+import { startOfLocalDay } from '../lib/calendarDate';
 import { HOME_CACHE_KEY } from '../lib/localUserData';
 import { MACRO_META, getTimeBand, type MacroTarget } from '../screens/homeFormat';
 import { greetingIsFreshToday as isGreetingFreshToday } from '../lib/greetingFreshness';
@@ -21,6 +25,7 @@ export interface TodaySession {
   /** True only when the user explicitly chose today as a rest day (Switch Workout, or asking
    *  the coach) — distinct from hasSession:false as a byproduct of the plan's own rotation. */
   isRestDay?: boolean;
+  completedWorkout?: { workoutLogId: string; focus: string | null } | null;
 }
 
 export interface HomeData {
@@ -32,19 +37,12 @@ export interface HomeData {
   coachMessage: string;
   streakDays: number;
   loadError: string | null;
-  /** Onboarding finished but the coach hadn't actually generated a plan yet as of the last
-   *  check (see src/lib/planStatus.ts) — distinct from a user who genuinely has no plan for
-   *  some other reason, so Home can show an actionable "still setting up" state instead of the
-   *  generic empty one. */
-  planPending: boolean;
+  planStartsOn: string | null;
+  upcomingSession: { name: string; exerciseCountLabel: string } | null;
   refetch: () => void;
-  retryPlan: () => void;
 }
 
 const QUERY_TIMEOUT_MS = 12000;
-const PENDING_RETRY_DELAYS_MS = [
-  2000, 3000, 5000, 5000, 8000, 8000, 12000, 15000, 20000, 30000, 30000, 30000,
-];
 
 function timed<T>(label: string, work: PromiseLike<T>): Promise<T> {
   const started = Date.now();
@@ -99,7 +97,8 @@ function computeStreak(logTimestamps: string[], restDayKeys: Set<string>): numbe
   return streak;
 }
 
-const DEFAULT_COACH_MESSAGE_NO_PLAN = "Let's build your plan — tap the orb and tell me your goals.";
+const DEFAULT_COACH_MESSAGE_NO_PLAN =
+  "Let's finish setting up your plan — tap the orb and I'll ask a few quick questions.";
 const DEFAULT_COACH_MESSAGE_HAS_PLAN = 'Tap the orb any time to check in.';
 
 // A cold app launch has nothing to show yet, so it briefly renders "Loading your plan…" instead
@@ -107,7 +106,7 @@ const DEFAULT_COACH_MESSAGE_HAS_PLAN = 'Tap the orb any time to check in.';
 // lets a relaunch show real (if a few minutes stale) content immediately while the fresh fetch
 // runs quietly underneath; the plain loading state is now only ever seen on a genuine first-ever
 // launch, when there's truly nothing to show.
-type HomeDataCache = Omit<HomeData, 'loading' | 'loadError' | 'refetch' | 'retryPlan'>;
+type HomeDataCache = Omit<HomeData, 'loading' | 'loadError' | 'refetch'>;
 
 // Fired at most once per real day (see the freshness check below) — hidden so it never shows up
 // as a fake question in the visible chat transcript (see useHomeChat's query), but its reply
@@ -123,6 +122,7 @@ type HomeDataCache = Omit<HomeData, 'loading' | 'loadError' | 'refetch' | 'retry
 // entirely — there's no tool call, no history, and no other session for it to reach for instead.
 function buildGreetingPrompt(
   sessionToday: { focus: string | null; exerciseNames: string[] } | null,
+  completedToday: { focus: string | null } | null,
   nutrition: { caloriesLeft: number; proteinLeft: number } | null,
 ): string {
   const nutritionNote = nutrition
@@ -147,6 +147,17 @@ function buildGreetingPrompt(
     'without literally stating the clock time. Never ask for the time and never mention needing ' +
     'it — you have it.';
 
+  if (!sessionToday && completedToday) {
+    const named = completedToday.focus ? ` ("${completedToday.focus}")` : '';
+    return (
+      `Say hello for the first time today — not a reply to a question, and not generic small talk. They ` +
+      `already finished today's session${named}. It was logged today by the app's own local-day boundary, ` +
+      `even if the clock now reads late at night — call it today's session, never yesterday's. One short, ` +
+      `motivating line acknowledging that specifically — never call it a rest day, and don't offer or ` +
+      `describe a session as still due today.` +
+      `${nutritionNote}${questionNote}${timeNote}`
+    );
+  }
   if (!sessionToday) {
     return (
       "Say hello for the first time today — not a reply to a question, and not generic small talk. Today " +
@@ -186,6 +197,11 @@ const MISSING_INPUT = /\b(?:i (?:need|require|don'?t have|do not have|am missing
 const META_LEAK_PATTERNS = [
   MISSING_INPUT,
   /\b(?:in order )?to greet you (?:naturally|properly|appropriately)\b/i,
+  // A real greeting never calls itself one. Confirmed live on Home: "I can't give you a greeting
+  // right now — you just told me about 8/10 SI joint pain", which is the model narrating its own
+  // instruction back at the user instead of greeting them.
+  /\bgreeting\b/i,
+  /\b(?:can|could|will|would)(?:'|’)?t\s+(?:really\s+)?(?:give|offer|provide|do|say)\b/i,
   /\bas an ai\b/i,
   /\b(?:system|context) (?:note|block|prompt)\b/i,
   /\[system\b/i,
@@ -219,7 +235,7 @@ function sanitizeCoachMessage(raw: string): string {
 }
 
 export function useHomeData(): HomeData {
-  const [state, setState] = useState<Omit<HomeData, 'refetch' | 'retryPlan'>>({
+  const [state, setState] = useState<Omit<HomeData, 'refetch'>>({
     loading: true,
     userId: null,
     userName: null,
@@ -228,15 +244,11 @@ export function useHomeData(): HomeData {
     coachMessage: DEFAULT_COACH_MESSAGE_NO_PLAN,
     streakDays: 0,
     loadError: null,
-    planPending: false,
+    planStartsOn: null,
+    upcomingSession: null,
   });
   const [refetchSignal, setRefetchSignal] = useState(0);
   const refetch = useCallback(() => setRefetchSignal((n) => n + 1), []);
-  const pendingRetryCountRef = useRef(0);
-  const retryPlan = useCallback(() => {
-    pendingRetryCountRef.current = 0;
-    setRefetchSignal((n) => n + 1);
-  }, []);
 
   // Today's session, the greeting, and the nutrition window are all scoped to the user's local
   // day, so all three have to be re-read the moment that day turns over — not whenever the screen
@@ -247,16 +259,6 @@ export function useHomeData(): HomeData {
   // fabricated-not-corrupted duplicate greeting at worst, not the P0 class of bug.
   const greetingInFlightRef = useRef(false);
   const loadedFromNetworkRef = useRef(false);
-  const planPendingRef = useRef(false);
-  planPendingRef.current = state.planPending;
-
-  useEffect(() => {
-    const subscription = AppState.addEventListener('change', (appState) => {
-      if (appState !== 'active' || !planPendingRef.current) return;
-      retryPlan();
-    });
-    return () => subscription.remove();
-  }, [retryPlan]);
 
   // Runs once, in parallel with the real fetch below — an AsyncStorage read resolves in a few ms,
   // long before any network round-trip, so this reliably wins the race and replaces the plain
@@ -316,7 +318,7 @@ export function useHomeData(): HomeData {
           supabase
             .from('training_plan')
             .select(
-              'id, created_at, plan_session(id, day_order, weekday, focus, plan_exercise(id, ord, exercise:exercise_id(name)))',
+              'id, created_at, starts_on, plan_session(id, day_order, weekday, focus, plan_exercise(id, ord, exercise:exercise_id(name)))',
             )
             .eq('user_id', userId)
             .eq('status', 'active')
@@ -350,7 +352,7 @@ export function useHomeData(): HomeData {
           'workout',
           supabase
             .from('workout_log')
-            .select('at, plan_session_id, status')
+            .select('id, at, plan_session_id, status')
             .eq('user_id', userId)
             .order('at', { ascending: false })
             .limit(60),
@@ -385,6 +387,8 @@ export function useHomeData(): HomeData {
 
       const plan = planRes.data;
       const hasPlan = !!plan;
+      const planStartDate: string | null = plan?.starts_on ?? null;
+      const isBeforeStart = !!planStartDate && todayKey < planStartDate;
       // A one-off session the coach built for today (create_custom_session) replaces whatever the
       // plan says is due — including a rest day — so it's resolved here alongside the plan rather
       // than as a special case afterwards. It's also why `plan` alone no longer gates this block:
@@ -394,16 +398,31 @@ export function useHomeData(): HomeData {
         return (Array.isArray(row) ? row[0] : row) ?? null;
       })();
 
+      const completedLog = ((workoutRes.data ?? []) as any[])
+        .slice()
+        .sort(byMostRecentFinishedFirst)
+        .find((log) => !isUnfinishedWorkout(log.status) && localDateKey(new Date(log.at)) === todayKey);
+      const completedSession = completedLog?.plan_session_id
+        ? ((plan?.plan_session ?? []) as any[]).find((s) => s.id === completedLog.plan_session_id) ??
+          (overrideSession?.id === completedLog.plan_session_id ? overrideSession : undefined)
+        : undefined;
+      const completedWorkout = completedLog?.id
+        ? { workoutLogId: completedLog.id as string, focus: completedSession?.focus ?? null }
+        : null;
+
       let todaySession: TodaySession | null = null;
       let greetingSession: { focus: string | null; exerciseNames: string[] } | null = null;
       if (plan || overrideSession) {
-        const sessionToday = resolveTodaySession(
-          (plan?.plan_session ?? []) as any[],
-          (workoutRes.data ?? []) as any[],
-          new Date(),
-          restDayDates,
-          overrideSession,
-        );
+        const sessionToday = completedLog
+          ? null
+          : resolveTodaySession(
+              (plan?.plan_session ?? []) as any[],
+              (workoutRes.data ?? []) as any[],
+              new Date(),
+              restDayDates,
+              overrideSession,
+              planStartDate,
+            );
         todaySession = sessionToday
           ? {
               hasSession: true,
@@ -411,7 +430,7 @@ export function useHomeData(): HomeData {
               name: titleCase(sessionToday.focus) === '—' ? 'Training' : titleCase(sessionToday.focus),
               exerciseCountLabel: `${sessionToday.plan_exercise?.length ?? 0} exercises`,
             }
-          : { hasSession: false, isRestDay: restDayDates.has(todayKey) };
+          : { hasSession: false, isRestDay: !completedWorkout && restDayDates.has(todayKey), completedWorkout };
         greetingSession = sessionToday
           ? {
               // Humanized before it reaches the prompt, not just before it reaches a label. The
@@ -425,6 +444,8 @@ export function useHomeData(): HomeData {
                 .filter(Boolean),
             }
           : null;
+      } else if (completedWorkout) {
+        todaySession = { hasSession: false, isRestDay: false, completedWorkout };
       }
 
       const nutrition = nutritionRes.data;
@@ -460,7 +481,11 @@ export function useHomeData(): HomeData {
       // — Deadlift, Lat Pulldown, Seated Row, Face Pull" directly above a session chip reading
       // "LOWER, 4 exercises". A cached greeting with no key at all predates this column, so it is
       // treated as unverifiable and regenerated once rather than trusted.
-      const greetingKey = todaySession?.hasSession ? todaySession.planSessionId : 'rest';
+      const greetingKey = todaySession?.hasSession
+        ? todaySession.planSessionId
+        : todaySession?.completedWorkout
+          ? `done:${todaySession.completedWorkout.workoutLogId}`
+          : 'rest';
       const greetingIsFreshToday = isGreetingFreshToday({
         lastGreeting,
         greetingKey,
@@ -489,9 +514,14 @@ export function useHomeData(): HomeData {
                   proteinLeft: Math.max(0, proteinMacro.goal - proteinMacro.current),
                 }
               : null;
+          const completedTodayForGreeting = todaySession?.completedWorkout
+            ? {
+                focus: todaySession.completedWorkout.focus ? titleCase(todaySession.completedWorkout.focus) : null,
+              }
+            : null;
           const generated = await callBrain({
             userId,
-            message: buildGreetingPrompt(greetingSession, nutritionForGreeting),
+            message: buildGreetingPrompt(greetingSession, completedTodayForGreeting, nutritionForGreeting),
             hidden: true,
             isDailyGreeting: true,
             greetingKey,
@@ -516,24 +546,31 @@ export function useHomeData(): HomeData {
       if (!profileRes.error) setCachedDisplayName(userId, userName);
       const loadError = planRes.error ? "Couldn't load your plan." : null;
 
-      let planPending = false;
-      if (hasPlan) {
-        clearPlanPending(userId);
-        pendingRetryCountRef.current = 0;
-      } else {
-        planPending = await isPlanPending(userId);
-        const delay = PENDING_RETRY_DELAYS_MS[pendingRetryCountRef.current];
-        if (planPending && delay !== undefined) {
-          pendingRetryCountRef.current += 1;
-          setTimeout(() => {
-            if (!cancelled) refetch();
-          }, delay);
-        }
-      }
+      const upcomingSession =
+        isBeforeStart && planStartDate
+          ? resolveTodaySession((plan?.plan_session ?? []) as any[], [], startOfLocalDay(planStartDate))
+          : null;
+
       if (cancelled) return;
 
       loadedFromNetworkRef.current = true;
-      const next = { loading: false, userId, userName, macros, todaySession, coachMessage, streakDays, loadError, planPending };
+      const next = {
+        loading: false,
+        userId,
+        userName,
+        macros,
+        todaySession,
+        coachMessage,
+        streakDays,
+        loadError,
+        planStartsOn: isBeforeStart ? planStartDate : null,
+        upcomingSession: upcomingSession
+          ? {
+              name: titleCase(upcomingSession.focus) === '—' ? 'Training' : titleCase(upcomingSession.focus),
+              exerciseCountLabel: `${upcomingSession.plan_exercise?.length ?? 0} exercises`,
+            }
+          : null,
+      };
       setState(next);
       if (!loadError) {
         const { loading: _loading, loadError: _loadError, ...cacheable } = next;
@@ -548,5 +585,5 @@ export function useHomeData(): HomeData {
     };
   }, [refetchSignal]);
 
-  return { ...state, refetch, retryPlan };
+  return { ...state, refetch };
 }

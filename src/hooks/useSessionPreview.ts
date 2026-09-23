@@ -16,8 +16,10 @@ export interface SessionPreview {
   exercises: SessionExercise[];
   /** Most recent run of this same plan session, for the "Last time" comparison — real history,
    *  not a placeholder. When status is "partial", this is also what the Continue Session path
-   *  resumes from (see ActiveSessionContext.start's resumeExercisesDone param). */
-  lastTime: { at: string; status: 'completed' | 'partial'; exercises: LoggedExercise[] } | null;
+   *  resumes from (see ActiveSessionContext.start's resumeExercisesDone param), and `id` is what
+   *  Restart Instead deletes — choosing to restart is an explicit "discard this attempt", so the
+   *  partial row it was offered from must not survive as accepted history once declined. */
+  lastTime: { id: string; at: string; status: 'completed' | 'partial'; exercises: LoggedExercise[] } | null;
 }
 
 interface PlanExerciseRow {
@@ -66,7 +68,7 @@ export function useSessionPreview(planSessionId: string): SessionPreview {
           .maybeSingle(),
         supabase
           .from('workout_log')
-          .select('at, status, exercises_done')
+          .select('id, at, status, exercises_done')
           .eq('user_id', userId)
           .eq('plan_session_id', planSessionId)
           .order('at', { ascending: false })
@@ -92,6 +94,7 @@ export function useSessionPreview(planSessionId: string): SessionPreview {
       const lastRow = logRes.data;
       const lastTime = lastRow
         ? {
+            id: lastRow.id as string,
             at: lastRow.at as string,
             status: (lastRow.status ?? 'completed') as 'completed' | 'partial',
             exercises: (lastRow.exercises_done ?? []) as LoggedExercise[],

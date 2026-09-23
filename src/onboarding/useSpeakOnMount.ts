@@ -19,7 +19,9 @@ const PLAYBACK_RETRY_DELAY_MS = 350;
 export const useSpeakOnMount = (text: string, enabled: boolean = true) => {
   const [audioDone, setAudioDone] = useState(!enabled);
   const [audioStarted, setAudioStarted] = useState(!enabled);
-  const player = useAudioPlayer(null);
+  // Without this, expo-audio deactivates the shared audio session 100ms after playback ends —
+  // a check that only counts active players, never recorders — killing the recording that follows.
+  const player = useAudioPlayer(null, { keepAudioSessionActive: true });
   const status = useAudioPlayerStatus(player);
 
   useEffect(() => {
@@ -78,6 +80,11 @@ export const useSpeakOnMount = (text: string, enabled: boolean = true) => {
 
   useEffect(() => {
     if (status.didJustFinish) {
+      try {
+        player.pause();
+      } catch (err) {
+        console.warn("[onboarding voice] could not pause finished player:", err);
+      }
       setAudioDone(true);
     }
   }, [status.didJustFinish]);

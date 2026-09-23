@@ -61,7 +61,7 @@ export function SessionReportScreen({ route, navigation }: Props) {
           )}
           {report?.isPartial && (
             <View style={styles.partialTag}>
-              <Text style={styles.partialTagText}>PARTIAL SESSION</Text>
+              <Text style={styles.partialTagText}>PARTIALLY COMPLETED</Text>
             </View>
           )}
         </View>

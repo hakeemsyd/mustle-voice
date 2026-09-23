@@ -29,6 +29,7 @@ import { chooseRestDay } from "../lib/restDay";
 import { titleCase } from "../lib/textFormat";
 import { callBrain, COACH_UNREACHABLE_MESSAGE } from "../lib/brain";
 import { supabase } from "../lib/supabase";
+import { dispatchQuery } from "../lib/dispatchQuery";
 import { kgToDisplayWeight, type Units } from "../lib/units";
 import { useUnitPrefsState } from "../hooks/useUnitPrefs";
 import { convertLoadScheme } from "../lib/loadScheme";
@@ -135,7 +136,10 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
 
   useEffect(() => {
     if (session.target || !session.userId) return;
-    void supabase.from("live_session_state").delete().eq("user_id", session.userId);
+    dispatchQuery(
+      supabase.from("live_session_state").delete().eq("user_id", session.userId),
+      "live-state clear (preview)",
+    );
   }, [session.target, session.userId]);
 
   useEffect(() => {
@@ -286,7 +290,20 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
       startSession({ type: "strength", planSessionId }, canResume);
     } else if (label === "Restart Instead") {
       appendMessage("user", label);
+      const discardedId = lastTime?.id;
       startSession({ type: "strength", planSessionId }, false);
+      if (discardedId) {
+        supabase
+          .from("workout_log")
+          .delete()
+          .eq("id", discardedId)
+          .then(({ error }) => {
+            if (error) console.error("[preview] failed to discard interrupted session:", error.message, discardedId);
+            else console.log("[preview] discarded interrupted session:", discardedId);
+          });
+      } else {
+        console.warn("[preview] Restart Instead had no lastTime.id to discard");
+      }
     } else if (label === "Manage Workout") {
       appendMessage("user", label);
       appendMessage("coach", "Would you like to change an exercise, add one, or swap the entire workout?");

@@ -27,17 +27,27 @@ const toKg = (value: number, statedUnit: string | null, units: Units): number =>
   return isPounds ? Math.round(value * 0.453592 * 10) / 10 : value;
 };
 
-export function parseSetReport(raw: string, units: Units = 'metric'): ParsedSet | null {
+export interface ParseSetOptions {
+  allowPositional?: boolean;
+  timedExercise?: boolean;
+}
+
+export function parseSetReport(
+  raw: string,
+  units: Units = 'metric',
+  options: ParseSetOptions = {},
+): ParsedSet | null {
   const normalized = normalizeSpokenNumbers(raw);
 
-  // Isometric/timed exercises (Plank, holds) report a duration, not a rep count — confirmed
-  // live: "I held it for 52 seconds" matched nothing below and silently fell through to a
-  // plain conversational reply. The held seconds fills the same `reps` slot the rest of the
-  // app already reads for "how much of the target did they do" — bodyweight, no weight.
-  const durationMatch = normalized.match(/(\d+)\s*(?:sec|secs|second|seconds)\b/i);
-  if (durationMatch) {
-    const reps = Math.round(Number(durationMatch[1]));
-    return reps > 0 ? { weight: null, reps, unit: 'seconds' } : null;
+  if (options.timedExercise) {
+    const durationMatch = normalized.match(
+      /(\d+(?:\.\d+)?)\s*(?:sec|secs|second|seconds|min|mins|minute|minutes)\b/i,
+    );
+    if (durationMatch) {
+      const isMinutes = /min/i.test(durationMatch[0]);
+      const reps = Math.round(Number(durationMatch[1]) * (isMinutes ? 60 : 1));
+      return reps > 0 ? { weight: null, reps, unit: 'seconds' } : null;
+    }
   }
 
   const weightMatch = normalized.match(/(\d+(?:\.\d+)?)\s*(kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?)\b/i);
@@ -68,6 +78,8 @@ export function parseSetReport(raw: string, units: Units = 'metric'): ParsedSet 
   // give me 2 minutes") get misread as a phantom set. Anchoring the whole trimmed string means
   // any other words fail this fallback and go to the coach instead — the false-negative cost (a
   // wordier terse report going to chat) is far cheaper than a fabricated set.
+  if (options.allowPositional === false) return null;
+
   const positional = normalized.trim().match(
     /^(\d+(?:\.\d+)?)\s*(?:,|for|x|by)?\s*(\d+)\s*(?:reps?|times|each)?\.?$/i,
   );
@@ -90,7 +102,11 @@ export function parseStatedWeight(raw: string, units: Units = 'metric'): number 
 }
 
 export function describeParsedSet(parsed: ParsedSet, units: Units = 'metric'): string {
-  if (parsed.unit === 'seconds') return `${parsed.reps}s held`;
+  if (parsed.unit === 'seconds') {
+    return parsed.reps >= 60 && parsed.reps % 60 === 0
+      ? `${parsed.reps / 60} min`
+      : `${parsed.reps}s held`;
+  }
   return parsed.weight === null
     ? `${parsed.reps} reps · bodyweight`
     : `${kgToDisplayWeight(parsed.weight, units)} × ${parsed.reps} reps`;
@@ -99,8 +115,12 @@ export function describeParsedSet(parsed: ParsedSet, units: Units = 'metric'): s
 // Distinguishes "I did a set" from "hey coach, question" — the same split the design
 // makes, so one field serves both without a mode toggle. Anything with a unit/rep
 // keyword or a completion word is a report; everything else goes to the coach.
-export function looksLikeSetReport(raw: string, units: Units = 'metric'): boolean {
-  if (parseSetReport(raw, units) !== null) return true;
+export function looksLikeSetReport(
+  raw: string,
+  units: Units = 'metric',
+  options: ParseSetOptions = {},
+): boolean {
+  if (parseSetReport(raw, units, options) !== null) return true;
   return /\b(done|complete|completed|finished)\b/i.test(raw);
 }
 

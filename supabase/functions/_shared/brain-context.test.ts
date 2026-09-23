@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveTodaySession, startOfLocalDayUtc } from './brain-context.ts';
+import { describeUserName, resolveTodaySession, startOfLocalDayUtc } from './brain-context.ts';
 
 const session = (id: string, day_order: number, weekday: number | null, focus = id) => ({
   id,
@@ -77,4 +77,26 @@ test('yesterday is still excluded once the timezone is applied', () => {
   const dayStart = startOfLocalDayUtc('America/New_York', EVENING_IN_NEW_YORK).getTime();
   const lastNight = new Date('2026-09-18T01:00:00Z').getTime();
   assert.ok(lastNight < dayStart);
+});
+
+test('a stored name is handed to the coach every turn, with an explicit ban on asking for it', () => {
+  const line = describeUserName('Damion');
+  assert.ok(line.includes('Damion'));
+  assert.ok(/never ask what to call them/.test(line));
+});
+
+test('a blank or whitespace-only name is treated as no name, not as a name', () => {
+  for (const value of [null, undefined, '', '   ']) {
+    assert.ok(describeUserName(value).startsWith('No name on file'));
+  }
+});
+
+test('with no name the coach is told to ask once and then persist it', () => {
+  assert.ok(/update_profile/.test(describeUserName(null)));
+});
+
+test('a transcription artifact stored as a name is never read back as one', () => {
+  for (const junk of ['[background Noise]', '[szum]', '(inaudible)', 'test']) {
+    assert.ok(describeUserName(junk).startsWith('No name on file'), junk);
+  }
 });

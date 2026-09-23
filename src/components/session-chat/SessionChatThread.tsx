@@ -5,6 +5,7 @@ import { colors, fonts } from "../../constants/theme";
 import { MMark } from "../../icons/MMark";
 import { ArrowRightIcon } from "../../icons/ArrowRightIcon";
 import { CoachMessageText } from "../CoachMessageText";
+import { useKeyboardOpen } from "../../hooks/useKeyboardOpen";
 
 export interface SessionChatMessage {
   id: string;
@@ -33,10 +34,12 @@ export function SessionChatThread({ messages, typing = false, footer }: SessionC
   // every render, which would re-arm this timer on every keystroke.
   const hasFooter = footer != null;
 
+  const keyboardOpen = useKeyboardOpen();
+
   useEffect(() => {
     const timer = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 80);
     return () => clearTimeout(timer);
-  }, [messages.length, typing, hasFooter]);
+  }, [messages.length, typing, hasFooter, keyboardOpen]);
 
   return (
     <View style={styles.stage}>

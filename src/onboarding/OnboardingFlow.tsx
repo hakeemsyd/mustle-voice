@@ -21,9 +21,7 @@ import { ScreenSummary } from "./screens/ScreenSummary";
 import { ScreenLoading } from "./screens/ScreenLoading";
 import { syncOnboarding } from "../lib/onboardingSync";
 import { callBrain } from "../lib/brain";
-import { markPlanPending, clearPlanPending } from "../lib/planStatus";
 import { getPendingEmailConfirmation } from "../lib/pendingEmailConfirmation";
-import { supabase } from "../lib/supabase";
 import { prefetchSpeech } from "../lib/elevenLabsVoice";
 import { STATIC_ONBOARDING_PROMPTS, historyPrompt } from "./prompts";
 
@@ -63,13 +61,7 @@ export const OnboardingFlow = ({ userId, onComplete, skipSplash = false }: Onboa
     });
   }, []);
 
-  // Plan generation (~15s per audit) is far slower than ScreenLoading's fixed animation
-  // (5.8s) — without this, onboarding routinely hands off to Home before the plan exists,
-  // and Home has no way to know one is still coming. ScreenLoading waits on this instead.
-  const planReadyRef = useRef<Promise<void> | null>(null);
-  // Bumped after a retry re-assigns planReadyRef.current to a fresh promise — planReadyRef is a
-  // plain ref, so mutating it alone doesn't re-render; this forces one so ScreenLoading receives
-  // the new promise as a fresh prop.
+  const consultationReadyRef = useRef<Promise<void> | null>(null);
   const [, setPlanAttempt] = useState(0);
 
   useEffect(() => {
@@ -98,55 +90,33 @@ export const OnboardingFlow = ({ userId, onComplete, skipSplash = false }: Onboa
 
   // Resolves once the plan-generation call has genuinely settled — rejects only on a real
   // failure (network/tool error), so ScreenLoading can tell that apart from a
-  // slow-but-still-running call. A successful call doesn't guarantee the model actually called
-  // generate_training_plan (it might ask a clarifying question or just reply conversationally
-  // instead), so this verifies a plan row actually exists before treating it as done — Home
-  // reads the pending flag to show an actionable state instead of the generic empty one.
-  //
-  // hidden:true (not false) — this reply is deliberately routed through the SAME "daily
-  // greeting" channel useHomeData.ts already reads and shows prominently on Home, rather than
-  // sitting as a real chat message a new user would have no reason to go looking for. Previously
-  // this was hidden:false: the coach's actual explanation of why this plan/split/targets were
-  // chosen was technically visible in the chat transcript, but nothing surfaced it — Home's own
-  // greeting caption came from a separate, later synthetic call, so a new user landed on Home
-  // seeing only a generic workout command with the real "why" buried in a transcript they had no
-  // reason to open. Marking it hidden:true makes it the exact message useHomeData's greeting
-  // query picks up as the first thing shown, with no new screen needed.
-  const runPlanGeneration = () => {
+  const startConsultation = () => {
     if (!userId) {
       console.warn("[onboarding] no session — skipping sync");
       return;
     }
-    planReadyRef.current = syncOnboarding(userId, state)
+    consultationReadyRef.current = syncOnboarding(userId, state)
       .then(() =>
         callBrain({
           userId,
           message:
-            "I just finished onboarding — please set up my training plan and nutrition targets from what you know about me, and briefly explain why you chose this split and these targets.",
+            "I just finished onboarding — let's set up my training plan. Ask me anything you still " +
+            "need to know first, using what you already know about me from onboarding so I don't have " +
+            "to repeat myself.",
           hidden: true,
-          isOnboarding: true,
-          timeoutMs: 45000,
+          hideReply: false,
+          timeoutMs: 20000,
         }),
       )
-      .then(async () => {
-        const { data } = await supabase
-          .from('training_plan')
-          .select('id')
-          .eq('user_id', userId)
-          .eq('status', 'active')
-          .maybeSingle();
-        if (data) await clearPlanPending(userId);
-        else await markPlanPending(userId);
-      })
+      .then(() => undefined)
       .catch((err) => {
-        console.error("[onboarding] sync/plan generation failed:", err);
-        markPlanPending(userId);
+        console.error("[onboarding] sync/consultation opening failed:", err);
         throw err;
       });
   };
 
-  const retryPlanGeneration = () => {
-    runPlanGeneration();
+  const retryConsultationStart = () => {
+    startConsultation();
     setPlanAttempt((n) => n + 1);
   };
 
@@ -154,7 +124,7 @@ export const OnboardingFlow = ({ userId, onComplete, skipSplash = false }: Onboa
   // Creation existed as its own step; unchanged otherwise.
   const finishOnboarding = () => {
     complete();
-    runPlanGeneration();
+    startConsultation();
     goNext();
   };
 
@@ -338,12 +308,12 @@ export const OnboardingFlow = ({ userId, onComplete, skipSplash = false }: Onboa
     case 13:
       return (
         <ScreenLoading
-          readyPromise={planReadyRef.current}
+          readyPromise={consultationReadyRef.current}
           onComplete={() => {
             clearDraft();
             onComplete();
           }}
-          onRetry={retryPlanGeneration}
+          onRetry={retryConsultationStart}
         />
       );
 

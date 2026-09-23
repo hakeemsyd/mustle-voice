@@ -138,30 +138,42 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
             <View style={styles.todayWrap}>
               {(() => {
                 const completed = today.completedWorkout;
+                const isUpcoming = !completed && !!today.planStartsOn;
+                const noPlan = !today.hasPlan && !completed;
                 // "Rest day" and "already trained today" are both `!today.session`, but they are
                 // not the same thing — confirmed live, finishing today's only session showed as
                 // a bare Rest Day because this distinction didn't exist. `completed` takes
                 // priority: a pinned-weekday plan still reports its session as due even once
                 // it's done, and a done session should never look identical to "not started."
-                const heroActive = !!completed || !today.isRestDay;
+                const heroActive = !noPlan && (!!completed || isUpcoming || !today.isRestDay);
                 const heroLabel = completed
                   ? completed.focus
                     ? titleCase(completed.focus)
                     : "Workout Complete"
-                  : today.isRestDay
-                    ? "Rest Day"
-                    : titleCase(today.session!.focus);
+                  : noPlan
+                    ? "No Plan Yet"
+                    : isUpcoming
+                      ? `Plan Starts ${startOfLocalDay(today.planStartsOn!).toLocaleDateString("en-US", { weekday: "long" })}`
+                      : today.isRestDay
+                        ? "Rest Day"
+                        : titleCase(today.session!.focus);
 
                 return (
                   <>
                     <View style={[styles.todayHero, heroActive ? styles.todayHeroActive : styles.todayHeroRest]}>
                       <View style={styles.todayHeroTop}>
                         <Text style={[styles.todayEyebrow, heroActive && styles.todayEyebrowActive]}>
-                          {new Date().toLocaleDateString("en-US", { weekday: "long" })} · Today
+                          {noPlan
+                            ? "GET STARTED"
+                            : isUpcoming
+                              ? "UPCOMING"
+                              : `${new Date().toLocaleDateString("en-US", { weekday: "long" })} · Today`}
                         </Text>
                         <View style={[styles.todayIconBadge, heroActive && styles.todayIconBadgeActive]}>
                           {completed ? (
                             <CheckCircleIcon size={18} color={colors.accent} />
+                          ) : isUpcoming ? (
+                            <CalendarIcon size={18} color={colors.accent} />
                           ) : today.isRestDay ? (
                             <MoonIcon size={18} color={colors.accent} />
                           ) : (
@@ -171,10 +183,13 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                       </View>
                       <Text style={[styles.todayTitle, heroActive && styles.todayTitleActive]}>{heroLabel}</Text>
                       <Text style={[styles.todayDate, heroActive && styles.todayDateActive]}>
-                        {new Date().toLocaleDateString("en-US", { month: "long", day: "numeric" })}
+                        {(isUpcoming
+                          ? startOfLocalDay(today.planStartsOn!)
+                          : new Date()
+                        ).toLocaleDateString("en-US", { month: "long", day: "numeric" })}
                       </Text>
 
-                      {!today.isRestDay && !completed && (
+                      {!today.isRestDay && !completed && !isUpcoming && (
                         <View style={[styles.todayStatsRow, styles.todayStatsRowActive]}>
                           <View style={styles.todayStat}>
                             <Text style={[styles.todayStatValue, styles.todayStatValueActive]}>
@@ -191,7 +206,9 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                           </View>
                           <View style={[styles.todayStatDivider, styles.todayStatDividerActive]} />
                           <View style={styles.todayStat}>
-                            <Text style={[styles.todayStatValue, styles.todayStatValueActive]}>Strength</Text>
+                            <Text style={[styles.todayStatValue, styles.todayStatValueActive]}>
+                              {titleCase(today.session!.sessionType)}
+                            </Text>
                             <Text style={[styles.todayStatLabel, styles.todayStatLabelActive]}>Type</Text>
                           </View>
                         </View>
@@ -222,6 +239,34 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                         <ChevronRightIcon size={13} color={colors.accentOn} />
                         <Text style={styles.startBtnText}>View Session Summary</Text>
                       </Pressable>
+                    ) : isUpcoming && today.upcomingSession ? (
+                      <View style={styles.todaySection}>
+                        <View style={styles.todaySectionHeader}>
+                          <DumbbellIcon size={13} color={colors.muted} />
+                          <Text style={styles.todaySectionLabel}>Workout</Text>
+                        </View>
+                        <View style={styles.exerciseList}>
+                          {today.upcomingSession.exercises.map((ex, i) => (
+                            <View key={ex.name + i} style={styles.exerciseRow}>
+                              <Text style={styles.exerciseIndex}>{String(i + 1).padStart(2, "0")}</Text>
+                              <View style={styles.exerciseMain}>
+                                <Text style={styles.exerciseName}>{ex.name}</Text>
+                                <View style={styles.exerciseRestRow}>
+                                  <TimerIcon size={10.5} color={colors.muted} />
+                                  <Text style={styles.exerciseRest}>{formatRestSeconds(estimateRestSeconds(ex.repScheme))}</Text>
+                                </View>
+                              </View>
+                              <Text style={styles.exerciseSets}>
+                                {ex.sets ?? "—"} × {ex.repScheme ?? "—"}
+                              </Text>
+                            </View>
+                          ))}
+                        </View>
+                      </View>
+                    ) : noPlan ? (
+                      <Text style={styles.restCopy}>
+                        Talk to your coach to set up your plan — a few quick questions and you're training.
+                      </Text>
                     ) : today.isRestDay ? (
                       <Text style={styles.restCopy}>Focus on recovery today — your next session hits harder for it.</Text>
                     ) : (

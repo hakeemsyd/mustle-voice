@@ -11,6 +11,10 @@
 export interface SplitSessionInput {
   day_order: number;
   focus: string;
+  /** Present on a pinned plan (0=Sun..6=Sat). When every session has one, adjacency is judged by
+   *  the calendar rather than by day_order — Mon/Wed/Fri are positions 1,2,3 in the rotation but
+   *  are not consecutive days, and treating them as such rejected an ordinary M/W/F split. */
+  weekday?: number | null;
 }
 
 export interface SplitProblem {
@@ -48,8 +52,21 @@ const patternOf = (focus: string): string => {
  *     a pattern that simply isn't in the plan at all is not compared (a dedicated upper-body block
  *     is a legitimate choice, and this must not force legs into one).
  */
+const isPinned = (sessions: SplitSessionInput[]): boolean =>
+  sessions.every((s) => typeof s.weekday === 'number' && s.weekday >= 0 && s.weekday <= 6);
+
+/** Whether two sessions land on genuinely consecutive calendar days. */
+const areAdjacentDays = (a: SplitSessionInput, b: SplitSessionInput, pinned: boolean): boolean => {
+  if (!pinned) return true;
+  const gap = (((b.weekday as number) - (a.weekday as number)) % 7 + 7) % 7;
+  return gap === 1;
+};
+
 export function validateSplit(sessions: SplitSessionInput[]): SplitProblem[] {
-  const ordered = sessions.slice().sort((a, b) => a.day_order - b.day_order);
+  const pinned = isPinned(sessions);
+  const ordered = sessions
+    .slice()
+    .sort((a, b) => (pinned ? (a.weekday as number) - (b.weekday as number) : a.day_order - b.day_order));
   if (ordered.length < 2) return [];
 
   const problems: SplitProblem[] = [];
@@ -68,7 +85,7 @@ export function validateSplit(sessions: SplitSessionInput[]): SplitProblem[] {
     if (isWrap && ordered.length === 2) break;
     const current = ordered[i];
     const next = ordered[(i + 1) % ordered.length];
-    if (normalizeFocus(current.focus) === normalizeFocus(next.focus)) {
+    if (normalizeFocus(current.focus) === normalizeFocus(next.focus) && areAdjacentDays(current, next, pinned)) {
       problems.push({
         kind: 'adjacent_duplicate',
         detail:

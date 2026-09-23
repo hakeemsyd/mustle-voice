@@ -139,7 +139,10 @@ export const MicKeyboardVoiceInput = ({
     startRecording((reason: StopReason) => {
       if (stopHandledRef.current) return;
       stopHandledRef.current = true;
-      if (reason === "no-speech") {
+      // "no-signal" means the input read silence even after useVoiceRecorder reclaimed the audio
+      // session and retried — transcribing that would just return nothing and leave this control
+      // sitting there with no answer and no visible reason, so hand them the keyboard instead.
+      if (reason === "no-speech" || reason === "no-signal") {
         stopRecording().catch(() => null);
         setListening(false);
         setMode("keyboard");

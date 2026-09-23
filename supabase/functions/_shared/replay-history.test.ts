@@ -84,10 +84,7 @@ test('oversized read_state results are capped, mutation results are left intact'
 
 test('empty and whitespace-only rows are dropped (the model rejects empty content)', () => {
   const out = replayHistory([userRow('hi'), { role: 'assistant', content: '   ', blocks: null }, userRow('still there')]);
-  assert.deepEqual(out, [
-    { role: 'user', content: 'hi' },
-    { role: 'user', content: 'still there' },
-  ]);
+  assert.deepEqual(out, [{ role: 'user', content: 'hi\nstill there' }]);
 });
 
 test('rows written before the blocks column existed still replay as plain text', () => {
@@ -113,4 +110,27 @@ test('a multi-round tool turn replays all rounds in order', () => {
   const out = replayHistory([userRow('my knee hurts'), twoRounds]);
   assert.equal(out.length, 6);
   assert.ok(JSON.stringify(out).includes('rejected: knee'), 'the validator rejection stays visible');
+});
+
+test('a user turn whose reply never landed is merged into the next one, not left adjacent', () => {
+  const replayed = replayHistory([
+    { role: 'user', content: 'Arms day: incline curls 40s x4' },
+    { role: 'assistant', content: 'What rep target do you want?' },
+    { role: 'user', content: '8 to 10 on all of them' },
+    { role: 'user', content: 'did you get that?' },
+  ]);
+  assert.deepEqual(replayed, [
+    { role: 'user', content: 'Arms day: incline curls 40s x4' },
+    { role: 'assistant', content: 'What rep target do you want?' },
+    { role: 'user', content: '8 to 10 on all of them\ndid you get that?' },
+  ]);
+});
+
+test('ordinary alternating history is untouched by the coalescing', () => {
+  const rows = [
+    { role: 'user', content: 'hey' },
+    { role: 'assistant', content: 'hi' },
+    { role: 'user', content: 'what is due today?' },
+  ];
+  assert.deepEqual(replayHistory(rows), rows);
 });

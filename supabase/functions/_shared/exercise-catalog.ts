@@ -66,6 +66,55 @@ export const EXERCISE_CATALOG: CatalogExercise[] = [
   { name: 'Plank',       movementPattern: 'core', primaryMuscles: ['core'], contraindicatedFor: [] },
   { name: 'Dead Bug',    movementPattern: 'core', primaryMuscles: ['core'], contraindicatedFor: [] },
   { name: 'Hanging Knee Raise', movementPattern: 'core', primaryMuscles: ['core'], contraindicatedFor: [] },
+  { name: 'Incline Dumbbell Curl', movementPattern: 'isolation', primaryMuscles: ['biceps'], contraindicatedFor: ['deep_elbow_flexion_loaded'] },
+  { name: 'Preacher Curl',         movementPattern: 'isolation', primaryMuscles: ['biceps'], contraindicatedFor: ['deep_elbow_flexion_loaded'] },
+  { name: 'Cable Curl',            movementPattern: 'isolation', primaryMuscles: ['biceps'], contraindicatedFor: ['deep_elbow_flexion_loaded'] },
+  { name: 'Concentration Curl',    movementPattern: 'isolation', primaryMuscles: ['biceps'], contraindicatedFor: ['deep_elbow_flexion_loaded'] },
+  { name: 'Reverse Curl',          movementPattern: 'isolation', primaryMuscles: ['biceps', 'forearms'], contraindicatedFor: ['deep_elbow_flexion_loaded', 'loaded_wrist_extension'] },
+  { name: 'Tricep Kickback',       movementPattern: 'isolation', primaryMuscles: ['triceps'], contraindicatedFor: ['loaded_elbow_extension'] },
+  { name: 'Skull Crusher',         movementPattern: 'isolation', primaryMuscles: ['triceps'], contraindicatedFor: ['loaded_elbow_extension'] },
+  { name: 'Close-Grip Bench Press',movementPattern: 'push',      primaryMuscles: ['triceps', 'chest'], contraindicatedFor: ['heavy_horizontal_press', 'loaded_elbow_extension'] },
+  { name: 'Dumbbell Bench Press',  movementPattern: 'push', primaryMuscles: ['chest'], contraindicatedFor: ['heavy_horizontal_press'] },
+  { name: 'Incline Barbell Press', movementPattern: 'push', primaryMuscles: ['chest', 'shoulders'], contraindicatedFor: ['heavy_horizontal_press'] },
+  { name: 'Chest Fly',             movementPattern: 'isolation', primaryMuscles: ['chest'], contraindicatedFor: ['heavy_horizontal_press'] },
+  { name: 'Cable Crossover',       movementPattern: 'isolation', primaryMuscles: ['chest'], contraindicatedFor: ['heavy_horizontal_press'] },
+  { name: 'Dumbbell Shoulder Press', movementPattern: 'push', primaryMuscles: ['shoulders'], contraindicatedFor: ['overhead_press'] },
+  { name: 'Arnold Press',            movementPattern: 'push', primaryMuscles: ['shoulders'], contraindicatedFor: ['overhead_press'] },
+  { name: 'Front Raise',             movementPattern: 'isolation', primaryMuscles: ['shoulders'], contraindicatedFor: [] },
+  { name: 'Rear Delt Fly',           movementPattern: 'isolation', primaryMuscles: ['rear_delts'], contraindicatedFor: [] },
+  { name: 'Upright Row',             movementPattern: 'pull', primaryMuscles: ['shoulders', 'traps'], contraindicatedFor: ['overhead_press'] },
+  { name: 'Shrug',                   movementPattern: 'isolation', primaryMuscles: ['traps'], contraindicatedFor: [] },
+  { name: 'Barbell Row',          movementPattern: 'pull', primaryMuscles: ['back', 'lats'], contraindicatedFor: ['loaded_spinal_flexion'] },
+  { name: 'T-Bar Row',            movementPattern: 'pull', primaryMuscles: ['back', 'lats'], contraindicatedFor: ['loaded_spinal_flexion'] },
+  { name: 'Chest-Supported Row',  movementPattern: 'pull', primaryMuscles: ['back'], contraindicatedFor: [] },
+  { name: 'Chin-up',              movementPattern: 'pull', primaryMuscles: ['lats', 'biceps'], contraindicatedFor: ['deep_elbow_flexion_loaded'] },
+  { name: 'Straight-Arm Pulldown',movementPattern: 'isolation', primaryMuscles: ['lats'], contraindicatedFor: [] },
+  { name: 'Goblet Squat',           movementPattern: 'squat', primaryMuscles: ['quads', 'glutes'], contraindicatedFor: ['deep_knee_flexion_loaded'] },
+  { name: 'Hack Squat',             movementPattern: 'squat', primaryMuscles: ['quads'], contraindicatedFor: ['deep_knee_flexion_loaded', 'heavy_axial_load'] },
+  { name: 'Bulgarian Split Squat',  movementPattern: 'squat', primaryMuscles: ['quads', 'glutes'], contraindicatedFor: ['deep_knee_flexion_loaded'] },
+  { name: 'Walking Lunge',          movementPattern: 'squat', primaryMuscles: ['quads', 'glutes'], contraindicatedFor: ['deep_knee_flexion_loaded'] },
+  { name: 'Step-up',                movementPattern: 'squat', primaryMuscles: ['quads', 'glutes'], contraindicatedFor: ['deep_knee_flexion_loaded'] },
+  { name: 'Sumo Deadlift',              movementPattern: 'hinge', primaryMuscles: ['glutes', 'hamstrings'], contraindicatedFor: ['heavy_axial_load', 'loaded_spinal_flexion', 'deep_hip_flexion_loaded'] },
+  { name: 'Trap Bar Deadlift',          movementPattern: 'hinge', primaryMuscles: ['glutes', 'quads', 'back'], contraindicatedFor: ['heavy_axial_load'] },
+  { name: 'Single-Leg Romanian Deadlift', movementPattern: 'hinge', primaryMuscles: ['hamstrings', 'glutes'], contraindicatedFor: [] },
+  { name: 'Good Morning',               movementPattern: 'hinge', primaryMuscles: ['hamstrings', 'back'], contraindicatedFor: ['loaded_spinal_flexion', 'heavy_axial_load'] },
+  { name: 'Back Extension',             movementPattern: 'hinge', primaryMuscles: ['back', 'glutes'], contraindicatedFor: ['loaded_spinal_extension'] },
+  { name: 'Cable Glute Kickback', movementPattern: 'isolation', primaryMuscles: ['glutes'], contraindicatedFor: [] },
+  { name: 'Hip Abduction',        movementPattern: 'isolation', primaryMuscles: ['glutes'], contraindicatedFor: [] },
+  { name: 'Seated Calf Raise',    movementPattern: 'isolation', primaryMuscles: ['calves'], contraindicatedFor: [] },
+  { name: 'Side Plank',      movementPattern: 'core', primaryMuscles: ['core'], contraindicatedFor: [] },
+  { name: 'Russian Twist',   movementPattern: 'core', primaryMuscles: ['core'], contraindicatedFor: ['loaded_spinal_flexion'] },
+  { name: 'Cable Crunch',    movementPattern: 'core', primaryMuscles: ['core'], contraindicatedFor: ['loaded_spinal_flexion'] },
+  { name: 'Bicycle Crunch',  movementPattern: 'core', primaryMuscles: ['core'], contraindicatedFor: ['loaded_spinal_flexion'] },
+  { name: "Farmer's Carry",  movementPattern: 'carry', primaryMuscles: ['core', 'forearms', 'traps'], contraindicatedFor: ['heavy_axial_load'] },
+  { name: 'Zone 2 Cardio',          movementPattern: 'cardio', primaryMuscles: ['heart'], contraindicatedFor: [] },
+  { name: 'Treadmill Incline Walk', movementPattern: 'cardio', primaryMuscles: ['heart', 'calves'], contraindicatedFor: [] },
+  { name: 'Stationary Bike',        movementPattern: 'cardio', primaryMuscles: ['heart', 'quads'], contraindicatedFor: [] },
+  { name: 'Rowing Machine',         movementPattern: 'cardio', primaryMuscles: ['heart', 'back'], contraindicatedFor: ['loaded_spinal_flexion'] },
+  { name: 'Elliptical',             movementPattern: 'cardio', primaryMuscles: ['heart'], contraindicatedFor: [] },
+  { name: 'Stair Climber',          movementPattern: 'cardio', primaryMuscles: ['heart', 'glutes'], contraindicatedFor: [] },
+  { name: 'Jump Rope',              movementPattern: 'cardio', primaryMuscles: ['heart', 'calves'], contraindicatedFor: ['high_impact'] },
+  { name: 'Running',                movementPattern: 'cardio', primaryMuscles: ['heart'], contraindicatedFor: ['high_impact'] },
 ];
 
 export function findExercise(name: string): CatalogExercise | undefined {
@@ -75,9 +124,12 @@ export function findExercise(name: string): CatalogExercise | undefined {
 export const BODYWEIGHT_EXERCISES = new Set([
   'Push-up',
   'Pull-up',
+  'Chin-up',
   'Tricep Dip',
   'Plank',
+  'Side Plank',
   'Dead Bug',
+  'Bicycle Crunch',
   'Hanging Knee Raise',
   'Glute Bridge',
   'Box Jump',
@@ -86,7 +138,37 @@ export const BODYWEIGHT_EXERCISES = new Set([
 export const isBodyweightExercise = (name: string): boolean =>
   BODYWEIGHT_EXERCISES.has(name.trim());
 
+export const TIMED_EXERCISES = new Set([
+  'Zone 2 Cardio',
+  'Treadmill Incline Walk',
+  'Stationary Bike',
+  'Rowing Machine',
+  'Elliptical',
+  'Stair Climber',
+  'Jump Rope',
+  'Running',
+  'Plank',
+  'Side Plank',
+  "Farmer's Carry",
+]);
+
+export const isTimedExercise = (name: string): boolean => TIMED_EXERCISES.has(name.trim());
+
+export const CARDIO_EXERCISES = new Set(
+  EXERCISE_CATALOG.filter((e) => e.movementPattern === 'cardio').map((e) => e.name),
+);
+
+export const isCardioExercise = (name: string): boolean => CARDIO_EXERCISES.has(name.trim());
+
+const REFERENCES_ONE_REP_MAX = /1\s*RM/i;
+
 export const loadSchemeForExercise = (
   name: string,
   requested: string | null | undefined,
-): string | null => (isBodyweightExercise(name) ? 'bodyweight' : (requested ?? null));
+  hasLoadHistory: boolean,
+): string | null => {
+  if (isCardioExercise(name)) return null;
+  if (isBodyweightExercise(name)) return 'bodyweight';
+  if (requested && REFERENCES_ONE_REP_MAX.test(requested) && !hasLoadHistory) return null;
+  return requested ?? null;
+};

@@ -9,6 +9,7 @@ import React, {
 } from "react";
 import * as Crypto from "expo-crypto";
 import { supabase } from "../lib/supabase";
+import { dispatchQuery } from "../lib/dispatchQuery";
 import { callBrain, COACH_UNREACHABLE_MESSAGE } from "../lib/brain";
 import { DEFAULT_REST_SEC, suggestRestSeconds, type RestSuggestionReason } from "../lib/restSuggestion";
 import { useProfileName } from "../hooks/useProfileName";
@@ -30,6 +31,8 @@ const EXTEND_REST_SEC = 10;
 // new set. Generous because logging a set immediately starts a rest period, so a real second set
 // of the same load and reps cannot physically arrive inside this window.
 const DUPLICATE_SET_WINDOW_MS = 10_000;
+
+const LIVE_STATE_HEARTBEAT_MS = 5 * 60_000;
 
 export interface SessionExercise {
   id: string;
@@ -193,7 +196,9 @@ interface ActiveSessionValue {
   minimize: () => void;
   restore: () => void;
   logSet: (weight: number | null, reps: number, unit?: 'seconds') => void;
+  lastSetLoggedAt: number | null;
   skipExercise: () => void;
+  goToExercise: (name: string) => boolean;
   addSet: () => void;
   undoLastSet: () => void;
   /** Persists the outgoing session as `partial` if anything was logged — used before a switch/
@@ -208,6 +213,7 @@ interface ActiveSessionValue {
   noteSetLogged: (summary: string) => void;
   announce: (text: string) => void;
   describeForCoach: () => string | undefined;
+  publishLiveState: () => Promise<unknown>;
   setPaused: (paused: boolean) => void;
   clear: () => void;
 }
@@ -235,6 +241,7 @@ export function ActiveSessionProvider({
   const [exercises, setExercises] = useState<SessionExercise[]>([]);
   const [currentExerciseIndex, setCurrentExerciseIndex] = useState(0);
   const [loggedSets, setLoggedSets] = useState<LoggedSet[][]>([]);
+  const [lastSetLoggedAt, setLastSetLoggedAt] = useState<number | null>(null);
   const [resting, setResting] = useState(false);
   const [restKey, setRestKey] = useState(0);
   const [restTargetSec, setRestTargetSec] = useState(DEFAULT_REST_SEC);
@@ -379,7 +386,10 @@ export function ActiveSessionProvider({
       // A session that truly ends must leave no live_session_state row behind — brain-voice
       // treats the absence of a fresh row as "no session running," which only holds if this
       // never leaves a stale one for a session that's actually over.
-      void supabase.from("live_session_state").delete().eq("user_id", clearedUserId);
+      dispatchQuery(
+        supabase.from("live_session_state").delete().eq("user_id", clearedUserId),
+        "live-state clear",
+      );
     }
     setTarget(null);
     setEnded(false);
@@ -488,7 +498,11 @@ export function ActiveSessionProvider({
   // while workout_log held 3, and the row was still there after the coach had said goodbye.
   const clearLiveSessionState = useCallback(() => {
     const endingUserId = userIdRef.current;
-    if (endingUserId) void supabase.from("live_session_state").delete().eq("user_id", endingUserId);
+    if (endingUserId)
+      dispatchQuery(
+        supabase.from("live_session_state").delete().eq("user_id", endingUserId),
+        "live-state clear (finished)",
+      );
   }, []);
 
   // A workout used to reach workout_log only when it finished, was skipped to the end, was ended
@@ -523,6 +537,7 @@ export function ActiveSessionProvider({
         }));
 
       if (!isCardio && exercisesDone.length === 0) return;
+      if (isCardio && !elapsedSec) return;
       if (status === "completed") workoutLogWrittenRef.current = true;
 
       const vsPlanned = isCardio
@@ -612,6 +627,7 @@ export function ActiveSessionProvider({
         return;
       }
       recentSetRef.current = { key: dedupeKey, at: now };
+      setLastSetLoggedAt(now);
 
       loggingRef.current = true;
 
@@ -716,7 +732,9 @@ export function ActiveSessionProvider({
     setRestReasonLabel(null);
 
     if (currentExerciseIndex === exercises.length - 1) {
-      const status: SessionStatus = loggedSets.some((sets) => sets.length > 0) ? "completed" : "partial";
+      const totalTargetSets = exercises.reduce((sum, ex) => sum + ex.sets, 0);
+      const totalLoggedSets = loggedSets.reduce((sum, sets) => sum + sets.length, 0);
+      const status: SessionStatus = totalLoggedSets >= totalTargetSets ? "completed" : "partial";
       setEnded(true);
       setEndedStatus(status);
       clearLiveSessionState();
@@ -725,6 +743,22 @@ export function ActiveSessionProvider({
       setCurrentExerciseIndex((i) => i + 1);
     }
   }, [currentExerciseIndex, exercises.length, loggedSets, writeWorkoutLog, clearLiveSessionState]);
+
+  const goToExercise = useCallback(
+    (name: string) => {
+      const target = name.trim().toLowerCase();
+      const index = exercises.findIndex((e) => e.name.trim().toLowerCase() === target);
+      if (index === -1) return false;
+      lastSetSnapshotRef.current = null;
+      setResting(false);
+      setRestEndAt(null);
+      setRestPausedRemainingSec(null);
+      setRestReasonLabel(null);
+      setCurrentExerciseIndex(index);
+      return true;
+    },
+    [exercises],
+  );
 
   const addSet = useCallback(() => {
     setExercises((prev) => {
@@ -810,7 +844,11 @@ export function ActiveSessionProvider({
   }, [restPausedRemainingSec, pauseRest, resumeRest]);
 
   const endSession = useCallback(
-    async (status: SessionStatus, reason?: string | null) => {
+    async (requestedStatus: SessionStatus, reason?: string | null) => {
+      const totalTargetSets = exercises.reduce((sum, ex) => sum + ex.sets, 0);
+      const totalLoggedSets = loggedSets.reduce((sum, sets) => sum + sets.length, 0);
+      const status: SessionStatus =
+        requestedStatus === "completed" && totalLoggedSets < totalTargetSets ? "partial" : requestedStatus;
       lastSetSnapshotRef.current = null;
       setEnded(true);
       setEndedStatus(status);
@@ -822,14 +860,21 @@ export function ActiveSessionProvider({
       // deleting outright removes any live_session_state block for the coach to read at all,
       // which is the one signal brain-voice actually checks (see live-session-format.ts).
       const endingUserId = userIdRef.current;
-      if (endingUserId) void supabase.from("live_session_state").delete().eq("user_id", endingUserId);
+      if (endingUserId)
+        dispatchQuery(
+          supabase.from("live_session_state").delete().eq("user_id", endingUserId),
+          "live-state clear (end session)",
+        );
       await writeWorkoutLog(loggedSets, status);
       const logId = logIdRef.current;
       if (logId && reason?.trim()) {
-        void supabase.from("workout_log").update({ note: reason.trim() }).eq("id", logId);
+        dispatchQuery(
+          supabase.from("workout_log").update({ note: reason.trim() }).eq("id", logId),
+          "workout end reason",
+        );
       }
     },
-    [loggedSets, writeWorkoutLog],
+    [exercises, loggedSets, writeWorkoutLog],
   );
 
   const submitFeedback = useCallback(async (note: string, tags: string[]) => {
@@ -886,6 +931,68 @@ export function ActiveSessionProvider({
     units,
   ]);
 
+  const liveStateWriteRef = useRef<Promise<unknown>>(Promise.resolve());
+  const liveStateRef = useRef<Record<string, unknown> | null>(null);
+  liveStateRef.current =
+    userId && target && !ended
+      ? {
+          user_id: userId,
+          state: {
+            startedAt,
+            target,
+            focus,
+            exercises,
+            currentExerciseIndex,
+            loggedSets,
+            resting,
+            restTargetSec,
+            restEndAt,
+            restPausedRemainingSec,
+            ended,
+            paused,
+            elapsedSec,
+          },
+        }
+      : null;
+
+  const publishLiveState = useCallback((): Promise<unknown> => {
+    const row = liveStateRef.current;
+    if (!row) return liveStateWriteRef.current;
+    liveStateWriteRef.current = liveStateWriteRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        const { error } = await supabase.from("live_session_state").upsert(row);
+        if (error) console.error("[session] live state write failed:", error.message);
+      });
+    return liveStateWriteRef.current;
+  }, []);
+
+  useEffect(() => {
+    void publishLiveState();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    userId,
+    startedAt,
+    target,
+    focus,
+    exercises,
+    currentExerciseIndex,
+    loggedSets,
+    resting,
+    restTargetSec,
+    restEndAt,
+    restPausedRemainingSec,
+    paused,
+    ended,
+    publishLiveState,
+  ]);
+
+  useEffect(() => {
+    if (!userId || !target || ended) return;
+    const id = setInterval(() => void publishLiveState(), LIVE_STATE_HEARTBEAT_MS);
+    return () => clearInterval(id);
+  }, [userId, target, ended, publishLiveState]);
+
   const latestAskRef = useRef(0);
   const askCoach = useCallback(
     async (text: string) => {
@@ -894,6 +1001,7 @@ export function ActiveSessionProvider({
       const requestId = ++latestAskRef.current;
       appendMessage("user", text.trim());
       setCoachThinking(true);
+      let liveSessionState: string | undefined;
       try {
         const snapshot = buildLiveSessionSnapshot({
           target,
@@ -909,34 +1017,37 @@ export function ActiveSessionProvider({
           paused,
           elapsedSec,
         });
-        const liveSessionState = snapshot ? describeLiveSessionSnapshot(snapshot, units) : undefined;
-        const result = await callBrain({ userId, message: text.trim(), liveSessionState });
-        if (latestAskRef.current !== requestId) return;
-        setCoachMessage(result.reply);
-        appendMessage("coach", result.reply);
+        liveSessionState = snapshot ? describeLiveSessionSnapshot(snapshot, units) : undefined;
+      } catch (err) {
+        console.error("[active session] failed to describe live state:", err);
+      }
 
-        const exercise = exercises[currentExerciseIndex];
-        if (exercise && result.reply.trim()) {
-          const { error: noteError } = await supabase
-            .from("exercise_note")
-            .insert({
-              user_id: userId,
-              exercise_id: exercise.exerciseId,
-              note: result.reply.trim(),
-            });
-          if (noteError)
-            console.error(
-              "[active session] failed to save note:",
-              noteError.message,
-            );
-        }
+      let result: Awaited<ReturnType<typeof callBrain>>;
+      try {
+        result = await callBrain({ userId, message: text.trim(), liveSessionState });
       } catch (err) {
         console.error("[active session] coach call failed:", err);
-        if (latestAskRef.current !== requestId) return;
-        setCoachMessage(COACH_UNREACHABLE_MESSAGE);
-        appendMessage("coach", COACH_UNREACHABLE_MESSAGE);
-      } finally {
-        if (latestAskRef.current === requestId) setCoachThinking(false);
+        if (latestAskRef.current === requestId) {
+          setCoachMessage(COACH_UNREACHABLE_MESSAGE);
+          appendMessage("coach", COACH_UNREACHABLE_MESSAGE);
+          setCoachThinking(false);
+        }
+        return;
+      }
+
+      if (latestAskRef.current !== requestId) return;
+      setCoachMessage(result.reply);
+      appendMessage("coach", result.reply);
+      setCoachThinking(false);
+
+      const exercise = exercises[currentExerciseIndex];
+      if (exercise && result.reply.trim()) {
+        const { error: noteError } = await supabase.from("exercise_note").insert({
+          user_id: userId,
+          exercise_id: exercise.exerciseId,
+          note: result.reply.trim(),
+        });
+        if (noteError) console.error("[active session] failed to save note:", noteError.message);
       }
     },
     [
@@ -1008,7 +1119,9 @@ export function ActiveSessionProvider({
       minimize,
       restore,
       logSet,
+      lastSetLoggedAt,
       skipExercise,
+      goToExercise,
       addSet,
       undoLastSet,
       resolveOutgoingSession: persistPartialIfAny,
@@ -1021,6 +1134,7 @@ export function ActiveSessionProvider({
       noteSetLogged,
       announce,
       describeForCoach,
+      publishLiveState,
       setPaused,
       clear,
       toggleRestPause,
@@ -1060,7 +1174,9 @@ export function ActiveSessionProvider({
       minimize,
       restore,
       logSet,
+      lastSetLoggedAt,
       skipExercise,
+      goToExercise,
       addSet,
       undoLastSet,
       persistPartialIfAny,
@@ -1073,6 +1189,7 @@ export function ActiveSessionProvider({
       noteSetLogged,
       announce,
       describeForCoach,
+      publishLiveState,
       clear,
       toggleRestPause,
       extendRest,

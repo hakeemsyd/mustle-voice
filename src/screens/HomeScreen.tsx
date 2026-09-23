@@ -27,6 +27,8 @@ import { colors, fonts } from "../constants/theme";
 import { CalendarIcon, MenuIcon, MoonIcon, SunIcon } from "../icons";
 import { getMomentumLine, getTimeBand, type TimeBand } from "./homeFormat";
 import { subscribeToHomeRefresh } from "../lib/homeRefreshBridge";
+import { titleCase } from "../lib/textFormat";
+import { startOfLocalDay } from "../lib/calendarDate";
 
 function getGreeting(band: TimeBand, name: string | null): string {
   return name ? `${band}, ${name}.` : `${band}.`;
@@ -50,9 +52,9 @@ export function HomeScreen() {
     coachMessage,
     streakDays,
     loadError,
-    planPending,
+    planStartsOn,
+    upcomingSession,
     refetch,
-    retryPlan,
   } = useHomeData();
   const { appendLocal } = useHomeChat(userId);
   const activeSession = useActiveSessionContext();
@@ -206,13 +208,18 @@ export function HomeScreen() {
                           {loadError} Tap to retry
                         </Text>
                       </Pressable>
-                    ) : todaySession === null && planPending ? (
-                      <Pressable style={styles.restLine} onPress={retryPlan}>
-                        <View style={styles.restLineDot} />
-                        <Text style={styles.restLineText}>
-                          Still setting up your plan — tap to check
+                    ) : planStartsOn ? (
+                      <View style={styles.slimSession}>
+                        <View style={styles.slimSessionDot} />
+                        <Text style={styles.slimSessionName}>
+                          Your plan starts {startOfLocalDay(planStartsOn).toLocaleDateString("en-US", { weekday: "long" })}
                         </Text>
-                      </Pressable>
+                        {upcomingSession && (
+                          <Text style={styles.slimSessionTime}>
+                            {upcomingSession.name}
+                          </Text>
+                        )}
+                      </View>
                     ) : todaySession === null ? (
                       <View style={styles.restLine}>
                         <View style={styles.restLineDot} />
@@ -220,6 +227,23 @@ export function HomeScreen() {
                           No plan yet — talk to your coach to set one up
                         </Text>
                       </View>
+                    ) : todaySession.completedWorkout ? (
+                      <Pressable
+                        style={styles.slimSession}
+                        onPress={() =>
+                          navigation.navigate("Calendar", {
+                            initialScope: "today",
+                          })
+                        }
+                      >
+                        <View style={styles.slimSessionDot} />
+                        <Text style={styles.slimSessionName}>
+                          {todaySession.completedWorkout.focus
+                            ? titleCase(todaySession.completedWorkout.focus)
+                            : "Workout"}
+                        </Text>
+                        <Text style={styles.slimSessionTime}>Done today</Text>
+                      </Pressable>
                     ) : todaySession.hasSession ? (
                       <Pressable
                         style={styles.slimSession}

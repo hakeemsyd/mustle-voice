@@ -25,12 +25,28 @@ export function AppActionBridge({ userId }: AppActionBridgeProps) {
       case 'skip_exercise':
         session.skipExercise();
         break;
+      case 'go_to_exercise': {
+        const name = String(action.payload?.exercise_name ?? '');
+        if (name) session.goToExercise(name);
+        break;
+      }
       case 'add_set':
         session.addSet();
         break;
       case 'undo_last_set':
         session.undoLastSet();
         break;
+      case 'log_set': {
+        const reps = Number(action.payload?.reps);
+        if (!Number.isFinite(reps) || reps <= 0) break;
+        const weight = Number(action.payload?.weight_kg);
+        session.logSet(
+          Number.isFinite(weight) && weight > 0 ? weight : null,
+          Math.round(reps),
+          action.payload?.unit === 'seconds' ? 'seconds' : undefined,
+        );
+        break;
+      }
       case 'end_workout':
         session.endSession(
           (action.payload?.status as SessionStatus) ?? 'completed',

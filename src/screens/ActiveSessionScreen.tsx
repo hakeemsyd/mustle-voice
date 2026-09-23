@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useFocusEffect, useIsFocused } from "@react-navigation/native";
 import {
   Keyboard,
@@ -50,9 +50,11 @@ import {
   looksLikeSetReport,
   looksLikeStartSetCommand,
   parseSetReport,
-  parseStatedWeight,
   type ParsedSet,
 } from "../lib/parseSetReport";
+import { classifySpokenSet } from "../lib/spokenSetIntent";
+import { isCardioExercise, isTimedExercise } from "../lib/exerciseCatalog";
+import { isImplausibleWeightJump, parseLoadSchemeKg } from "../lib/weightPlausibility";
 import { chooseRestDay } from "../lib/restDay";
 import { targetRepsFrom } from "../lib/restSuggestion";
 import { titleCase } from "../lib/textFormat";
@@ -61,6 +63,17 @@ import type { RootStackParamList } from "../navigation/types";
 type Props = NativeStackScreenProps<RootStackParamList, "ActiveSession">;
 
 const ADVANCE_CUE_GRACE_MS = 3_000;
+
+const AWAITING_SET_DETAILS_MS = 120_000;
+
+const WEIGHT_CONFIRM_MS = 120_000;
+
+const AFFIRMATION = /\b(yes|yeah|yep|yup|correct|that'?s right|right|confirm(?:ed)?|i did|sure|affirmative)\b/i;
+
+const NEGATION = /\b(no|nope|nah|wrong|incorrect|didn'?t|not right)\b/i;
+
+const COACH_ASKS_FOR_SET_DETAILS =
+  /\b(how many (?:reps|did you get|was that)|what did you get|reps did you (?:get|do)|how'd that set go|what weight (?:did|was) (?:you|that))\b/i;
 
 // "30-45 seconds" is three times the width of "8-10", and the collapsed strip gives Reps whatever
 // it asks for, so a timed exercise squeezed the only shrinkable column until even its "EXERCISE"
@@ -71,6 +84,7 @@ const formatRepScheme = (scheme: string | null): string =>
 type ChipsState =
   | { kind: "idle" }
   | { kind: "gear-menu" }
+  | { kind: "goto-target" }
   | { kind: "change-target" }
   | { kind: "change-pick"; exerciseRowId: string; exerciseName: string; candidates: SwapCandidate[] }
   | { kind: "remove-target" }
@@ -96,6 +110,14 @@ export function ActiveSessionScreen({ navigation }: Props) {
   useEffect(() => {
     if (keyboardOpen) setCardCollapsed(true);
   }, [keyboardOpen]);
+
+  useEffect(() => {
+    if (session.lastSetLoggedAt === null) return;
+    setUndoVisible(true);
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    undoTimerRef.current = setTimeout(() => setUndoVisible(false), 8000);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.lastSetLoggedAt]);
   // Mic-first: this screen auto-connects on focus and the whole point is reporting sets by
   // voice, so it lands on the speak surface rather than an open keyboard composer.
   const [inputMode, setInputMode] = useState<"mic" | "keyboard">("mic");
@@ -166,6 +188,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
   const restRemaining = useRestRemaining(restEndAt, restPausedRemainingSec);
   const currentSetCount = loggedSets[currentExerciseIndex]?.length ?? 0;
   const nextExerciseName = exercises[currentExerciseIndex + 1]?.name ?? null;
+  const currentIsTimed = isTimedExercise(currentExercise?.name);
   // Plan data only carries a load *scheme* ("%1RM", "RPE 8"), never a number, so the collapsed
   // row shows the weight actually lifted this exercise once there is one and falls back to the
   // scheme until then.
@@ -183,6 +206,14 @@ export function ActiveSessionScreen({ navigation }: Props) {
   // said "set one done" — and with no set yet logged on the exercise there was nothing to carry
   // forward either, so a real 80kg set was recorded as bodyweight.
   const statedWeightRef = useRef<{ exerciseIndex: number; weight: number } | null>(null);
+  const awaitingSetDetailsRef = useRef<{ exerciseIndex: number; at: number } | null>(null);
+  const pendingWeightConfirmRef = useRef<{
+    exerciseIndex: number;
+    at: number;
+    weight: number | null;
+    reps: number;
+    unit?: "seconds";
+  } | null>(null);
   const carryWeight = (): number | null =>
     lastLoggedWeight ??
     (statedWeightRef.current?.exerciseIndex === currentExerciseIndex
@@ -204,10 +235,6 @@ export function ActiveSessionScreen({ navigation }: Props) {
     // deliberately excluded: the coach already knows about those from its own inline context
     // update a few lines up in the message handler.
     pendingSetCueRef.current = viaVoice ? "skip" : "fire";
-
-    setUndoVisible(true);
-    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
-    undoTimerRef.current = setTimeout(() => setUndoVisible(false), 8000);
   };
 
   //
@@ -222,6 +249,12 @@ export function ActiveSessionScreen({ navigation }: Props) {
   // a second later, so it spoke over itself with a near-duplicate question.
   const pendingAdvanceRef = useRef<{ timer: ReturnType<typeof setTimeout>; name: string } | null>(null);
   const restManualFinishRef = useRef(-1);
+
+  const tryCommitSetRef = useRef<
+    (weight: number | null, reps: number, viaVoice: boolean, unit?: "seconds") => boolean
+  >(() => false);
+  const tryCommitSet = (weight: number | null, reps: number, viaVoice: boolean, unit?: "seconds"): boolean =>
+    tryCommitSetRef.current(weight, reps, viaVoice, unit);
 
   const {
     orbState, isActive, status: voiceStatus, toggle, sendContextualUpdate, sendUserMessage,
@@ -298,7 +331,11 @@ export function ActiveSessionScreen({ navigation }: Props) {
               `and the timer is cleared. Rest is over. Answer them — going quiet here is wrong, they ` +
               `just spoke to you. Give them the real next-set prompt: this is set ${setNumber}` +
               `${currentExercise ? ` of ${currentExercise.sets} for ${currentExercise.name}` : ""}, ` +
-              `${currentExercise ? `target ${currentExercise.repScheme} reps` : "the target reps"}` +
+              `${
+                currentExercise
+                  ? `target ${currentExercise.repScheme}${currentIsTimed ? "" : " reps"}`
+                  : "the target reps"
+              }` +
               `${lastLoggedWeight != null ? ` at ${lastLoggedWeight}kg, the same weight as their last set` : ""}. ` +
               `One short line, natural, then let them lift.`,
           );
@@ -307,15 +344,49 @@ export function ActiveSessionScreen({ navigation }: Props) {
         }
         return;
       }
-      if (message.role !== "user" || isCardio) return;
-      const statedWeight = parseStatedWeight(message.text, units);
-      if (statedWeight != null) {
-        statedWeightRef.current = { exerciseIndex: currentExerciseIndex, weight: statedWeight };
+      if (isCardio) return;
+      if (message.role !== "user") {
+        if (COACH_ASKS_FOR_SET_DETAILS.test(message.text)) {
+          awaitingSetDetailsRef.current = { exerciseIndex: currentExerciseIndex, at: Date.now() };
+        }
+        return;
       }
-      if (!looksLikeSetReport(message.text, units)) return;
+      const pendingWeight = pendingWeightConfirmRef.current;
+      const awaitingWeightConfirm =
+        !!pendingWeight &&
+        pendingWeight.exerciseIndex === currentExerciseIndex &&
+        Date.now() - pendingWeight.at < WEIGHT_CONFIRM_MS;
+      if (awaitingWeightConfirm && pendingWeight) {
+        if (AFFIRMATION.test(message.text) && !NEGATION.test(message.text)) {
+          pendingWeightConfirmRef.current = null;
+          commitSet(pendingWeight.weight, pendingWeight.reps, true, pendingWeight.unit);
+          return;
+        }
+        if (NEGATION.test(message.text)) {
+          pendingWeightConfirmRef.current = null;
+          awaitingSetDetailsRef.current = { exerciseIndex: currentExerciseIndex, at: Date.now() };
+          return;
+        }
+      }
+
+      const pending = awaitingSetDetailsRef.current;
+      const awaitingDetails =
+        !!pending &&
+        pending.exerciseIndex === currentExerciseIndex &&
+        Date.now() - pending.at < AWAITING_SET_DETAILS_MS;
+      const intent = classifySpokenSet(message.text, units, {
+        awaitingDetails,
+        timedExercise: isTimedExercise(currentExercise?.name),
+      });
+      if (intent.kind === "ignore") return;
+      if (intent.kind === "stated_weight") {
+        statedWeightRef.current = { exerciseIndex: currentExerciseIndex, weight: intent.weight };
+        return;
+      }
       if (resting) session.finishRest();
-      const parsed = parseSetReport(message.text, units);
+      const parsed = intent.kind === "log" ? intent.set : null;
       if (!parsed) {
+        awaitingSetDetailsRef.current = { exerciseIndex: currentExerciseIndex, at: Date.now() };
         // The single biggest source of coach/app drift: the user reports a set, the coach hears
         // and counts it conversationally, but the local parser can't read the numbers out of it
         // — and this used to `return` silently. The app stayed on set N while the coach believed
@@ -343,8 +414,12 @@ export function ActiveSessionScreen({ navigation }: Props) {
       // live: answering the app's own "How many reps?" clarifying question with reps only logged
       // 60kg as bodyweight. Carry forward the last weight actually logged for this exercise
       // instead of trusting "no weight mentioned this sentence" as "true bodyweight movement".
+      awaitingSetDetailsRef.current = null;
       const parsedForLog = { ...parsed, weight: resolveSetWeight(parsed) };
-      commitSet(parsedForLog.weight, parsedForLog.reps, true, parsedForLog.unit);
+
+      if (!awaitingWeightConfirm && !tryCommitSet(parsedForLog.weight, parsedForLog.reps, true, parsedForLog.unit)) {
+        return;
+      }
       const setNumber = currentSetCount + 1;
       // A voice-reported set is logged and acknowledged entirely through this inline context
       // update, never through the set_logged/exercise_advanced cue system below (that's
@@ -407,8 +482,6 @@ export function ActiveSessionScreen({ navigation }: Props) {
     sendContextRef.current = sendContextualUpdate;
   }, [sendContextualUpdate]);
 
-  const liveStateWriteRef = useRef<PromiseLike<unknown>>(Promise.resolve());
-
   const cueOverTextRef = useRef<(cue: string) => void>(() => undefined);
   cueOverTextRef.current = (cue: string) => {
     const userId = session.userId;
@@ -427,6 +500,48 @@ export function ActiveSessionScreen({ navigation }: Props) {
         console.error("[active session] text fallback for coach cue failed:", err);
       }
     })();
+  };
+
+  const tellCoachRef = useRef<(text: string) => void>(() => undefined);
+  tellCoachRef.current = (text: string) => {
+    if (voiceStatus === "connected" && !isMuted) {
+      try {
+        sendContextRef.current?.(text);
+        return;
+      } catch (err) {
+        console.error("[active session] contextual update failed, falling back to text:", err);
+      }
+    }
+    const userId = session.userId;
+    if (!userId) return;
+    void callBrain({ userId, message: text, hidden: true, liveSessionState: session.describeForCoach() })
+      .then((result) => {
+        const reply = result.reply?.trim();
+        if (reply) session.announce(reply);
+      })
+      .catch((err) => console.error("[active session] text fallback for coach context failed:", err));
+  };
+
+  tryCommitSetRef.current = (weight, reps, viaVoice, unit) => {
+    const referenceWeight = lastLoggedWeight ?? parseLoadSchemeKg(currentExercise?.loadScheme ?? null);
+    if (isImplausibleWeightJump(weight, referenceWeight)) {
+      pendingWeightConfirmRef.current = { exerciseIndex: currentExerciseIndex, at: Date.now(), weight, reps, unit };
+      const heard = kgToDisplayWeight(weight as number, units);
+      const expected = kgToDisplayWeight(referenceWeight as number, units);
+      session.announce(
+        `That came through as ${heard}, but you were on ${expected}. Nothing logged yet — was that right?`,
+      );
+      tellCoachRef.current(
+        `IMPORTANT: the app heard ${heard} for this set, but the working weight here is ${expected}. ` +
+          `That is too big a jump to trust, so NOTHING was logged and the app is still waiting on set ` +
+          `${currentSetCount + 1}${currentExercise ? ` of ${currentExercise.sets} for ${currentExercise.name}` : ""}. ` +
+          `Ask them once, briefly, to confirm the weight — do not count this set until they do.`,
+      );
+      return false;
+    }
+    pendingWeightConfirmRef.current = null;
+    commitSet(weight, reps, viaVoice, unit);
+    return true;
   };
 
   useEffect(() => {
@@ -452,39 +567,6 @@ export function ActiveSessionScreen({ navigation }: Props) {
   //
   //
 
-  useEffect(() => {
-    // Once ended, session.endSession() has already deleted this row outright (see
-    // ActiveSessionContext.tsx) so the coach sees no session at all rather than a stale one —
-    // re-upserting here on the very same ended:false→true transition would race that delete and
-    // could leave the row behind again, exactly the bug this was meant to close.
-    if (!session.userId || !target || ended) return;
-    liveStateWriteRef.current = supabase.from("live_session_state").upsert({
-      user_id: session.userId,
-      state: {
-        // Scopes the coach's replayed conversation to THIS workout (see brain-voice's prepareTurn).
-        // The session survives leaving the screen — Home's in-progress card comes back to the same
-        // in-memory session — so the coach should still remember the weight they were told. Killing
-        // the app wipes that state and starts a new session with a new stamp, so the coach forgets
-        // exactly what the UI forgot, instead of insisting they're on set 3 of a workout the screen
-        // has restarted from zero.
-        startedAt: session.startedAt,
-        target,
-        focus,
-        exercises,
-        currentExerciseIndex,
-        loggedSets,
-        resting,
-        restTargetSec,
-        restEndAt: session.restEndAt,
-        restPausedRemainingSec,
-        ended,
-        paused,
-        elapsedSec,
-      },
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session.userId, target, focus, exercises, currentExerciseIndex, loggedSets, resting, restTargetSec, restPausedRemainingSec, paused, ended]);
-
   const greetedSessionRef = useRef<typeof target>(null);
   useEffect(() => {
     if (!target || ended) return;
@@ -494,7 +576,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
     // Either outcome sends the cue: a failed live_session_state write is worth greeting through
     // anyway (session_start's own wording falls back to a generic hello when no state block
     // reaches the model), whereas skipping it would leave the user in silence.
-    void liveStateWriteRef.current.then(
+    void session.publishLiveState().then(
       () => triggerCueRef.current?.("session_start"),
       () => triggerCueRef.current?.("session_start"),
     );
@@ -534,7 +616,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
         name: advancedTo,
         timer: setTimeout(() => {
           pendingAdvanceRef.current = null;
-          void liveStateWriteRef.current.then(
+          void session.publishLiveState().then(
             () => triggerCueRef.current?.("exercise_advanced"),
             () => triggerCueRef.current?.("exercise_advanced"),
           );
@@ -542,7 +624,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
       };
       return;
     }
-    void liveStateWriteRef.current.then(
+    void session.publishLiveState().then(
       () => triggerCueRef.current?.("set_logged"),
       () => triggerCueRef.current?.("set_logged"),
     );
@@ -572,7 +654,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
     const state = restCueStateRef.current;
     if (state.over) return;
     state.over = true;
-    void liveStateWriteRef.current.then(
+    void session.publishLiveState().then(
       () => triggerCueRef.current?.("rest_over"),
       () => triggerCueRef.current?.("rest_over"),
     );
@@ -633,7 +715,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
       state.over = true;
       // Same live_session_state race as set_logged/session_start — the coach reads the next
       // exercise/set number off this row when told rest is over.
-      void liveStateWriteRef.current.then(
+      void session.publishLiveState().then(
         () => triggerCueRef.current?.("rest_over"),
         () => triggerCueRef.current?.("rest_over"),
       );
@@ -655,7 +737,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
       scheduleCheckIn();
     } else if (restRemaining > 0 && restRemaining <= 10 && !state.countdown) {
       state.countdown = true;
-      void liveStateWriteRef.current.then(
+      void session.publishLiveState().then(
         () => triggerCueRef.current?.("rest_final_countdown"),
         () => triggerCueRef.current?.("rest_final_countdown"),
       );
@@ -704,15 +786,40 @@ export function ActiveSessionScreen({ navigation }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ended]);
 
-  const parsedDraft = parseSetReport(draft, units);
+  const parsedDraft = parseSetReport(draft, units, { timedExercise: currentIsTimed });
 
   const handleSend = () => {
     const text = draft.trim();
     if (!text) return;
-    if (!isCardio && !resting && looksLikeSetReport(text, units)) {
-      const parsed = parseSetReport(text, units);
+
+    const pendingWeight = pendingWeightConfirmRef.current;
+    const awaitingWeightConfirm =
+      !!pendingWeight &&
+      pendingWeight.exerciseIndex === currentExerciseIndex &&
+      Date.now() - pendingWeight.at < WEIGHT_CONFIRM_MS;
+    if (awaitingWeightConfirm && pendingWeight) {
+      if (AFFIRMATION.test(text) && !NEGATION.test(text)) {
+        session.appendMessage("user", text);
+        setDraft("");
+        pendingWeightConfirmRef.current = null;
+        commitSet(pendingWeight.weight, pendingWeight.reps, false, pendingWeight.unit);
+        return;
+      }
+      if (NEGATION.test(text)) {
+        session.appendMessage("user", text);
+        setDraft("");
+        pendingWeightConfirmRef.current = null;
+        void session.askCoach(text);
+        return;
+      }
+    }
+
+    if (!isCardio && !resting && looksLikeSetReport(text, units, { timedExercise: currentIsTimed })) {
+      const parsed = parseSetReport(text, units, { timedExercise: currentIsTimed });
       if (parsed) {
-        commitSet(resolveSetWeight(parsed), parsed.reps, false, parsed.unit);
+        session.appendMessage("user", text);
+        setDraft("");
+        tryCommitSet(resolveSetWeight(parsed), parsed.reps, false, parsed.unit);
         return;
       }
     }
@@ -723,7 +830,10 @@ export function ActiveSessionScreen({ navigation }: Props) {
   const handleDoneSet = () => {
     if (resting || !currentExercise) return;
     if (parsedDraft) {
-      commitSet(resolveSetWeight(parsedDraft), parsedDraft.reps, false, parsedDraft.unit);
+      const text = draft.trim();
+      session.appendMessage("user", text);
+      setDraft("");
+      tryCommitSet(resolveSetWeight(parsedDraft), parsedDraft.reps, false, parsedDraft.unit);
       return;
     }
     const fallbackReps = targetRepsFrom(currentExercise.repScheme);
@@ -813,7 +923,10 @@ export function ActiveSessionScreen({ navigation }: Props) {
     }
 
     if (chatChips.kind === "gear-menu") {
-      if (label === "Change Exercise") {
+      if (label === "Go To Exercise") {
+        session.announce("Which exercise do you want to be on?");
+        setChatChips({ kind: "goto-target" });
+      } else if (label === "Change Exercise") {
         session.announce("Which upcoming exercise would you like to change?");
         setChatChips({ kind: "change-target" });
       } else if (label === "Remove Exercise") {
@@ -823,6 +936,19 @@ export function ActiveSessionScreen({ navigation }: Props) {
         session.announce("Which workout would you like instead?");
         setChatChips({ kind: "switch-pick" });
       }
+      return;
+    }
+
+    if (chatChips.kind === "goto-target") {
+      if (label === currentExercise?.name) {
+        session.announce(`You're already on ${label}.`);
+        resetChips();
+        return;
+      }
+      if (session.goToExercise(label)) {
+        session.announce(`Moved to ${label}. Any sets you already logged on it are still there.`);
+      }
+      resetChips();
       return;
     }
 
@@ -890,8 +1016,16 @@ export function ActiveSessionScreen({ navigation }: Props) {
 
   const chipsForState: ChatChip[] =
     chatChips.kind === "gear-menu"
-      ? [{ label: "Change Exercise" }, { label: "Remove Exercise" }, { label: "Change Workout" }, { label: "Cancel" }]
-      : chatChips.kind === "change-target" || chatChips.kind === "remove-target"
+      ? [
+          { label: "Go To Exercise" },
+          { label: "Change Exercise" },
+          { label: "Remove Exercise" },
+          { label: "Change Workout" },
+          { label: "Cancel" },
+        ]
+      : chatChips.kind === "goto-target"
+        ? [...exercises.map((e) => ({ label: e.name })), { label: "Cancel" }]
+        : chatChips.kind === "change-target" || chatChips.kind === "remove-target"
         ? upcomingExercises.length === 0
           ? [{ label: "Cancel" }]
           : [...upcomingExercises.map((e) => ({ label: e.name })), { label: "Cancel" }]
@@ -1235,10 +1369,12 @@ export function ActiveSessionScreen({ navigation }: Props) {
                                     ? `Next: ${nextExerciseName}`
                                     : `Next: Set ${currentSetCount + 1}`}
                                 </Text>
-                                <View style={styles.targetWeight}>
-                                  <DumbbellIcon size={14} color="#0A0A0A" />
-                                  <Text style={styles.targetWeightText}>{currentWeightLabel}</Text>
-                                </View>
+                                {!isCardioExercise(exercise.name) && (
+                                  <View style={styles.targetWeight}>
+                                    <DumbbellIcon size={14} color="#0A0A0A" />
+                                    <Text style={styles.targetWeightText}>{currentWeightLabel}</Text>
+                                  </View>
+                                )}
                               </>
                             ) : (
                               <>
@@ -1246,11 +1382,15 @@ export function ActiveSessionScreen({ navigation }: Props) {
                                   SET {Math.min(currentSetCount + 1, exercise.sets ?? 1)} OF {exercise.sets ?? 1}
                                 </Text>
                                 <Text style={styles.targetValue}>{exercise.repScheme ?? "—"}</Text>
-                                <Text style={styles.targetSub}>TARGET REPS</Text>
-                                <View style={styles.targetWeight}>
-                                  <DumbbellIcon size={14} color="#0A0A0A" />
-                                  <Text style={styles.targetWeightText}>{currentWeightLabel}</Text>
-                                </View>
+                                <Text style={styles.targetSub}>
+                                  {isTimedExercise(exercise.name) ? "TARGET TIME" : "TARGET REPS"}
+                                </Text>
+                                {!isCardioExercise(exercise.name) && (
+                                  <View style={styles.targetWeight}>
+                                    <DumbbellIcon size={14} color="#0A0A0A" />
+                                    <Text style={styles.targetWeightText}>{currentWeightLabel}</Text>
+                                  </View>
+                                )}
                               </>
                             )}
                           </View>

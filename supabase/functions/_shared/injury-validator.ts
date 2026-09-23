@@ -11,9 +11,10 @@ export interface Violation { exercise: string; injuryArea: string; tag: string }
 
 // An injury area forbids a set of movement tags. Exercises are tagged with the same
 // vocabulary (see exercise-catalog.ts); a match is a violation.
-const INJURY_FORBIDS: Record<string, string[]> = {
+export const INJURY_FORBIDS: Record<string, string[]> = {
   knee:       ['deep_knee_flexion_loaded', 'high_impact', 'heavy_axial_load'],
   lumbar:     ['heavy_axial_load', 'loaded_spinal_flexion', 'loaded_spinal_extension'],
+  si_joint:   ['heavy_axial_load', 'loaded_spinal_flexion', 'loaded_spinal_extension', 'high_impact'],
   shoulder:   ['overhead_press', 'heavy_horizontal_press', 'behind_neck'],
   // loaded_elbow_extension covers direct triceps work (pushdowns, overhead extensions, dips).
   // Without it, a reported elbow problem pulled the presses but left every triceps isolation in
@@ -29,6 +30,7 @@ const INJURY_FORBIDS: Record<string, string[]> = {
 export function normalizeArea(area: string): string {
   let a = area.toLowerCase().replace(/[^a-z]+/g, '_').replace(/^_|_$/g, '');
   a = a.replace(/^(left|right)_?/, '').replace(/s$/, '');
+  if (a === 'si' || a.includes('si_joint') || a.includes('sacro') || a.includes('pelvi')) return 'si_joint';
   if (a.includes('back') || a.includes('spine') || a.includes('lumbar')) return 'lumbar';
   for (const key of Object.keys(INJURY_FORBIDS)) if (a.includes(key)) return key;
   return a;

@@ -22,6 +22,7 @@ import {
   useDayDetail,
   type DayDetail,
 } from "../hooks/useCalendarData";
+import { isUnfinishedWorkout } from "../lib/resolveTodaySession";
 import { useFuelData } from "../hooks/useFuelData";
 import { localDateKey, addDays, startOfLocalDay } from "../lib/calendarDate";
 import { colors, fonts, lightCard } from "../constants/theme";
@@ -202,7 +203,9 @@ const HistoryEntryRow = ({
         </Text>
         <View style={styles.entryTimeRow}>
           <ClockIcon size={10} color={colors.muted} />
-          <Text style={styles.entryTime}>{dateGroupLabel(localDateKey(new Date(at)))}</Text>
+          <Text style={styles.entryTime}>
+            {dateGroupLabel(localDateKey(new Date(at)))} · {formatTime(at)}
+          </Text>
         </View>
       </View>
       <ChevronRightIcon size={14} color={colors.muted} />
@@ -510,16 +513,25 @@ const CalendarDetail = ({
   const month = useMonthCalendar(monthCursor);
 
   const selectedWorkout = selectedDay.workouts[0] ?? null;
-  const selectedFocus = selectedWorkout?.focus ?? selectedDay.plannedFocus ?? null;
+  const isUpcoming = selectedDay.isToday && !selectedWorkout && !!today.planStartsOn;
+  const selectedFocus =
+    selectedWorkout?.focus ?? (isUpcoming ? today.upcomingSession?.focus ?? null : selectedDay.plannedFocus ?? null);
+  const selectedUnfinished = !!selectedWorkout && isUnfinishedWorkout(selectedWorkout.status);
   const heroEyebrow = selectedWorkout
-    ? selectedDay.isToday
-      ? "COMPLETED TODAY"
-      : "COMPLETED"
-    : selectedDay.isToday
-      ? "TODAY'S SESSION"
-      : selectedDay.isFuture
-        ? "PLANNED"
-        : "NOT LOGGED";
+    ? selectedUnfinished
+      ? selectedDay.isToday
+        ? "ENDED EARLY TODAY"
+        : "ENDED EARLY"
+      : selectedDay.isToday
+        ? "COMPLETED TODAY"
+        : "COMPLETED"
+    : isUpcoming
+      ? "UPCOMING"
+      : selectedDay.isToday
+        ? "TODAY'S SESSION"
+        : selectedDay.isFuture
+          ? "PLANNED"
+          : "NOT LOGGED";
 
   const caloriesMacro = fuel.macros?.find((m) => m.key === "calories");
   const proteinMacro = fuel.macros?.find((m) => m.key === "protein");
@@ -527,6 +539,43 @@ const CalendarDetail = ({
   const fatMacro = fuel.macros?.find((m) => m.key === "fat");
 
   const totalSets = today.session?.exercises.reduce((sum, ex) => sum + (ex.sets ?? 0), 0) ?? 0;
+
+  const heroStats = selectedWorkout
+    ? {
+        exercises: selectedWorkout.exercisesDone.length,
+        sets: selectedWorkout.exercisesDone.reduce((sum, ex) => sum + (Number(ex.sets) || 0), 0),
+        setsLabel: "Sets logged",
+        type: selectedWorkout.sessionType,
+      }
+    : isUpcoming && today.upcomingSession
+      ? {
+          exercises: today.upcomingSession.exercises.length,
+          sets: today.upcomingSession.exercises.reduce((sum, ex) => sum + (ex.sets ?? 0), 0),
+          setsLabel: "Total sets",
+          type: today.upcomingSession.sessionType,
+        }
+      : selectedDay.isToday && today.session
+        ? { exercises: today.session.exercises.length, sets: totalSets, setsLabel: "Total sets", type: today.session.sessionType }
+        : null;
+
+  const nutritionHero = selectedDay.isToday
+    ? {
+        calories: caloriesMacro?.current ?? 0,
+        macros: [proteinMacro, carbsMacro, fatMacro].map((m, i) => ({
+          key: m?.key ?? String(i),
+          label: m?.label ?? "",
+          current: m?.current ?? 0,
+          goal: m?.goal ?? 0,
+        })),
+      }
+    : {
+        calories: selectedDay.meals.reduce((sum, meal) => sum + (meal.calories ?? 0), 0),
+        macros: [
+          { key: "protein", label: "Protein", current: selectedDay.macros?.proteinG ?? 0, goal: selectedDay.macros?.proteinGoalG ?? 0 },
+          { key: "carbs", label: "Carbs", current: selectedDay.macros?.carbsG ?? 0, goal: selectedDay.macros?.carbsGoalG ?? 0 },
+          { key: "fat", label: "Fat", current: selectedDay.macros?.fatG ?? 0, goal: selectedDay.macros?.fatGoalG ?? 0 },
+        ],
+      };
 
   return (
     <ScrollView style={styles.flex} contentContainerStyle={styles.calendarContent}>
@@ -555,20 +604,22 @@ const CalendarDetail = ({
                 day: "numeric",
               })}
             </Text>
-            {selectedDay.isToday && today.session && !today.completedWorkout && (
+            {heroStats && (
               <View style={styles.calHeroStatsRow}>
                 <View style={styles.calHeroStat}>
-                  <Text style={styles.calHeroStatValue}>{today.session.exercises.length}</Text>
-                  <Text style={styles.calHeroStatLabel}>Exercises</Text>
+                  <Text style={styles.calHeroStatValue}>{heroStats.exercises}</Text>
+                  <Text style={styles.calHeroStatLabel}>
+                    {heroStats.exercises === 1 ? "Exercise" : "Exercises"}
+                  </Text>
                 </View>
                 <View style={styles.calHeroStatDivider} />
                 <View style={styles.calHeroStat}>
-                  <Text style={styles.calHeroStatValue}>{totalSets}</Text>
-                  <Text style={styles.calHeroStatLabel}>Total sets</Text>
+                  <Text style={styles.calHeroStatValue}>{heroStats.sets}</Text>
+                  <Text style={styles.calHeroStatLabel}>{heroStats.setsLabel}</Text>
                 </View>
                 <View style={styles.calHeroStatDivider} />
                 <View style={styles.calHeroStat}>
-                  <Text style={styles.calHeroStatValue}>Strength</Text>
+                  <Text style={styles.calHeroStatValue}>{titleCase(heroStats.type)}</Text>
                   <Text style={styles.calHeroStatLabel}>Type</Text>
                 </View>
               </View>
@@ -577,27 +628,33 @@ const CalendarDetail = ({
         ) : (
           <>
             <View style={styles.calHeroTop}>
-              <Text style={styles.calHeroEyebrow}>TODAY'S NUTRITION</Text>
+              <Text style={styles.calHeroEyebrow}>
+                {selectedDay.isToday ? "TODAY'S NUTRITION" : "NUTRITION"}
+              </Text>
               <View style={styles.calHeroIconBadge}>
                 <UtensilsIcon size={18} color={lightCard.iconOn} />
               </View>
             </View>
-            <Text style={styles.calHeroTitle}>{caloriesMacro?.current ?? 0} kcal</Text>
+            <Text style={styles.calHeroTitle}>{nutritionHero.calories} kcal</Text>
             <Text style={styles.calHeroDate}>
-              {new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}
+              {startOfLocalDay(timelineDateKey).toLocaleDateString("en-US", {
+                weekday: "long",
+                month: "long",
+                day: "numeric",
+              })}
             </Text>
             <View style={styles.calHeroStatsRow}>
-              {[proteinMacro, carbsMacro, fatMacro].map((m, i) => (
-                <View key={m?.key ?? i} style={styles.calHeroStat}>
+              {nutritionHero.macros.map((m) => (
+                <View key={m.key} style={styles.calHeroStat}>
                   <Text style={styles.calHeroStatValue}>
-                    {m?.current ?? 0}/{m?.goal ?? 0}g
+                    {m.current}/{m.goal}g
                   </Text>
-                  <Text style={styles.calHeroStatLabel}>{m?.label ?? ""}</Text>
+                  <Text style={styles.calHeroStatLabel}>{m.label}</Text>
                   <View style={styles.calHeroStatBarTrack}>
                     <View
                       style={[
                         styles.calHeroStatBarFill,
-                        { width: `${m && m.goal > 0 ? Math.min(100, Math.round((m.current / m.goal) * 100)) : 0}%` },
+                        { width: `${m.goal > 0 ? Math.min(100, Math.round((m.current / m.goal) * 100)) : 0}%` },
                       ]}
                     />
                   </View>
@@ -856,7 +913,7 @@ const ProfileDetail = ({ userId, userName }: { userId: string | null; userName: 
       const { error } = await supabase.functions.invoke("delete-account");
       if (error) throw new Error(error.message);
       await supabase.auth.signOut({ scope: "local" });
-      await clearLocalUserData(userId);
+      await clearLocalUserData();
     } catch (err) {
       console.error("[drawer] failed to delete account:", err);
       Alert.alert("Couldn't delete your account", "Check your connection and try again.");
@@ -1069,14 +1126,19 @@ export const AppDrawer = ({
   const detailTranslateX = stageAnim.interpolate({ inputRange: [0, 1], outputRange: [SCREEN_WIDTH, 0] });
   const detailOpacity = stageAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 1] });
 
-  const historyCount = historyGroups.reduce((n, g) => n + g.entries.length, 0);
-  const lastEntry = historyGroups[0]?.entries[historyGroups[0].entries.length - 1];
+  const historyEntries = historyGroups.flatMap((g) => g.entries);
+  const historyCount = historyEntries.length;
+  const lastEntry = historyEntries[historyEntries.length - 1];
   const historySummary = historyCount === 0 ? "No conversations yet" : `${historyCount} conversations · last one ${lastEntry ? relativeTime(lastEntry.at) : ""}`;
   const calendarSummary = today.completedWorkout
     ? `${today.completedWorkout.focus ? titleCase(today.completedWorkout.focus) : "Training"} · done today`
-    : today.session
-      ? `${titleCase(today.session.focus)} · today`
-      : "Rest day · today";
+    : today.planStartsOn
+      ? `Starts ${startOfLocalDay(today.planStartsOn).toLocaleDateString("en-US", { weekday: "long" })} · upcoming`
+      : today.session
+        ? `${titleCase(today.session.focus)} · today`
+        : today.hasPlan
+          ? "Rest day · today"
+          : "No plan yet";
   const profileSummary = userName ? `${userName} · Coached by MUSTLE` : "Coached by MUSTLE";
 
   if (!mounted) return null;

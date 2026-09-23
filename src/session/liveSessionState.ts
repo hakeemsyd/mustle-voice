@@ -2,6 +2,10 @@ import type { LoggedSet, SessionExercise, SessionTarget } from './ActiveSessionC
 import { kgToDisplayWeight, type Units } from '../lib/units';
 import { convertLoadScheme } from '../lib/loadScheme';
 import { titleCase } from '../lib/textFormat';
+import { isTimedExercise } from '../lib/exerciseCatalog';
+
+const formatDuration = (seconds: number): string =>
+  seconds >= 60 && seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds}s held`;
 
 export interface LiveSessionSnapshot {
   target: SessionTarget;
@@ -97,7 +101,7 @@ export function describeLiveSessionSnapshot(
         ? c.loggedSets
             .map((s) =>
               s.unit === 'seconds'
-                ? `${s.reps}s held`
+                ? formatDuration(s.reps)
                 : `${s.weight != null ? kgToDisplayWeight(s.weight, units) : 'bodyweight'}×${s.reps}`,
             )
             .join(', ')
@@ -108,7 +112,7 @@ export function describeLiveSessionSnapshot(
     // live: "set 4 of 4" (3 done, the 4th still to do) was read as "4 of 4 finished", and the
     // coach moved on to the next exercise while the app was still waiting on the last set.
     lines.push(
-      `- Current exercise: "${c.name}" — target reps ${c.repScheme}` +
+      `- Current exercise: "${c.name}" — ${isTimedExercise(c.name) ? 'target time' : 'target reps'} ${c.repScheme}` +
         `${c.loadScheme ? `, load ${convertLoadScheme(c.loadScheme, units)}` : ''}. When you say the target out loud, say ` +
         `EXACTLY ${c.repScheme} — never a rep range carried over from an earlier exercise in this ` +
         `session, however many times you just said it.`,
@@ -129,6 +133,17 @@ export function describeLiveSessionSnapshot(
             `a set failed to register, and never accuse them of repeating one; if the two disagree, ` +
             `believe the more recent one and move on.`
         : `- Sets COMPLETED on it: ${done} of ${c.totalSets}. This exercise is finished.`,
+    );
+    lines.push(
+      `- Counting reps out loud together, even all the way to or past the target, is NOT a ` +
+        `completed set and never changes the number above — confirmed live: after counting to ten ` +
+        `together with the user, the coach announced "that's ten reps, solid first set" and "rest ` +
+        `is starting now," neither of which had happened, then argued with the user before backing ` +
+        `down. The COMPLETED count above is the only thing that says a set happened; if it hasn't ` +
+        `moved, nothing was logged, whatever was just said out loud. Never announce a set as done, ` +
+        `never say rest is starting, and never invent a reason a rep total went over target, unless ` +
+        `this exact block already shows it. If the user tells you it was just counting, agree ` +
+        `immediately on the first correction — don't defend a claim this block already disproves.`,
     );
     lines.push(`- Loads logged so far on this exercise: ${loggedDesc}.`);
   } else {

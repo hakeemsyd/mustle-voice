@@ -10,6 +10,8 @@ import { isBodyweightExercise, loadSchemeForExercise } from './exercise-catalog.
 import { issueConfirmToken, verifyConfirmToken } from './confirm-token.ts';
 import { validatePlan, explainViolations, forbiddenTags, type Injury } from './injury-validator.ts';
 import { validateSplit, explainSplitProblems } from './split-validator.ts';
+import { matchSessionExercise } from './session-navigation.ts';
+import { findInventedRepTargets } from './rep-target.ts';
 import { computeNutritionTargets, computeBodyFatGoal, type GoalObjective } from './nutrition.ts';
 import {
   resolveTodaySession,
@@ -20,6 +22,13 @@ import {
   fetchDayOverrideSession,
 } from './brain-context.ts';
 import { LIVE_STATE_MAX_AGE_MS } from './live-session-format.ts';
+import { userClaimedSetFinished } from './set-completion.ts';
+import { buildLoadHistory } from './load-history.ts';
+import {
+  CONSULTATION_TOPICS,
+  missingConsultationTopics,
+  type ConsultationTopic,
+} from './consultation-context.ts';
 import type { ToolHandlers } from './brain-orchestrator.ts';
 
 const DUPLICATE_WINDOW_MS = 5 * 60 * 1000;
@@ -322,6 +331,38 @@ async function writeAppAction(supabase: any, userId: string, type: string, paylo
   if (error) throw new Error(`app_action insert: ${error.message}`);
 }
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// start_todays_workout used to say "started" the instant the app_action row was queued — the
+// client hadn't necessarily picked it up, run session.start(), and published live_session_state
+// yet, so the reply could claim the workout was live before it actually was. Polls briefly for
+// the client's own confirmation instead of trusting the queue write.
+async function waitForLiveSessionStart(supabase: any, userId: string, after: string): Promise<boolean> {
+  for (let i = 0; i < 6; i++) {
+    await sleep(250);
+    const { data } = await supabase
+      .from('live_session_state')
+      .select('updated_at')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (data && new Date(data.updated_at).getTime() >= new Date(after).getTime()) return true;
+  }
+  return false;
+}
+
+async function waitForExerciseIndex(supabase: any, userId: string, index: number): Promise<boolean> {
+  for (let i = 0; i < 6; i++) {
+    await sleep(250);
+    const { data } = await supabase
+      .from('live_session_state')
+      .select('state')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (data?.state?.currentExerciseIndex === index) return true;
+  }
+  return false;
+}
+
 async function fetchActiveInjuries(supabase: any, userId: string): Promise<Injury[]> {
   const { data, error } = await supabase
     .from('injury')
@@ -347,10 +388,19 @@ async function writePlan(
   options: { confirmSecret?: string; requireConfirm?: boolean } = {},
 ) {
   const names = plan.sessions.flatMap((s: any) => s.exercises.map((e: any) => e.name));
-  const [injuries, exerciseByName] = await Promise.all([
+  const [injuries, exerciseByName, { data: recentLogs }] = await Promise.all([
     fetchActiveInjuries(supabase, userId),
     resolveExercises(supabase, names),
+    supabase
+      .from('workout_log')
+      .select('at, exercises_done')
+      .eq('user_id', userId)
+      .order('at', { ascending: false })
+      .limit(10),
   ]);
+  const exercisesWithLoadHistory = new Set(
+    buildLoadHistory(recentLogs ?? []).map((h) => h.name.toLowerCase()),
+  );
 
   const exercisesForValidator = names.map((name: string) => ({
     name,
@@ -364,7 +414,7 @@ async function writePlan(
   // generated plan ran Upper Push on two consecutive days and gave push double the volume of
   // pull, and passed every gate because nothing looked at the week as a whole.
   const splitProblems = validateSplit(
-    plan.sessions.map((s: any) => ({ day_order: s.day_order, focus: humanizeFocus(s.focus) })),
+    plan.sessions.map((s: any) => ({ day_order: s.day_order, focus: humanizeFocus(s.focus), weekday: s.weekday })),
   );
   if (splitProblems.length > 0) {
     throw new Error(
@@ -374,18 +424,50 @@ async function writePlan(
   }
 
   for (const name of names) {
-    if (!exerciseByName.has(name)) throw new Error(`Unknown exercise "${name}" — not in the catalog.`);
+    if (!exerciseByName.has(name)) {
+      throw new Error(
+        `Unknown exercise "${name}" — not in the catalog. Nothing was saved. Do not pick a ` +
+          `replacement yourself: tell the user this exact exercise isn't available, propose the ` +
+          `closest catalog alternative, wait for them to agree to it (or name their own), and only ` +
+          `then call this tool again with that confirmed name.`,
+      );
+    }
   }
 
   // Only generate_training_plan gates on this, not update_training_plan (a live plan revision
   // is already an in-conversation, immediate action per the client's confirmation-gate spec) —
   // a brand-new user's very first plan is the one place Damion asked for an explicit consultation
-  // and start-date confirmation before anything goes live. Keyed on a fixed literal, not the plan
-  // payload itself — a full multi-session/exercise plan is exactly the kind of large structure an
-  // LLM won't reproduce byte-for-byte between preview and confirm calls (see log_workout's
-  // identical fix, same session), and there's only ever one "confirm my new plan" action pending
-  // at a time for a given conversation, so a payload-bound signature buys nothing here.
+  // and start-date confirmation before anything goes live.
   if (options.requireConfirm) {
+    const { data: anyPriorPlan } = await supabase
+      .from('training_plan')
+      .select('id')
+      .eq('user_id', userId)
+      .limit(1)
+      .maybeSingle();
+    if (!anyPriorPlan) {
+      const { data: progress } = await supabase
+        .from('consultation_progress')
+        .select('topics')
+        .eq('user_id', userId)
+        .maybeSingle();
+      const missing = missingConsultationTopics((progress?.topics ?? []) as string[]);
+      if (missing.length > 0) {
+        throw new Error(
+          `Not ready to propose a plan yet — still missing from the consultation: ${missing.join(', ')} ` +
+            `(of ${CONSULTATION_TOPICS.join(', ')}). Nothing was saved. Keep the conversation natural: ask ` +
+            'about what is missing, call note_consultation_covered as each is resolved (a clear "I don\'t ' +
+            'know, use your judgment" counts as resolved too), then call generate_training_plan again once ' +
+            'all four are covered.',
+        );
+      }
+    }
+
+    // Keyed on a fixed literal, not the plan payload itself — a full multi-session/exercise plan
+    // is exactly the kind of large structure an LLM won't reproduce byte-for-byte between preview
+    // and confirm calls (see log_workout's identical fix, same session), and there's only ever one
+    // "confirm my new plan" action pending at a time for a given conversation, so a payload-bound
+    // signature buys nothing here.
     const tokenKey = 'new_plan';
     if (
       !plan.confirm ||
@@ -398,25 +480,35 @@ async function writePlan(
         sessions: plan.sessions,
         confirm_token: await issueConfirmToken(options.confirmSecret!, 'generate_training_plan', tokenKey),
         instruction:
-          'Nothing is saved yet. Read back the plan (split, days per week, one line per session) and ' +
-          'confirm which real day they want to start on, wait for explicit agreement, then call ' +
-          'generate_training_plan again with the same fields plus confirm:true and this exact confirm_token.',
+          'Nothing is saved yet. Read back the plan (split, days per week, one line per session) and the ' +
+          'proposed nutrition approach, confirm which real day they want to start on, wait for explicit ' +
+          'agreement, then call generate_training_plan again with the same fields plus confirm:true, ' +
+          'starts_on (that exact date, YYYY-MM-DD), and this exact confirm_token.',
       };
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(plan.starts_on ?? ''))) {
+      throw new Error(
+        'starts_on (YYYY-MM-DD) is required alongside confirm:true and must be a real calendar date — ' +
+          'nothing was saved. Compute it from the current date in your context plus what the user just ' +
+          'agreed to, then call generate_training_plan again with the same fields, confirm:true, this ' +
+          'exact confirm_token, and starts_on.',
+      );
     }
   }
 
   const rpcPlan = {
     split: plan.split,
     days_per_week: plan.days_per_week,
+    starts_on: plan.starts_on ?? null,
     sessions: plan.sessions.map((session: any) => ({
       day_order: session.day_order,
-      weekday: session.weekday ?? null,
+      weekday: null,
       focus: humanizeFocus(session.focus),
       exercises: session.exercises.map((e: any) => ({
         exercise_id: exerciseByName.get(e.name)!.id,
         sets: e.sets,
         rep_scheme: e.rep_scheme,
-        load_scheme: loadSchemeForExercise(e.name, e.load_scheme),
+        load_scheme: loadSchemeForExercise(e.name, e.load_scheme, exercisesWithLoadHistory.has(e.name.toLowerCase())),
       })),
     })),
   };
@@ -429,6 +521,15 @@ async function writePlan(
     p_plan: rpcPlan,
   });
   if (rpcError) throw new Error(`write_training_plan: ${rpcError.message}`);
+
+  if (options.requireConfirm) {
+    await supabase.from('consultation_progress').delete().eq('user_id', userId);
+  }
+
+  // Home caches what it fetched on its last load, so a plan created from chat left it showing
+  // "No plan yet" until the app was killed and relaunched. refresh_home already exists for
+  // exactly this (AppActionBridge), it was just never fired for the events that change the plan.
+  await writeAppAction(supabase, userId, 'refresh_home', { reason: 'plan_written' }).catch(() => {});
 
   return { status: 'persisted', plan_id: planId, split: plan.split, days_per_week: plan.days_per_week };
 }
@@ -458,6 +559,8 @@ async function writeNutritionTargets(supabase: any, userId: string, goal: GoalOb
     ...targets,
   });
   if (targetError) throw new Error(`nutrition_target upsert: ${targetError.message}`);
+  // Home's macro ring reads these, so it needs the same nudge the plan write gets.
+  await writeAppAction(supabase, userId, 'refresh_home', { reason: 'nutrition_targets_set' }).catch(() => {});
 
   const { error: goalError } = await supabase.from('goal').upsert({ user_id: userId, objective: goal });
   if (goalError) console.error('[brain] goal upsert:', goalError.message);
@@ -517,7 +620,7 @@ const resolveTodaysExercises = async (
   const [{ data: plan }, { data: recentLogs }, restDayDates, override] = await Promise.all([
     supabase
       .from('training_plan')
-      .select('plan_session(id, day_order, weekday, focus)')
+      .select('starts_on, plan_session(id, day_order, weekday, focus)')
       .eq('user_id', userId)
       .eq('status', 'active')
       .maybeSingle(),
@@ -537,6 +640,7 @@ const resolveTodaysExercises = async (
     now,
     restDayDates,
     override,
+    plan?.starts_on ?? null,
   );
   if (!today) return null;
 
@@ -566,7 +670,7 @@ export function createHandlers(
   supabase: any,
   userId: string,
   requestTimezone?: string | null,
-  options: { planNeedsConfirm?: boolean } = {},
+  options: { currentUserText?: string | null } = {},
 ): ToolHandlers {
   // Secret for confirm-token signing (see confirm-token.ts) — reused rather than a new env
   // var since it's already injected into every edge function and never leaves this process.
@@ -629,6 +733,9 @@ export function createHandlers(
             sessions,
             logsInTimezone(recentLogs ?? [], timezone),
             nowInTimezone(timezone),
+            undefined,
+            undefined,
+            out.plan?.starts_on ?? null,
           );
           out.next_session_to_train = nextSession
             ? {
@@ -744,11 +851,7 @@ export function createHandlers(
       return out;
     },
 
-    generate_training_plan: (input) =>
-      writePlan(supabase, userId, input, {
-        confirmSecret,
-        requireConfirm: options.planNeedsConfirm !== false,
-      }),
+    generate_training_plan: (input) => writePlan(supabase, userId, input, { confirmSecret, requireConfirm: true }),
     update_training_plan: (input) => writePlan(supabase, userId, input),
 
     generate_nutrition_targets: (input) => writeNutritionTargets(supabase, userId, input.goal),
@@ -776,9 +879,13 @@ export function createHandlers(
     },
 
     record_injury: async (input) => {
-      const { error } = await supabase
-        .from('injury')
-        .insert({ user_id: userId, area: input.area, severity: input.severity ?? null, note: input.note ?? null });
+      const { error } = await supabase.from('injury').insert({
+        user_id: userId,
+        area: input.area,
+        severity: input.severity ?? null,
+        pain_level: typeof input.pain_level === 'number' ? input.pain_level : null,
+        note: input.note ?? null,
+      });
       if (error) throw new Error(`injury insert: ${error.message}`);
 
       const injuries = await fetchActiveInjuries(supabase, userId);
@@ -1113,17 +1220,30 @@ export function createHandlers(
     },
 
     log_checkin: async (input) => {
-      const { error } = await supabase.from('checkin_log').insert({ user_id: userId, ...input });
+      const { body_fat_pct: bodyFatPct, ...checkinFields } = input;
+      const { error } = await supabase.from('checkin_log').insert({ user_id: userId, ...checkinFields });
       if (error) throw new Error(`checkin_log insert: ${error.message}`);
 
-      // A reported weight also belongs in the weight_log series: that is what the trend reads and
-      // what writeNutritionTargets recomputes from. Without this every future target derives from
-      // the onboarding weight no matter how many times the user weighs in.
       if (typeof input.weight_kg === 'number') {
         const { error: weightError } = await supabase
           .from('weight_log')
-          .insert({ user_id: userId, weight_kg: input.weight_kg });
+          .insert({ user_id: userId, weight_kg: input.weight_kg, body_fat_pct: bodyFatPct ?? null });
         if (weightError) console.error('[brain] weight_log insert:', weightError.message);
+      } else if (typeof bodyFatPct === 'number') {
+        const { data: lastWeight, error: fetchError } = await supabase
+          .from('weight_log')
+          .select('weight_kg')
+          .eq('user_id', userId)
+          .order('measured_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (fetchError) console.error('[brain] weight_log fetch for body-fat:', fetchError.message);
+        else if (lastWeight) {
+          const { error: weightError } = await supabase
+            .from('weight_log')
+            .insert({ user_id: userId, weight_kg: lastWeight.weight_kg, body_fat_pct: bodyFatPct });
+          if (weightError) console.error('[brain] weight_log insert (body-fat only):', weightError.message);
+        }
       }
 
       return { status: 'logged' };
@@ -1151,7 +1271,7 @@ export function createHandlers(
     open_todays_workout: async () => {
       const { data: activePlan } = await supabase
         .from('training_plan')
-        .select('plan_session(id, day_order, weekday, focus)')
+        .select('starts_on, plan_session(id, day_order, weekday, focus)')
         .eq('user_id', userId)
         .eq('status', 'active')
         .maybeSingle();
@@ -1181,6 +1301,7 @@ export function createHandlers(
         now,
         restDayDates,
         override,
+        activePlan?.starts_on ?? null,
       );
       if (!today) return { status: 'no_session', reason: 'rest_day' };
 
@@ -1194,7 +1315,7 @@ export function createHandlers(
     start_todays_workout: async (input) => {
       const { data: activePlan } = await supabase
         .from('training_plan')
-        .select('plan_session(id, day_order, weekday, focus)')
+        .select('starts_on, plan_session(id, day_order, weekday, focus)')
         .eq('user_id', userId)
         .eq('status', 'active')
         .maybeSingle();
@@ -1229,6 +1350,7 @@ export function createHandlers(
         now,
         restDayDates,
         override,
+        activePlan?.starts_on ?? null,
       );
       if (!today) return { status: 'no_session', reason: 'rest_day' };
 
@@ -1265,7 +1387,20 @@ export function createHandlers(
         };
       }
 
+      const requestedAt = new Date().toISOString();
       await writeAppAction(supabase, userId, 'start_workout', { plan_session_id: today.id });
+      const landed = await waitForLiveSessionStart(supabase, userId, requestedAt);
+      if (!landed) {
+        return {
+          status: 'starting',
+          plan_session_id: today.id,
+          focus: humanizeFocus(today.focus),
+          instruction:
+            "The app hasn't confirmed the session is open yet. Tell them you're launching it — " +
+            'do not say they are live, do not give a set instruction, and do not ask for reps. ' +
+            'Wait for a live session state block in a later turn before treating it as active.',
+        };
+      }
       return { status: 'started', plan_session_id: today.id, focus: humanizeFocus(today.focus) };
     },
 
@@ -1279,9 +1414,27 @@ export function createHandlers(
       const now = nowInTimezone(timezone);
       const todayKey = now.toISOString().slice(0, 10);
 
+      // A future date is the "I can't train Monday" case. Only today was supported before, so the
+      // model reached for this tool anyway and narrated a result it never got — including pairing
+      // a weekday with a date that wasn't that weekday. The resolved weekday goes back in the
+      // result so a mismatch is the model's to catch rather than to invent.
+      const targetKey = typeof input.date === 'string' && input.date.length > 0 ? input.date : todayKey;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(targetKey)) {
+        throw new Error('date must be YYYY-MM-DD. Nothing changed.');
+      }
+      if (targetKey < todayKey) {
+        throw new Error(
+          `${targetKey} is in the past — a day that has already been cannot be turned into a rest ` +
+            'day. Nothing changed.',
+        );
+      }
+      const targetDate = new Date(`${targetKey}T00:00:00Z`);
+      const targetWeekday = targetDate.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
+      const isToday = targetKey === todayKey;
+
       const { data: plan } = await supabase
         .from('training_plan')
-        .select('plan_session(id, day_order, weekday, focus)')
+        .select('starts_on, plan_session(id, day_order, weekday, focus)')
         .eq('user_id', userId)
         .eq('status', 'active')
         .maybeSingle();
@@ -1298,20 +1451,30 @@ export function createHandlers(
       ]);
       const logs = logsInTimezone((recentLogs ?? []) as any[], timezone);
       const sessions = plan.plan_session ?? [];
-      const override = await fetchDayOverrideSession(supabase, userId, todayKey);
-      const dueToday = resolveTodaySession(sessions, logs, now, restDayDates, override);
-      if (!dueToday) return { status: 'already_rest_day' };
+      const override = await fetchDayOverrideSession(supabase, userId, targetKey);
+      const dueToday = resolveTodaySession(
+        sessions,
+        logs,
+        isToday ? now : targetDate,
+        restDayDates,
+        override,
+        plan.starts_on ?? null,
+      );
+      if (!dueToday) return { status: 'already_rest_day', date: targetKey, weekday: targetWeekday };
 
-      if (!input.confirm || !(await verifyConfirmToken(confirmSecret, 'reschedule_today', dueToday.id, input.confirm_token))) {
+      const tokenSubject = `${dueToday.id}:${targetKey}`;
+      if (!input.confirm || !(await verifyConfirmToken(confirmSecret, 'reschedule_today', tokenSubject, input.confirm_token))) {
         return {
           status: 'preview',
+          date: targetKey,
+          weekday: targetWeekday,
           would_reschedule: { plan_session_id: dueToday.id, focus: humanizeFocus(dueToday.focus) },
-          confirm_token: await issueConfirmToken(confirmSecret, 'reschedule_today', dueToday.id),
+          confirm_token: await issueConfirmToken(confirmSecret, 'reschedule_today', tokenSubject),
           instruction:
-            `Nothing is saved yet. Confirm with the user that "${humanizeFocus(dueToday.focus)}" moves off today ` +
-            'and becomes a rest day (the plan itself is unchanged — it resumes from this same ' +
-            'session next time they train), then call reschedule_today again with confirm:true and ' +
-            'this exact confirm_token.',
+            `Nothing is saved yet. Confirm with the user that "${humanizeFocus(dueToday.focus)}" moves off ` +
+            `${isToday ? 'today' : `${targetWeekday} ${targetKey}`} and becomes a rest day (the plan itself ` +
+            'is unchanged — it resumes from this same session next time they train), then call ' +
+            'reschedule_today again with confirm:true and this exact confirm_token.',
         };
       }
 
@@ -1323,28 +1486,128 @@ export function createHandlers(
           .from('day_override')
           .delete()
           .eq('user_id', userId)
-          .eq('date', todayKey);
+          .eq('date', targetKey);
         if (overrideError) throw new Error(`day_override delete: ${overrideError.message}`);
       }
 
       const { error } = await supabase
         .from('rest_day')
         .upsert(
-          { user_id: userId, date: todayKey, plan_session_id: dueToday.id, reason: 'coach_reschedule' },
+          { user_id: userId, date: targetKey, plan_session_id: dueToday.id, reason: 'coach_reschedule' },
           { onConflict: 'user_id,date' },
         );
       if (error) throw new Error(`rest_day upsert: ${error.message}`);
 
       // Code-enforced proof, not an assumed side effect — re-resolve with the just-written rest
       // day in place and only report success if today genuinely comes back null.
-      const stillDue = resolveTodaySession(sessions, logs, now, new Set([...restDayDates, todayKey]));
-      if (stillDue) throw new Error('reschedule_today: today still resolves as due after writing rest_day.');
+      const stillDue = resolveTodaySession(
+        sessions,
+        logs,
+        isToday ? now : targetDate,
+        new Set([...restDayDates, targetKey]),
+        undefined,
+        plan.starts_on ?? null,
+      );
+      if (stillDue) throw new Error(`reschedule_today: ${targetKey} still resolves as due after writing rest_day.`);
 
       return {
         status: 'rescheduled',
-        rest_day_date: todayKey,
+        rest_day_date: targetKey,
+        weekday: targetWeekday,
         deferred_session: { plan_session_id: dueToday.id, focus: humanizeFocus(dueToday.focus) },
       };
+    },
+
+    note_consultation_covered: async (input) => {
+      const requested = Array.isArray(input.topics) ? (input.topics as string[]) : [];
+      const topics = requested.filter((t): t is ConsultationTopic =>
+        (CONSULTATION_TOPICS as readonly string[]).includes(t),
+      );
+      if (topics.length === 0) return { status: 'noop' };
+
+      const { data: existing } = await supabase
+        .from('consultation_progress')
+        .select('topics')
+        .eq('user_id', userId)
+        .maybeSingle();
+      const covered = Array.from(new Set([...(existing?.topics ?? []), ...topics]));
+
+      // The gate in writePlan trusts this table, so without a limit here the model can open its
+      // own gate — confirmed live: told to "skip the questions" it marked all four topics covered
+      // in a single call, having asked nothing, and went straight to building the plan. Each real
+      // answer can legitimately settle at most two topics, so tying the ceiling to the number of
+      // turns the user has actually taken makes a wholesale self-certification impossible while
+      // leaving the genuine flow (two topics from a combined answer, then the rest) untouched.
+      const { data: openerRow } = await supabase
+        .from('message')
+        .select('at')
+        .eq('user_id', userId)
+        .eq('role', 'user')
+        .eq('hidden', true)
+        .order('at', { ascending: true })
+        .limit(1)
+        .maybeSingle();
+      let userTurns = 0;
+      if (openerRow?.at) {
+        const { data: turnRows } = await supabase
+          .from('message')
+          .select('id')
+          .eq('user_id', userId)
+          .eq('role', 'user')
+          .eq('hidden', false)
+          .gt('at', openerRow.at);
+        userTurns = turnRows?.length ?? 0;
+      }
+      const ceiling = Math.max(1, userTurns) * 2;
+      if (covered.length > ceiling) {
+        throw new Error(
+          `Can't mark ${covered.length} topics covered yet — the user has only answered ${userTurns} ` +
+            `time(s) since the consultation started, so at most ${ceiling} can be settled so far. ` +
+            `Nothing was saved. Ask about what's still missing and call this again as each is genuinely ` +
+            `answered (a clear "I don't know, use your judgment" counts as answered).`,
+        );
+      }
+
+      const { error } = await supabase
+        .from('consultation_progress')
+        .upsert({ user_id: userId, topics: covered, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+      if (error) throw new Error(`consultation_progress upsert: ${error.message}`);
+
+      return { status: 'noted', covered, still_missing: missingConsultationTopics(covered) };
+    },
+
+    update_plan_start_date: async (input) => {
+      const { data: plan } = await supabase
+        .from('training_plan')
+        .select('id, starts_on')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .maybeSingle();
+      if (!plan) return { status: 'no_plan' };
+
+      const timezone = await resolveTimezone(supabase, userId, requestTimezone);
+      const todayKey = nowInTimezone(timezone).toISOString().slice(0, 10);
+      if (!plan.starts_on || plan.starts_on <= todayKey) return { status: 'already_started' };
+
+      const target = input.new_starts_on ?? todayKey;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(target)) {
+        throw new Error('new_starts_on must be YYYY-MM-DD. Nothing changed.');
+      }
+
+      if (!input.confirm) {
+        return {
+          status: 'preview',
+          would_start_on: target,
+          instruction:
+            `Nothing changed yet. Confirm they want the plan to start ${target} instead of ${plan.starts_on}, ` +
+            'then call update_plan_start_date again with confirm:true.',
+        };
+      }
+
+      const { error } = await supabase.from('training_plan').update({ starts_on: target }).eq('id', plan.id);
+      if (error) throw new Error(`training_plan update: ${error.message}`);
+      await writeAppAction(supabase, userId, 'refresh_home', { reason: 'start_date_changed' }).catch(() => {});
+      return { status: 'updated', starts_on: target };
     },
 
     create_custom_session: async (input) => {
@@ -1375,10 +1638,19 @@ export function createHandlers(
             'no repeats and call again.',
         };
       }
-      const [injuries, exerciseByName] = await Promise.all([
+      const [injuries, exerciseByName, { data: recentLogsForCustomSession }] = await Promise.all([
         fetchActiveInjuries(supabase, userId),
         resolveExercises(supabase, names),
+        supabase
+          .from('workout_log')
+          .select('at, exercises_done')
+          .eq('user_id', userId)
+          .order('at', { ascending: false })
+          .limit(10),
       ]);
+      const exercisesWithLoadHistoryForCustomSession = new Set(
+        buildLoadHistory(recentLogsForCustomSession ?? []).map((h) => h.name.toLowerCase()),
+      );
 
       // Same gate as writePlan, and deliberately returned as a tool result rather than thrown:
       // the model is expected to revise and call again, which it can only do if it's told exactly
@@ -1388,8 +1660,10 @@ export function createHandlers(
         return {
           status: 'rejected',
           reason:
-            `Not in the catalog: ${unknown.join(', ')}. Nothing was created. Rebuild the session ` +
-            'using only exact catalog names from your instructions and call again.',
+            `Not in the catalog: ${unknown.join(', ')}. Nothing was created. Do not pick a ` +
+            `replacement yourself: tell the user each one isn't available, propose the closest ` +
+            `catalog alternative, wait for them to agree to it (or name their own), and only then ` +
+            'call this tool again with those confirmed names.',
         };
       }
 
@@ -1404,16 +1678,31 @@ export function createHandlers(
         };
       }
 
+      const invented = findInventedRepTargets(requested, options.currentUserText ?? null);
+      if (invented.length > 0) {
+        return {
+          status: 'rejected',
+          reason:
+            `Nothing was created. The rep target you gave for ${invented.join(', ')} is just the set ` +
+            `count repeated back — "x4" in their workout means four SETS and says nothing about reps, ` +
+            `so a rep target of 4 is a number they never gave. Ask them what rep target they want on ` +
+            `these, or use their logged history for each one and say that is what you did, then call ` +
+            `again.`,
+        };
+      }
+
       const focus = humanizeFocus(input.focus);
       // Keyed on a fixed literal rather than the payload: an LLM won't reproduce a multi-exercise
       // structure byte-for-byte between the preview and confirm calls, and only one custom session
       // is ever pending at a time (same reasoning as writePlan's 'new_plan' key).
       const tokenKey = 'custom_session';
       if (!input.confirm || !(await verifyConfirmToken(confirmSecret, 'create_custom_session', tokenKey, input.confirm_token))) {
+        const omissions = (input.source_omissions ?? []) as string[];
         return {
           status: 'preview',
           focus,
           exercises: requested,
+          source_omissions: omissions,
           confirm_token: await issueConfirmToken(confirmSecret, 'create_custom_session', tokenKey),
           instruction:
             `NOTHING HAS BEEN CREATED YET — do not tell the user they are all set, do not tell them ` +
@@ -1421,7 +1710,13 @@ export function createHandlers(
             `session (one line per exercise with sets and reps), say it replaces today's scheduled ` +
             `session and that the weekly plan itself is unchanged, wait for explicit agreement, then ` +
             `call create_custom_session again with the same fields plus confirm:true and this exact ` +
-            `confirm_token.`,
+            `confirm_token.` +
+            (omissions.length > 0
+              ? ` You are leaving out ${omissions.length} thing${omissions.length === 1 ? '' : 's'} ` +
+                `from what they gave you: ${omissions.join('; ')}. Say so in the same message, before ` +
+                `they agree — not after. Ask what they want done about each one rather than deciding ` +
+                `for them.`
+              : ''),
         };
       }
 
@@ -1433,7 +1728,11 @@ export function createHandlers(
           exercise_id: exerciseByName.get(e.name)!.id,
           sets: e.sets,
           rep_scheme: e.rep_scheme,
-          load_scheme: loadSchemeForExercise(e.name, e.load_scheme),
+          load_scheme: loadSchemeForExercise(
+            e.name,
+            e.load_scheme,
+            exercisesWithLoadHistoryForCustomSession.has(e.name.toLowerCase()),
+          ),
         })),
       });
       if (rpcError) throw new Error(`write_custom_session: ${rpcError.message}`);
@@ -1526,7 +1825,7 @@ export function createHandlers(
     show_daily_workout: async () => {
       const { data: plan, error } = await supabase
         .from('training_plan')
-        .select('plan_session(id, day_order, weekday, focus, plan_exercise(ord, sets, rep_scheme, exercise(name)))')
+        .select('starts_on, plan_session(id, day_order, weekday, focus, plan_exercise(ord, sets, rep_scheme, exercise(name)))')
         .eq('user_id', userId)
         .eq('status', 'active')
         .maybeSingle();
@@ -1556,6 +1855,7 @@ export function createHandlers(
         now,
         restDayDates,
         override,
+        plan?.starts_on ?? null,
       );
       if (!today) return { status: 'no_session', reason: 'rest_day' };
 
@@ -1883,9 +2183,116 @@ export function createHandlers(
       return { status: 'requested' };
     },
 
+    go_to_exercise: async (input) => {
+      const { data: liveRow } = await supabase
+        .from('live_session_state')
+        .select('updated_at, state')
+        .eq('user_id', userId)
+        .maybeSingle();
+      const isLive = liveRow && Date.now() - new Date(liveRow.updated_at).getTime() < LIVE_STATE_MAX_AGE_MS;
+      if (!isLive) {
+        return {
+          status: 'no_session',
+          instruction:
+            'Nothing was changed. There is no workout running in the app right now, so there is no ' +
+            'exercise to move to.',
+        };
+      }
+
+      const names: string[] = ((liveRow.state?.exercises ?? []) as { name?: string }[])
+        .map((e) => String(e?.name ?? ''))
+        .filter(Boolean);
+      const requested = String(input.exercise_name ?? '').trim();
+      const match = matchSessionExercise(names, requested);
+
+      if (match.kind === 'ambiguous') {
+        return {
+          status: 'ambiguous',
+          candidates: match.candidates,
+          instruction:
+            `Nothing was changed. "${requested}" could mean more than one exercise in this session: ` +
+            `${match.candidates.join(', ')}. Ask which one they meant and call again with that name.`,
+        };
+      }
+      if (match.kind === 'not_found') {
+        return {
+          status: 'not_in_session',
+          session_exercises: names,
+          instruction:
+            `Nothing was changed. "${requested}" is not one of the exercises in this workout. Tell ` +
+            'the user what the session actually contains (listed here) and ask which of those they ' +
+            'meant — never move them to an exercise they did not name.',
+        };
+      }
+
+      const targetIndex = names.findIndex((n) => n === match.name);
+      if (targetIndex === liveRow.state?.currentExerciseIndex) {
+        return {
+          status: 'already_there',
+          exercise_name: match.name,
+          instruction:
+            `Nothing was changed because ${match.name} is ALREADY the current exercise on their ` +
+            `screen. Do not say you moved or switched anything — confirm they are on it and carry on.`,
+        };
+      }
+
+      await writeAppAction(supabase, userId, 'go_to_exercise', { exercise_name: match.name });
+
+      const landed = await waitForExerciseIndex(supabase, userId, targetIndex);
+      if (!landed) {
+        return {
+          status: 'not_confirmed',
+          exercise_name: match.name,
+          instruction:
+            `The request was sent but the app has NOT confirmed the move yet. Do not tell the user ` +
+            `they are on ${match.name} — say you are moving them there and to check the card, and ` +
+            `believe the live session state block over your own request from here on.`,
+        };
+      }
+      return { status: 'moved', exercise_name: match.name };
+    },
+
     add_set: async () => {
       await writeAppAction(supabase, userId, 'add_set', {});
       return { status: 'requested' };
+    },
+
+    log_live_set: async (input) => {
+      const { data: liveRow } = await supabase
+        .from('live_session_state')
+        .select('updated_at')
+        .eq('user_id', userId)
+        .maybeSingle();
+      const isLive = liveRow && Date.now() - new Date(liveRow.updated_at).getTime() < LIVE_STATE_MAX_AGE_MS;
+      if (!isLive) return { status: 'no_session' };
+
+      if (!(await userClaimedSetFinished(supabase, userId, options.currentUserText ?? null))) {
+        return {
+          status: 'not_finished',
+          instruction:
+            'Nothing was logged. The user has not said they finished a set, so this would record one ' +
+            'they are still doing — counting reps out loud is not a report. Ask them to tell you when ' +
+            'the set is done and how many reps they got, then log it.',
+        };
+      }
+
+      const reps = Math.round(Number(input.reps));
+      if (!Number.isFinite(reps) || reps <= 0) return { status: 'invalid_reps' };
+
+      const rawWeight = typeof input.weight === 'number' ? input.weight : null;
+      const weightKg =
+        rawWeight === null || rawWeight <= 0
+          ? null
+          : input.weight_unit === 'lb'
+            ? Math.round(rawWeight * 0.453592 * 10) / 10
+            : rawWeight;
+
+      await writeAppAction(supabase, userId, 'log_set', {
+        reps,
+        weight_kg: weightKg,
+        unit: input.timed ? 'seconds' : null,
+      });
+      return { status: 'logged', reps, weight_kg: weightKg };
     },
 
     end_workout: async (input) => {

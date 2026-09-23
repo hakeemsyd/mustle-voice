@@ -66,7 +66,7 @@ export function GuideSheet({ open, onClose, exerciseId, exerciseName, repScheme,
           {reference ? (
             <>
               <View style={styles.guideCard}>
-                <ExerciseMotionIllustration motion={reference.motion} />
+                {reference.motion ? <ExerciseMotionIllustration motion={reference.motion} /> : null}
                 <Text style={styles.guideSummary}>{reference.summary}</Text>
                 <View style={styles.muscleRow}>
                   {reference.muscles.map((muscle) => (

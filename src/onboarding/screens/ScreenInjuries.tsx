@@ -90,7 +90,7 @@ export const ScreenInjuries = ({
             size="large"
           />
           <Pressable style={styles.doneBtn} onPress={() => setMapOpen(false)}>
-            <Text style={styles.doneBtnText}>DONE</Text>
+            <Text style={styles.doneBtnText}>SAVE AREAS</Text>
           </Pressable>
         </View>
       </BottomSheet>

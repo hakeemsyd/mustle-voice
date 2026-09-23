@@ -36,21 +36,15 @@ interface ScreenLoadingProps {
 // Sub-labels are real authored copy from the design (mustle-mvp's ScreenLoading.tsx), not
 // decorative — missing from this port entirely before.
 const STEPS = [
-  { label: "CREATING YOUR STARTING POINT", sub: "Generating personalized workouts", icon: "barbell" },
-  { label: "PREPARING EXPERIENCE", sub: "Calibrating to your profile", icon: "sparkle" },
-  { label: "SETTING UP COACH", sub: "MUSTLE is ready", icon: "avatar" },
+  { label: "SAVING YOUR ANSWERS", sub: "Setting up your profile", icon: "barbell" },
+  { label: "PREPARING YOUR COACH", sub: "Getting ready to talk things through", icon: "sparkle" },
+  { label: "ALMOST THERE", sub: "MUSTLE is ready", icon: "avatar" },
 ] as const;
 
 const STEP_DELAYS = [200, 1300, 2400];
-// Long enough that the animation always gets to play even when the plan lands instantly.
+// Long enough that the animation always gets to play even when the reply lands instantly.
 const MIN_DISPLAY_MS = 3000;
-// Plan generation measured ~15s in practice — this is a backstop, not the expected path, so
-// onboarding can never hang forever on a stuck or slow call. Deliberately still shorter than
-// the brain call's own 45s timeout (client already pushed back on a 30s wait) — the plan
-// generation promise keeps running in the background regardless of which side of this race
-// wins (see OnboardingFlow.tsx's planReadyRef), so a slow call handing off early doesn't lose
-// the result, it just means Home may briefly show the pending state until it lands.
-const SAFETY_TIMEOUT_MS = 30000;
+const SAFETY_TIMEOUT_MS = 15000;
 
 const BarbellIcon = () => (
   <Svg width={22} height={22} viewBox="0 0 22 22" fill="none">

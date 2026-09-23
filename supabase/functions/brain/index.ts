@@ -1,12 +1,16 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
 import { runBrainTurn } from '../_shared/brain-orchestrator.ts';
 import { replayHistory } from '../_shared/replay-history.ts';
-import { dropLeadingConcession } from '../_shared/humanize.ts';
+import { dropLeadingConcession, dropSelfCorrection } from '../_shared/humanize.ts';
 import { buildSystemPrompt, callModel, MESSAGE_HISTORY_LIMIT } from '../_shared/brain-config.ts';
 import { buildContextBlock, startOfLocalDayUtc } from '../_shared/brain-context.ts';
 import { createHandlers } from '../_shared/brain-handlers.ts';
-import { isOnboardingSetupTurn } from '../_shared/onboarding-turn.ts';
 import { stripSystemNote } from '../_shared/strip-system-note.ts';
+import { scrubInternalLanguage } from '../_shared/scrub-internal.ts';
+
+// How far back a still-unfinished consultation stays readable. Long enough to cover leaving it
+// overnight or for a few days, short enough that an abandoned one doesn't haunt a later signup.
+const CONSULTATION_HISTORY_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SUPABASE_SECRET_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -18,6 +22,7 @@ Deno.serve(async (req) => {
       message,
       modality = 'text',
       hidden = false,
+      hideReply = hidden,
       liveSessionState,
       timezone,
       attachmentUrl,
@@ -30,7 +35,6 @@ Deno.serve(async (req) => {
       // still-accurate cached greeting from one the day has moved past. See the greeting_key
       // column comment. Only ever sent alongside isDailyGreeting.
       greetingKey = null,
-      isOnboarding = false,
     } = await req.json();
     const hasAttachment = modality === 'image' && typeof attachmentUrl === 'string' && attachmentUrl.length > 0;
     if (!userId || (!message && !hasAttachment)) {
@@ -38,8 +42,9 @@ Deno.serve(async (req) => {
     }
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
-    const isPlanSetupTurn = isOnboarding || isOnboardingSetupTurn(message, hidden, isDailyGreeting);
-    const handlers = createHandlers(supabase, userId, timezone, { planNeedsConfirm: !isPlanSetupTurn });
+    const handlers = createHandlers(supabase, userId, timezone, {
+      currentUserText: message,
+    });
 
     const askedAt = new Date();
     // Global Chat is a continuous scrollback with no session boundary of its own, so without a
@@ -50,18 +55,53 @@ Deno.serve(async (req) => {
     // the same way a new voice call already gets one (see brain-voice's isFirstTurnOfCall) —
     // factual memory (plan, logs, nutrition) is untouched, since that comes from buildContextBlock
     // reading the database directly, never from this replayed turn history.
-    const [{ data: history, error: historyError }, contextBlock] = await Promise.all([
+    // ...except mid-consultation. Before a first plan exists the conversation IS the consultation,
+    // and Damion's requirement is that leaving partway through keeps the answers and resumes where
+    // they left off. Confirmed broken: the coach acknowledged "that covers diet and equipment" and
+    // never called note_consultation_covered, so nothing recorded it — and with history bounded to
+    // today, coming back the next day lost both answers and re-asked them. Relying on the model to
+    // write that bookkeeping is what failed; keeping the consultation readable until a plan exists
+    // does not depend on it. The day boundary returns the moment there's a plan, which is when the
+    // "yesterday's conversation is still current" complaint actually applies.
+    const { data: activePlanRow } = await supabase
+      .from('training_plan')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .limit(1)
+      .maybeSingle();
+    const midConsultation = !activePlanRow;
+
+    const fetchHistory = () =>
       supabase
         .from('message')
         .select('role,content,blocks')
         .eq('user_id', userId)
-        .gte('at', startOfLocalDayUtc(timezone).toISOString())
+        .gte(
+          'at',
+          midConsultation
+            ? new Date(Date.now() - CONSULTATION_HISTORY_LOOKBACK_MS).toISOString()
+            : startOfLocalDayUtc(timezone).toISOString(),
+        )
         .order('at', { ascending: false })
         .order('role', { ascending: true })
-        .limit(MESSAGE_HISTORY_LIMIT),
-      buildContextBlock(supabase, userId, timezone),
+        .limit(MESSAGE_HISTORY_LIMIT);
+
+    let [{ data: history, error: historyError }, contextBlock] = await Promise.all([
+      fetchHistory(),
+      buildContextBlock(supabase, userId, timezone, typeof message === 'string' ? message : null),
     ]);
-    if (historyError) throw new Error(`message fetch: ${historyError.message}`);
+
+    // Clock skew between Supabase edge nodes can reject a valid service-role token ("JWT issued at
+    // future"), which threw away the whole turn. Retry, then continue without today's scrollback.
+    if (historyError) {
+      console.warn(`[brain] message fetch failed, retrying: ${historyError.message}`);
+      ({ data: history, error: historyError } = await fetchHistory());
+      if (historyError) {
+        console.error(`[brain] message fetch failed twice, continuing without history: ${historyError.message}`);
+        history = [];
+      }
+    }
 
     const priorMessages = replayHistory((history ?? []).reverse());
 
@@ -78,6 +118,18 @@ Deno.serve(async (req) => {
         ? `${contextBlock}\n\n${liveSessionState}`
         : contextBlock;
     const systemPrompt = buildSystemPrompt((history ?? []).length > 0, fullContextBlock, 'text', isDailyGreeting);
+
+    const { error: askedLogError } = await supabase.from('message').insert({
+      user_id: userId,
+      role: 'user',
+      content: message,
+      modality,
+      hidden,
+      attachment_url: hasAttachment ? (attachmentPath ?? attachmentUrl) : null,
+      at: askedAt.toISOString(),
+    });
+    if (askedLogError) console.error('[brain] failed to log the user turn:', askedLogError.message);
+
     const result = await runBrainTurn({ systemPrompt, messages, handlers, callModel });
 
     const turnBlocks = result.messages.slice(messages.length);
@@ -101,30 +153,19 @@ Deno.serve(async (req) => {
     );
     const updatedDisplayName = profileUpdateCall?.result.display_name ?? null;
 
-    const reply = dropLeadingConcession(stripSystemNote(result.reply));
+    const reply = scrubInternalLanguage(dropSelfCorrection(dropLeadingConcession(stripSystemNote(result.reply))));
 
-    const { error: logError } = await supabase.from('message').insert([
-      {
-        user_id: userId,
-        role: 'user',
-        content: message,
-        modality,
-        hidden,
-        attachment_url: hasAttachment ? (attachmentPath ?? attachmentUrl) : null,
-        at: askedAt.toISOString(),
-      },
-      {
-        user_id: userId,
-        role: 'assistant',
-        content: reply,
-        modality: 'text',
-        hidden,
-        blocks: turnBlocks.length > 0 ? turnBlocks : null,
-        card,
-        greeting_key: isDailyGreeting ? greetingKey : null,
-        at: repliedAt.toISOString(),
-      },
-    ]);
+    const { error: logError } = await supabase.from('message').insert({
+      user_id: userId,
+      role: 'assistant',
+      content: reply,
+      modality: 'text',
+      hidden: hideReply,
+      blocks: turnBlocks.length > 0 ? turnBlocks : null,
+      card,
+      greeting_key: isDailyGreeting ? greetingKey : null,
+      at: repliedAt.toISOString(),
+    });
     if (logError) console.error('[brain] failed to log conversation:', logError.message);
 
     return new Response(

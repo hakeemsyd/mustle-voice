@@ -38,6 +38,12 @@ function isPartial(log: WorkoutLogRow): boolean {
   return isUnfinishedWorkout(log.status);
 }
 
+export function wasFinishedToday(logs: WorkoutLogRow[], sessionId: string, now: Date): boolean {
+  return logs.some(
+    (log) => log.plan_session_id === sessionId && !isPartial(log) && sameLocalDay(new Date(log.at), now),
+  );
+}
+
 /**
  * Most-recent-first, with finished sessions winning any tie on timestamp.
  *
@@ -93,16 +99,18 @@ export function resolveTodaySession<T extends PlanSessionRow>(
   now: Date = new Date(),
   restDayDates: Set<string> = new Set(),
   dayOverride: T | null = null,
+  planStartDate: string | null = null,
 ): T | null {
   // A one-off session the user asked the coach for (see write_custom_session) outranks everything
   // — the rotation, the weekday pinning, and a rest day. Checked first for that reason, and
   // regardless of whether the plan has any sessions at all: a custom session stands on its own.
-  if (dayOverride) return dayOverride;
+  if (dayOverride) return wasFinishedToday(logs, dayOverride.id, now) ? null : dayOverride;
   if (sessions.length === 0) return null;
   if (restDayDates.has(localDateKey(now))) return null;
+  if (planStartDate && localDateKey(now) < planStartDate) return null;
 
   const scheduled = sessions.find((s) => s.weekday === now.getDay());
-  if (scheduled) return scheduled;
+  if (scheduled) return wasFinishedToday(logs, scheduled.id, now) ? null : scheduled;
 
   // Rotate only for a genuinely flexible split. If any session in the plan is pinned to a
   // weekday, a day with no match is a real rest day and must stay one.

@@ -53,6 +53,20 @@ test('area normalization: side + plural still restricts ("knees")', () => {
   assert.ok(validatePlan([ex('Back Squat')], [{ area: 'knees', status: 'active' }]).length > 0);
 });
 
+test('SI joint injury REJECTS squats and deadlifts, however the user phrased the area', () => {
+  for (const area of ['SI joint', 'si_joint', 'sacroiliac', 'right SI joint', 'SI joints', 'pelvis']) {
+    assert.equal(normalizeArea(area), 'si_joint', `${area} should normalize to si_joint`);
+    const injuries = [{ area, status: 'active' as const }];
+    assert.ok(!isPlanSafe([ex('Back Squat')], injuries), `Back Squat must be blocked for "${area}"`);
+    assert.ok(!isPlanSafe([ex('Deadlift')], injuries), `Deadlift must be blocked for "${area}"`);
+  }
+});
+
+test('SI joint injury still allows upper-body work that does not load the spine', () => {
+  const si = [{ area: 'SI joint', status: 'active' as const }];
+  assert.ok(isPlanSafe([ex('Lat Pulldown'), ex('Bench Press'), ex('Seated Row')], si));
+});
+
 test('THE INVARIANT: no catalog exercise contraindicated for the knee ever passes a knee flag', () => {
   const risky = EXERCISE_CATALOG.filter(e =>
     e.contraindicatedFor.some(t => ['deep_knee_flexion_loaded', 'high_impact', 'heavy_axial_load'].includes(t)),

@@ -6,6 +6,8 @@ import {
   useAudioRecorder,
   useAudioRecorderState,
 } from 'expo-audio';
+import { reclaimMicrophone } from '../lib/micReclaim';
+import { getInputSampleRate, reassertSessionActive } from '../../modules/mustle-audio-session';
 
 const METERING_POLL_MS = 100;
 const WARMUP_MS = 150;
@@ -24,10 +26,16 @@ const CONTENT_RANGE_DB = 8;
 const MIN_CONTENT_STREAK_MS = 350;
 const MIN_RECORDING_MS = 1500;
 const MAX_RECORDING_MS = 14000;
+const SILENT_FLOOR_DB = -119;
+const NO_SIGNAL_AFTER_MS = 2500;
 
 const RECORDING_OPTIONS = { ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true };
 
-export type StopReason = 'paused' | 'no-speech' | 'max-length';
+// Match the live hardware rate; a mismatched rate records digital silence with no visible error.
+const recordingOptionsForHardware = (sampleRate: number | null) =>
+  sampleRate ? { ...RECORDING_OPTIONS, sampleRate, numberOfChannels: 1 } : RECORDING_OPTIONS;
+
+export type StopReason = 'paused' | 'no-speech' | 'max-length' | 'no-signal';
 
 interface VadSession {
   startedAt: number | null;
@@ -65,6 +73,38 @@ export const useVoiceRecorder = () => {
   const recorder = useAudioRecorder(RECORDING_OPTIONS);
   const recorderState = useAudioRecorderState(recorder, METERING_POLL_MS);
   const sessionRef = useRef<VadSession | null>(null);
+  const retriedDeadInputRef = useRef(false);
+
+  const openTake = useCallback(
+    async (onPause: (reason: StopReason) => void) => {
+      await reclaimMicrophone().catch((err) =>
+        console.warn('[onboarding voice] audio session reset failed:', err),
+      );
+
+      // 'doNotMix' so the recording claims the input; expo-audio's 'mixWithOthers' default
+      // makes it defer to WebRTC's still-resident audio unit and capture nothing.
+      await setAudioModeAsync({
+        allowsRecording: true,
+        playsInSilentMode: true,
+        interruptionMode: 'doNotMix',
+      });
+
+      const sampleRate = await getInputSampleRate().catch(() => null);
+      await recorder.prepareToRecordAsync(recordingOptionsForHardware(sampleRate));
+
+      const take = createSession(onPause);
+      sessionRef.current = take;
+      recorder.record();
+
+      // Any player that just finished has a session deactivation queued behind it; re-assert past
+      // that window so it can't land on this take.
+      setTimeout(() => {
+        if (sessionRef.current !== take) return;
+        reassertSessionActive().catch(() => undefined);
+      }, 250);
+    },
+    [recorder],
+  );
 
   const start = useCallback(
     async (onUserPaused: (reason: StopReason) => void) => {
@@ -73,13 +113,35 @@ export const useVoiceRecorder = () => {
         throw new Error('Microphone permission not granted');
       }
 
-      await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
-      await recorder.prepareToRecordAsync(RECORDING_OPTIONS);
+      retriedDeadInputRef.current = false;
 
-      sessionRef.current = createSession(onUserPaused);
-      recorder.record();
+      // Reclaim and retry once before reporting a dead input: expo-audio reports the recorder as
+      // recording whether or not it captured anything, so metering at the floor is the only signal.
+      const handleStop = (reason: StopReason) => {
+        const firedTake = sessionRef.current;
+        if (reason !== 'no-signal' || retriedDeadInputRef.current || !firedTake) {
+          onUserPaused(reason);
+          return;
+        }
+        retriedDeadInputRef.current = true;
+        console.warn('[onboarding voice] dead input — reclaiming the audio session and retrying');
+        Promise.resolve(recorder.stop())
+          .catch(() => undefined)
+          .then(() => {
+            // The caller may have stopped the recorder itself (a mic tap, leaving the screen)
+            // while this was in flight — reopening then would record behind their back.
+            if (sessionRef.current !== firedTake) return;
+            return openTake(handleStop);
+          })
+          .catch((err) => {
+            console.error('[onboarding voice] retry after dead input failed:', err);
+            onUserPaused('no-signal');
+          });
+      };
+
+      await openTake(handleStop);
     },
-    [recorder],
+    [recorder, openTake],
   );
 
   const stop = useCallback(async (): Promise<string | null> => {
@@ -183,9 +245,16 @@ export const useVoiceRecorder = () => {
 
     const pausedAfterSpeaking = elapsed > MIN_RECORDING_MS && silenceElapsed > SILENCE_DURATION_MS;
     const timedOut = elapsed > MAX_RECORDING_MS;
-    if (!pausedAfterSpeaking && !timedOut) return;
+    const noSignal = elapsed > NO_SIGNAL_AFTER_MS && !sawContent && smoothed <= SILENT_FLOOR_DB;
+    if (!pausedAfterSpeaking && !timedOut && !noSignal) return;
 
-    const reason: StopReason = !sawContent ? 'no-speech' : pausedAfterSpeaking ? 'paused' : 'max-length';
+    const reason: StopReason = noSignal
+      ? 'no-signal'
+      : timedOut
+        ? 'max-length'
+        : sawContent
+          ? 'paused'
+          : 'no-speech';
     console.log(
       `[onboarding voice] VAD auto-stop (${reason}) after ${elapsed}ms, range ${range.toFixed(1)} dB`,
     );

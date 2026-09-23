@@ -5,14 +5,32 @@ const exerciseSchema = {
   type: 'object',
   properties: {
     name: { type: 'string', description: 'Exercise name, matched against the catalog.' },
-    sets: { type: 'integer' },
-    rep_scheme: { type: 'string', description: "e.g. '8-10', 'AMRAP'" },
+    sets: {
+      type: 'integer',
+      description:
+        "How many sets. When the user wrote their own workout, \"x4\"/\"\u00d74\" after an exercise is " +
+        'this number, NOT the reps.',
+    },
+    rep_scheme: {
+      type: 'string',
+      description:
+        "The REP TARGET, e.g. '8-10', 'AMRAP'. For a timed movement this is a duration ('25 " +
+        "minutes'). NEVER copy the set count into this field: a workout written as 'Hammer curls " +
+        "40s x3' states three SETS and says nothing about reps, and answering '3 reps' is a number " +
+        'the user never gave. When their own workout gives sets and load but no rep target, either ' +
+        'ask them for it or use their logged history for that exercise and say which you did.',
+    },
     load_scheme: {
       type: 'string',
       description:
         "What weight to use, written for someone standing in front of the bar. Never leave blank. " +
         "Use their real numbers when read_state has them, written in the units the context block says " +
         "the user reads in (e.g. '60 kg' / '135 lb', 'last time: 22.5 kg each'). " +
+        "CONVERT before you write this. When the user's own workout states a unit once ('Pushdowns " +
+        "50 lb'), every bare number in that same list is in that unit too ('40s' is 40 lb), and each " +
+        "one must be converted into the unit they read in — confirmed live: a list written in pounds " +
+        "produced '40 kg each' on the workout card, which is 88 lb dumbbell curls. Never take their " +
+        "number and simply attach the display unit to it. " +
         "When it does not — which is every brand-new user — give a concrete starting point instead: " +
         "'bodyweight', 'empty bar to start', 'light — find your working weight'. NEVER a percentage " +
         "of one-rep max ('70-80% 1RM') or an RPE unless read_state actually shows a tested 1RM or " +
@@ -28,7 +46,6 @@ const sessionSchema = {
   type: 'object',
   properties: {
     day_order: { type: 'integer' },
-    weekday: { type: 'integer', description: '0-6, omit if the split is flexible.' },
     focus: { type: 'string', description: "e.g. 'legs', 'push', 'full_body'" },
     exercises: { type: 'array', items: exerciseSchema },
   },
@@ -58,11 +75,13 @@ export const BRAIN_TOOLS = [
     name: 'generate_training_plan',
     description:
       "Propose a brand-new user's first full training plan from goals/frequency/history/biometrics/injuries. " +
-      'Every exercise is checked against active injuries before it can persist — if rejected, revise and call ' +
+      "Refuses (nothing saved) until the consultation has covered equipment, diet, schedule, and any " +
+      "remaining goal/injury clarification — call note_consultation_covered as each is resolved first. Every " +
+      "exercise is checked against active injuries before it can persist — if rejected, revise and call " +
       'again. Call WITHOUT confirm first — it returns a preview, nothing is saved yet. Before confirming, this ' +
-      "is the moment for a real initial consultation: read back the plan and confirm which real day they'd " +
-      'like to start (today, tomorrow, a specific weekday) — never assume. Only call again with confirm:true ' +
-      'once they explicitly agree.',
+      "is the moment for a real initial consultation: read back the plan and the proposed nutrition approach, " +
+      "and confirm which real day they'd like to start (today, tomorrow, a specific weekday) — never assume. " +
+      'Only call again with confirm:true, starts_on, and the same confirm_token once they explicitly agree.',
     input_schema: {
       type: 'object',
       properties: {
@@ -74,6 +93,13 @@ export const BRAIN_TOOLS = [
           description:
             'Leave false/omitted to get a preview with nothing saved. Set true only after the user explicitly ' +
             'agreed to the plan and start day in their most recent message.',
+        },
+        starts_on: {
+          type: 'string',
+          description:
+            "The real calendar date the user agreed to start, as YYYY-MM-DD — e.g. if today is 2026-09-22 " +
+            "(Tuesday) and they say 'next Monday', that's 2026-09-28. Required alongside confirm:true; omit " +
+            'on the preview call.',
         },
         confirm_token: {
           type: 'string',
@@ -87,7 +113,9 @@ export const BRAIN_TOOLS = [
   {
     name: 'update_training_plan',
     description:
-      'Replace the active training plan with a revised one (e.g. "knee’s flaring, swap legs for upper"). Same injury-safety check as generate_training_plan.',
+      'Replace the active training plan with a revised one (e.g. "knee’s flaring, swap legs for upper"). Same ' +
+      "injury-safety check as generate_training_plan. Does not change the plan's start date — see " +
+      'update_plan_start_date for that.',
     input_schema: {
       type: 'object',
       properties: {
@@ -157,6 +185,14 @@ export const BRAIN_TOOLS = [
       properties: {
         area: { type: 'string', description: "e.g. 'left_knee', 'lumbar', 'right_shoulder'" },
         severity: { type: 'string' },
+        pain_level: {
+          type: 'number',
+          description:
+            'Pain on a 0-10 scale, if the user gave one ("8 out of 10" -> 8) or it can be reasonably ' +
+            'inferred ("really bad" -> 7-8, "mild" -> 2-3). Omit if genuinely unclear. This is read back ' +
+            'to you every turn and drives whether you can give exercise guidance for this area at all — ' +
+            'get it if you can.',
+        },
         note: { type: 'string' },
       },
       required: ['area'],
@@ -178,7 +214,13 @@ export const BRAIN_TOOLS = [
       'when the user gave no quantities (assume a typical single-serving size and say so isn\'t ' +
       'required, just estimate). Confirmed live: calling this with the macro fields omitted silently ' +
       'saves a meal with zero nutrition value, which the Fuel screen and Home\'s macro totals then ' +
-      'both read as truly zero — never leave them blank to avoid guessing.',
+      'both read as truly zero — never leave them blank to avoid guessing. ' +
+      'ASK AT MOST ONE ROUND OF QUESTIONS before calling this, and only when the food itself is ' +
+      'unidentifiable. Portion size, cooking method, brand and sides are things you estimate, not ' +
+      'things you ask about: a typical serving is always a good enough answer, and the user can ' +
+      'correct it afterwards with update_food. Confirmed live: a second round of clarifying ' +
+      'questions after the user had already answered one made logging a single meal feel like an ' +
+      'interrogation. If you have already asked once, estimate and log.',
     input_schema: {
       type: 'object',
       properties: {
@@ -404,6 +446,7 @@ export const BRAIN_TOOLS = [
         mood: { type: 'integer' },
         sleep_hours: { type: 'number' },
         soreness: { type: 'integer' },
+        body_fat_pct: { type: 'number', description: 'Body fat percentage, if the user reports one.' },
         note: { type: 'string' },
       },
     },
@@ -465,14 +508,22 @@ export const BRAIN_TOOLS = [
   {
     name: 'reschedule_today',
     description:
-      "Move today off as a rest day without touching the rest of the plan — use for \"let's skip " +
-      'today"/"push today back"/"I need a rest day" instead of update_training_plan, which would ' +
-      'replace the entire plan. Call this WITHOUT confirm first — it returns a preview of what ' +
-      'would become due tomorrow instead, with nothing saved. Only call it again with confirm:true ' +
+      "Move a training day off as a rest day without touching the rest of the plan — use for \"let's skip " +
+      'today"/"push today back"/"I need a rest day"/"I can\'t train Monday" instead of ' +
+      'update_training_plan, which would replace the entire plan. Defaults to today; pass `date` to ' +
+      'move a FUTURE day instead. Call this WITHOUT confirm first — it returns a preview of what ' +
+      'would become due instead, with nothing saved. Only call it again with confirm:true ' +
       "after the user has explicitly agreed in their next message.",
     input_schema: {
       type: 'object',
       properties: {
+        date: {
+          type: 'string',
+          description:
+            'YYYY-MM-DD, today or later. Omit for today. Work it out from the date in your context ' +
+            'block rather than guessing which date a weekday falls on — the result tells you the ' +
+            'weekday it actually landed on, so check that against what the user asked for.',
+        },
         confirm: { type: 'boolean', description: 'Leave false/omitted to preview; true only after explicit agreement.' },
         confirm_token: {
           type: 'string',
@@ -481,6 +532,42 @@ export const BRAIN_TOOLS = [
             'returned. A stale, missing, or invented token is rejected and returns a fresh preview ' +
             'instead of rescheduling anything.',
         },
+      },
+    },
+  },
+  {
+    name: 'note_consultation_covered',
+    description:
+      'Call the moment a consultation topic has actually been resolved — including when the user ' +
+      'explicitly defers ("I don\'t know, use your judgment", "doesn\'t matter to me"), which counts as ' +
+      'resolved, not a reason to keep asking. Never visible to the user; purely internal bookkeeping so ' +
+      'the app knows generate_training_plan can be proposed. Only relevant before a plan exists.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        topics: {
+          type: 'array',
+          items: { type: 'string', enum: ['equipment', 'diet', 'schedule', 'goals_injuries'] },
+          description: 'One or more of the four topics just resolved in this turn.',
+        },
+      },
+      required: ['topics'],
+    },
+  },
+  {
+    name: 'update_plan_start_date',
+    description:
+      'Move the active plan\'s start date — use for "actually, can I start today", "let\'s not wait until ' +
+      'Monday", "can we start Wednesday instead" said about the PLAN starting (not about beginning a ' +
+      'workout right now — that is start_todays_workout). Only valid while the plan has not started yet; ' +
+      "if it already has, say so instead of calling this. A clear, unambiguous request is itself " +
+      "sufficient — call with confirm:true directly. Only preview first (call without confirm) when you're " +
+      'inferring intent rather than hearing it stated.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        new_starts_on: { type: 'string', description: 'YYYY-MM-DD. Omit to mean "starting today".' },
+        confirm: { type: 'boolean', description: 'Leave false/omitted to preview; true once confident.' },
       },
     },
   },
@@ -513,8 +600,21 @@ export const BRAIN_TOOLS = [
             type: 'object',
             properties: {
               name: { type: 'string', description: 'Exact catalog name.' },
-              sets: { type: 'integer' },
-              rep_scheme: { type: 'string', description: "e.g. '8-10', 'AMRAP'" },
+              sets: {
+                type: 'integer',
+                description:
+                  "How many sets. When the user wrote their own workout, \"x4\"/\"\u00d74\" after an " +
+                  'exercise is this number, NOT the reps.',
+              },
+              rep_scheme: {
+      type: 'string',
+      description:
+        "The REP TARGET, e.g. '8-10', 'AMRAP'. For a timed movement this is a duration ('25 " +
+        "minutes'). NEVER copy the set count into this field: a workout written as 'Hammer curls " +
+        "40s x3' states three SETS and says nothing about reps, and answering '3 reps' is a number " +
+        'the user never gave. When their own workout gives sets and load but no rep target, either ' +
+        'ask them for it or use their logged history for that exercise and say which you did.',
+    },
               load_scheme: {
                 type: 'string',
                 description:
@@ -524,6 +624,17 @@ export const BRAIN_TOOLS = [
             },
             required: ['name', 'sets', 'rep_scheme'],
           },
+        },
+        source_omissions: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            "When the user supplied their own workout (a photo, screenshot or pasted list), every " +
+            'line of it you are NOT building, each with the reason — e.g. "Zone 2 25 min: no cardio ' +
+            'entry", "kickbacks: not in the catalog". Pass an empty array when you are building the ' +
+            'source in full, and omit the field entirely when there was no source. The preview reads ' +
+            'these back to the user, so a line left out here is a line they will discover missing ' +
+            'later on their own workout screen.',
         },
         confirm: { type: 'boolean', description: 'Leave false/omitted to preview; true only after explicit agreement.' },
         confirm_token: {
@@ -616,10 +727,64 @@ export const BRAIN_TOOLS = [
     input_schema: { type: 'object', properties: {} },
   },
   {
+    name: 'go_to_exercise',
+    description:
+      "Move the running workout to a SPECIFIC exercise the user names, forward or backward in the " +
+      "session. This is the right tool whenever they name one — \"go back to pushdowns\", \"I'm doing " +
+      "tricep pushdowns now\", \"let's jump to hammer curls\" — because skip_exercise only ever steps " +
+      "one place forward and will land on the wrong exercise if the one they named is further along " +
+      "or already behind them. Confirmed live: the user asked for Cable Tricep Pushdown, skip_exercise " +
+      "advanced to Hammer Curl instead, and there was then no way back to the exercise they actually " +
+      "wanted. Use skip_exercise only for a bare \"skip this\"/\"next one\" with no exercise named. " +
+      "Going back to an earlier exercise keeps every set already logged on it; the user simply " +
+      "continues from where they left off.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        exercise_name: {
+          type: 'string',
+          description:
+            "The exercise to move to, as it appears in this session's live state block. If the user's " +
+            'wording matches none of them, do not guess — call this with your best reading and the ' +
+            "tool will return the session's real exercise list to ask them with.",
+        },
+      },
+      required: ['exercise_name'],
+    },
+  },
+  {
     name: 'add_set',
     description:
       "Add one extra set to the current exercise in the user's active in-app workout session (e.g. \"let's do one more set of this\"). Only works while a session is actually running in the app.",
     input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'log_live_set',
+    description:
+      "Record one COMPLETED set into the user's active in-app workout when the app has not already " +
+      'recorded it itself. The app logs clear reports on its own (anything with "done"/"finished", a ' +
+      'past-tense report like "I got 8", a set number, or an explicit weight-and-reps pair) and the ' +
+      'live session state block shows you the resulting count every turn — so call this ONLY when the ' +
+      'user has told you a set is finished, the live state block still shows it as not completed, and ' +
+      'you have both numbers. Use it for phrasings the app deliberately stays out of: a rep count on ' +
+      'its own answering a question you asked, or a set described across several turns. ' +
+      'NEVER call it for a user counting their reps out loud mid-set ("one, two, three... four, five" ' +
+      'is counting, not a report, and logging it ends their set early — confirmed live), for a weight ' +
+      'they are about to use, for a set you merely announced, or for a set already in the live state ' +
+      'block. If you are unsure whether they finished, ask instead of calling this.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        reps: { type: 'number', description: 'Reps completed, or seconds held for a timed exercise.' },
+        weight: {
+          type: 'number',
+          description: 'Weight lifted, in the unit given by weight_unit. Omit for a bodyweight movement.',
+        },
+        weight_unit: { type: 'string', enum: ['kg', 'lb'], description: 'Unit of `weight`.' },
+        timed: { type: 'boolean', description: 'True when `reps` is a hold in seconds, not a rep count.' },
+      },
+      required: ['reps'],
+    },
   },
   {
     name: 'undo_last_set',

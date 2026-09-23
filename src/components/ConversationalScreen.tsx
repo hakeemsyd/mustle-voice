@@ -255,6 +255,16 @@ export const ConversationalScreen = ({
       return;
     }
 
+    if (reason === "no-signal") {
+      const uri = await stopRecording().catch(() => null);
+      const heard = uri ? await transcribeRecording(uri).catch((err) => `<failed: ${err}>`) : null;
+      console.warn(
+        `[onboarding voice] no-signal — metering read silence. uri=${uri} transcript=${JSON.stringify(heard)}`,
+      );
+      setTypeMode(true);
+      return;
+    }
+
     setPhase("transcribing");
 
     try {

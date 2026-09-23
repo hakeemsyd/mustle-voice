@@ -1,6 +1,12 @@
 import { humanizeFocus } from './humanize.ts';
 import { finalizeStaleLiveSession } from './interrupted-session.ts';
 import { LIVE_STATE_MAX_AGE_MS } from './live-session-format.ts';
+import { buildLoadHistory, describeLoadHistory } from './load-history.ts';
+import { describeActiveInjuries, describeUnloggedPainReport } from './injury-context.ts';
+import { describeTodaysFoodLog } from './food-log-context.ts';
+import { describeImportedWorkout } from './rep-target.ts';
+import { describeConsultationStatus } from './consultation-context.ts';
+
 interface PlanSessionRow {
   id: string;
   day_order: number;
@@ -120,6 +126,11 @@ function sameLocalDay(a: Date, b: Date): boolean {
 const holdsRotation = (log: WorkoutLogRow, now: Date): boolean =>
   isPartial(log) && sameLocalDay(new Date(log.at), now);
 
+const wasFinishedToday = (logs: WorkoutLogRow[], sessionId: string, now: Date): boolean =>
+  logs.some(
+    (log) => log.plan_session_id === sessionId && !isPartial(log) && sameLocalDay(new Date(log.at), now),
+  );
+
 const byMostRecentFinishedFirst = (a: WorkoutLogRow, b: WorkoutLogRow): number => {
   const byTime = new Date(b.at).getTime() - new Date(a.at).getTime();
   if (byTime !== 0) return byTime;
@@ -132,16 +143,18 @@ export function resolveTodaySession(
   now: Date,
   restDayDates: Set<string> = new Set(),
   dayOverride: PlanSessionRow | null = null,
+  planStartDate: string | null = null,
 ): PlanSessionRow | null {
   // Checked before everything else, including the rest-day short-circuit: an override is the user
   // explicitly asking for this session today, so it outranks both a rest day and the rotation.
   // Whether the plan has any sessions at all is irrelevant — a custom session stands on its own.
-  if (dayOverride) return dayOverride;
+  if (dayOverride) return wasFinishedToday(logs, dayOverride.id, now) ? null : dayOverride;
   if (sessions.length === 0) return null;
   if (restDayDates.has(now.toISOString().slice(0, 10))) return null;
+  if (planStartDate && now.toISOString().slice(0, 10) < planStartDate) return null;
 
   const scheduled = sessions.find((s) => s.weekday === now.getDay());
-  if (scheduled) return scheduled;
+  if (scheduled) return wasFinishedToday(logs, scheduled.id, now) ? null : scheduled;
 
   const flexible = sessions.every((s) => s.weekday === null || s.weekday === undefined);
   if (!flexible) return null;
@@ -163,6 +176,19 @@ export function resolveTodaySession(
   if (lastIndex === -1) return rotation[0];
   if (holdsRotation(lastLogged, now)) return rotation[lastIndex];
   return rotation[(lastIndex + 1) % rotation.length];
+}
+
+const NOT_A_NAME = /[[\]()]|^(?:test|unknown|n\/a|none)$/i;
+
+export function describeUserName(displayName: string | null | undefined): string {
+  const raw = (displayName ?? '').trim();
+  const name = NOT_A_NAME.test(raw) || !/[a-zA-Z]/.test(raw) ? '' : raw;
+  return name
+    ? `The user's name is ${name}. You already know it — never say you don't have it on file and ` +
+      `never ask what to call them. Use it sparingly, the way a coach does, not in every reply.`
+    : `No name on file for this user. If they ask whether you know their name, say plainly that you ` +
+      `don't have it yet and ask for it, then call update_profile with what they answer so it is on ` +
+      `file from then on.`;
 }
 
 const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -213,6 +239,7 @@ export async function buildContextBlock(
   supabase: any,
   userId: string,
   requestTimezone?: string | null,
+  currentUserText?: string | null,
 ): Promise<string> {
   // Must resolve before anything below reads workout_log/live_session_state — it can insert a
   // fresh 'interrupted' row and always clears any stale live_session_state row, both of which
@@ -233,6 +260,7 @@ export async function buildContextBlock(
   // cannot be raised, so every avoidable round trip here is spent against that ceiling. Running
   // it serially added a whole trip to every single voice turn.
   const eagerTodayKey = requestTimezone ? nowInTimezone(requestTimezone).toISOString().slice(0, 10) : null;
+  const eagerStartOfDay = requestTimezone ? startOfLocalDayUtc(requestTimezone) : null;
   const [
     { data: profile },
     { data: activePlan },
@@ -240,17 +268,22 @@ export async function buildContextBlock(
     restDayDates,
     { data: interrupted },
     eagerOverride,
+    { data: liveRow },
+    { data: lastWeight },
+    { data: activeInjuries, error: injuriesError },
+    { data: eagerFoodToday },
+    { data: consultationProgress },
   ] = await Promise.all([
-    supabase.from('profile').select('timezone, unit_prefs').eq('user_id', userId).maybeSingle(),
+    supabase.from('profile').select('timezone, unit_prefs, display_name').eq('user_id', userId).maybeSingle(),
     supabase
       .from('training_plan')
-      .select('plan_session(id, day_order, weekday, focus, plan_exercise(ord, exercise(name)))')
+      .select('starts_on, plan_session(id, day_order, weekday, focus, plan_exercise(ord, exercise(name)))')
       .eq('user_id', userId)
       .eq('status', 'active')
       .maybeSingle(),
     supabase
       .from('workout_log')
-      .select('at, plan_session_id, status, plan_session!workout_log_plan_session_id_fkey(focus)')
+      .select('at, plan_session_id, status, exercises_done, plan_session!workout_log_plan_session_id_fkey(focus)')
       .eq('user_id', userId)
       .order('at', { ascending: false })
       .limit(10),
@@ -264,6 +297,28 @@ export async function buildContextBlock(
       .limit(1)
       .maybeSingle(),
     eagerTodayKey ? fetchDayOverrideSession(supabase, userId, eagerTodayKey) : Promise.resolve(null),
+    supabase.from('live_session_state').select('updated_at').eq('user_id', userId).maybeSingle(),
+    supabase
+      .from('weight_log')
+      .select('weight_kg, body_fat_pct, measured_at')
+      .eq('user_id', userId)
+      .order('measured_at', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    supabase
+      .from('injury')
+      .select('area, pain_level, severity, created_at')
+      .eq('user_id', userId)
+      .eq('status', 'active'),
+    eagerStartOfDay
+      ? supabase
+          .from('food_log')
+          .select('description, calories, protein_g, carbs_g, fat_g, at')
+          .eq('user_id', userId)
+          .gte('at', eagerStartOfDay.toISOString())
+          .order('at', { ascending: true })
+      : Promise.resolve({ data: null }),
+    supabase.from('consultation_progress').select('topics').eq('user_id', userId).maybeSingle(),
   ]);
 
   const timezone = requestTimezone || profile?.timezone || null;
@@ -289,6 +344,19 @@ export async function buildContextBlock(
   const dateLine =
     `Right now it is ${timeOfDay} on ${weekday}, ${now.toISOString().slice(0, 10)} (${timezone ?? 'UTC'} time).`;
 
+  // Working out which date "next Monday" is turned out to be a reliable way to get it wrong —
+  // confirmed live twice, offering "start Monday, 2026-09-23" and "Monday 2026-09-30" when neither
+  // date is a Monday. Listing the coming week removes the arithmetic: a weekday the user names maps
+  // to a date stated here, and any date passed to a tool can be checked against it.
+  const upcomingDays: string[] = [];
+  for (let offset = 1; offset <= 7; offset++) {
+    const day = new Date(now.getTime() + offset * 86_400_000);
+    upcomingDays.push(`${day.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' })} ${day.toISOString().slice(0, 10)}`);
+  }
+  const upcomingLine = `The next seven days are: ${upcomingDays.join(', ')}. Use these exact dates — never work out a date for a weekday yourself.`;
+
+  const nameLine = describeUserName(profile?.display_name ?? null);
+
   const units = profile?.unit_prefs === 'imperial' ? 'imperial' : 'metric';
   const unitsLine =
     units === 'imperial'
@@ -300,8 +368,22 @@ export async function buildContextBlock(
   const dayOverride =
     eagerTodayKey === todayKey ? eagerOverride : await fetchDayOverrideSession(supabase, userId, todayKey);
 
+  const foodToday =
+    eagerTodayKey === todayKey
+      ? eagerFoodToday
+      : (
+          await supabase
+            .from('food_log')
+            .select('description, calories, protein_g, carbs_g, fat_g, at')
+            .eq('user_id', userId)
+            .gte('at', startOfLocalDayUtc(timezone).toISOString())
+            .order('at', { ascending: true })
+        ).data;
+
   const sessions: PlanSessionRow[] = activePlan?.plan_session ?? [];
   const logs: WorkoutLogRow[] = logsInTimezone(recentLogs ?? [], timezone);
+  const planStartDate: string | null = activePlan?.starts_on ?? null;
+  const notYetStarted = !!planStartDate && todayKey < planStartDate;
 
   const weeklyPlanLine = sessions.length > 0 ? describeWeeklyPlan(sessions) : null;
 
@@ -309,11 +391,15 @@ export async function buildContextBlock(
   if (sessions.length === 0 && !dayOverride) {
     planLine = 'No active training plan yet.';
   } else {
-    const today = resolveTodaySession(sessions, logs, now, restDayDates, dayOverride);
+    const today = resolveTodaySession(sessions, logs, now, restDayDates, dayOverride, planStartDate);
     if (!today) {
-      planLine = restDayDates.has(todayKey)
-        ? 'Today is a rest day — the user chose to skip it.'
-        : 'Today is a rest day — no scheduled session.';
+      planLine = notYetStarted
+        ? `A plan is set up and confirmed but hasn't started yet — it begins ${planStartDate}. Today is ` +
+          `not a training day under it. If they want to start earlier, use update_plan_start_date; ` +
+          `otherwise it begins on its own on that date.`
+        : restDayDates.has(todayKey)
+          ? 'Today is a rest day — the user chose to skip it.'
+          : 'Today is a rest day — no scheduled session.';
     } else if (dayOverride) {
       // Spelled out as a one-off so the model doesn't start describing it as part of the program
       // and contradict the weekly schedule line sitting right next to it.
@@ -363,22 +449,67 @@ export async function buildContextBlock(
   // Surfaced every turn (not just the first) so the model can still act on it if the user brings
   // it up mid-conversation — but instructed to only actually RAISE it unprompted once, near the
   // start of a new conversation, not re-nag every turn if the user moves on without addressing it.
+  const sessionIsLive =
+    !!liveRow && Date.now() - new Date(liveRow.updated_at).getTime() < LIVE_STATE_MAX_AGE_MS;
   const interruptedFocus = humanizeFocus(interrupted?.plan_session?.focus ?? 'training');
-  const interruptedLine = interrupted
-    ? `An earlier "${interruptedFocus}" workout was interrupted and never finished or reconciled ` +
-      `(${new Date(interrupted.at).toISOString().slice(0, 10)}, ${(interrupted.exercises_done ?? []).length} ` +
-      `exercise(s) logged before it cut off, id ${interrupted.id}). Near the start of a genuinely new ` +
-      `conversation, briefly ask what happened — did they finish it without the app, end early, or want ` +
-      `to discard it — then call resolve_interrupted_workout with that workout_log_id. Don't re-raise ` +
-      `this if the user is already mid-topic on something else; wait for a natural moment or for them ` +
-      `to bring it up.`
+  const interruptedLine =
+    interrupted && !sessionIsLive
+      ? `An earlier "${interruptedFocus}" workout was interrupted and never finished or reconciled ` +
+        `(${new Date(interrupted.at).toISOString().slice(0, 10)}, ${(interrupted.exercises_done ?? []).length} ` +
+        `exercise(s) logged before it cut off, id ${interrupted.id}). Near the start of a genuinely new ` +
+        `conversation, briefly ask what happened — did they finish it without the app, end early, or want ` +
+        `to discard it — then call resolve_interrupted_workout with that workout_log_id. Don't re-raise ` +
+        `this if the user is already mid-topic on something else; wait for a natural moment or for them ` +
+        `to bring it up.`
+      : null;
+
+  const loadHistoryLine = describeLoadHistory(buildLoadHistory(recentLogs ?? []), units);
+
+  const bodyStatsLine = lastWeight
+    ? `Last recorded weight: ${
+        units === 'imperial'
+          ? `${Math.round(lastWeight.weight_kg * 2.20462 * 10) / 10} lb`
+          : `${Math.round(lastWeight.weight_kg * 10) / 10} kg`
+      }${lastWeight.body_fat_pct != null ? `, body fat ${lastWeight.body_fat_pct}%` : ''} ` +
+      `(logged ${new Date(lastWeight.measured_at).toISOString().slice(0, 10)}). Use this when asked ` +
+      `about current weight or body fat — don't ask again unless it's genuinely stale or they bring ` +
+      `up a new measurement.`
+    : null;
+
+  const injuryLine = describeActiveInjuries(activeInjuries, !!injuriesError);
+  const painReportLine = describeUnloggedPainReport(currentUserText);
+
+  const importedWorkoutLine = describeImportedWorkout(currentUserText);
+
+  const foodLogLine = describeTodaysFoodLog(foodToday ?? []);
+
+  const consultationLine = describeConsultationStatus(!!activePlan, (consultationProgress?.topics ?? []) as string[]);
+
+  // Stated every turn a plan exists, not only before it starts. Without it the model had no
+  // authoritative value once the plan was running, and agreed to "stick with the original start
+  // date, Monday" while the stored date was actually today — telling the user a date it had never
+  // set. The date is only ever changed by update_plan_start_date, so saying so here is what makes
+  // a claimed change verifiable rather than asserted.
+  const startDateLine = planStartDate
+    ? `Plan start date on record: ${planStartDate}. This is the ONLY source of truth for when the ` +
+      `plan starts. Never tell the user it starts on a different date than this one, and never say ` +
+      `you have changed or kept it unless you called update_plan_start_date in this same turn — ` +
+      `if they ask for a different date, call that tool, and if it is already correct say so plainly.`
     : null;
 
   return (
     "Current context — you already know this, never ask the user for it:\n" +
-    `- ${dateLine}\n- ${unitsLine}\n- ${planLine}\n` +
+    `- ${nameLine}\n- ${dateLine}\n- ${upcomingLine}\n- ${unitsLine}\n- ${planLine}\n` +
+    (startDateLine ? `- ${startDateLine}\n` : '') +
     (weeklyPlanLine ? `- ${weeklyPlanLine}\n` : '') +
+    (consultationLine ? `- ${consultationLine}\n` : '') +
     (interruptedLine ? `- ${interruptedLine}\n` : '') +
-    `- ${historyLine}`
+    `- ${historyLine}` +
+    (loadHistoryLine ? `\n- ${loadHistoryLine}` : '') +
+    (bodyStatsLine ? `\n- ${bodyStatsLine}` : '') +
+    (injuryLine ? `\n- ${injuryLine}` : '') +
+    (painReportLine ? `\n- ${painReportLine}` : '') +
+    (importedWorkoutLine ? `\n- ${importedWorkoutLine}` : '') +
+    (foodLogLine ? `\n- ${foodLogLine}` : '')
   );
 }

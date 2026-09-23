@@ -2,7 +2,11 @@ import { useConversation } from '@elevenlabs/react-native';
 import { AudioSession } from '@livekit/react-native';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { setAudioModeAsync } from 'expo-audio';
-import { subscribeToAudioInterruptions } from '../../modules/mustle-audio-session';
+import {
+  enableWebrtcAudio,
+  releaseWebrtcAudio,
+  subscribeToAudioInterruptions,
+} from '../../modules/mustle-audio-session';
 import { supabase } from '../lib/supabase';
 import { setCachedDisplayName } from '../lib/profileStore';
 import { stripNonSpeechArtifacts } from '../lib/elevenLabsVoice';
@@ -47,6 +51,28 @@ const reportEndSessionFailure = (context: string, err: unknown): void => {
   const message = err instanceof Error ? err.message : String(err);
   if (AUDIO_SESSION_BUSY.test(message)) return;
   console.error(`[voice] failed to end session${context}:`, err);
+};
+
+const releaseMicrophone = async (): Promise<void> => {
+  // Order matters, and this used to run the other way round. WebRTC's audio unit has to be torn
+  // down FIRST: reshaping the category (and deactivating) out from under a live capture unit left
+  // the input wedged, so every later expo-audio recording — onboarding's mic after a logout, most
+  // visibly — read digital silence.
+  //
+  // AudioSession.stopAudioSession() is deliberately NOT called here: the ElevenLabs SDK already
+  // calls it in its own detach (see @elevenlabs/react-native's reactNativeSessionSetup), so ours
+  // was a second, unbalanced deactivate that drove RTCAudioSession's activationCount negative and
+  // broke its deactivation balancing for the rest of the app run. releaseWebrtcAudio drains that
+  // counter properly, which also covers the case where the SDK's detach never ran.
+  await releaseWebrtcAudio().catch((err) =>
+    console.warn('[voice] failed to release the WebRTC audio unit:', err),
+  );
+  try {
+    await AudioSession.setAppleAudioConfiguration({ audioMode: 'default' });
+  } catch (err) {
+    console.warn('[voice] failed to release the audio session:', err);
+  }
+  await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
 };
 
 export const SYSTEM_CUE_PREFIX = '[[SYSTEM_CUE]]';
@@ -181,7 +207,7 @@ export function useVoiceSession(
         if (isStopCommand(cleaned)) {
           intentionalEndRef.current = true;
           Promise.resolve(endSession())
-            .then(() => setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }))
+            .then(() => releaseMicrophone())
             .catch((err) => reportEndSessionFailure(' on stop command', err));
           return;
         }
@@ -246,6 +272,9 @@ export function useVoiceSession(
     } catch (err) {
       console.warn('[voice] failed to enable recording audio mode:', err);
     }
+    await enableWebrtcAudio().catch((err) =>
+      console.warn('[voice] failed to enable the WebRTC audio unit:', err),
+    );
     // Deliberately not awaited: the SDK types startSession as `=> void` and its implementation is
     // fire-and-forget (failures surface through onError, not a rejected promise). Awaiting it
     // resolved on the very next microtask, which made anything sequenced "after the connection is
@@ -335,7 +364,7 @@ export function useVoiceSession(
       intentionalEndRef.current = true;
       setIdleClosed(true);
       Promise.resolve(endSession())
-        .then(() => setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }))
+        .then(() => releaseMicrophone())
         .catch((err) => reportEndSessionFailure(' on silence timeout', err));
     }, SILENCE_CHECK_INTERVAL_MS);
     return () => clearInterval(id);
@@ -403,7 +432,7 @@ export function useVoiceSession(
         intentionalEndRef.current = true;
         endedByInterruptionRef.current = true;
         Promise.resolve(endSession())
-          .then(() => setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }))
+          .then(() => releaseMicrophone())
           .catch((err) => reportEndSessionFailure(' on audio interruption', err));
       },
       // Only resumes a call this listener itself closed, so a plain "ended" with nothing to
@@ -480,7 +509,7 @@ export function useVoiceSession(
     reconnectAttemptsRef.current = MAX_AUTO_RECONNECTS;
     intentionalEndRef.current = true;
     Promise.resolve(endSession())
-      .then(() => setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }))
+      .then(() => releaseMicrophone())
       .catch((err) => reportEndSessionFailure('', err));
   };
 

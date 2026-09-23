@@ -1,5 +1,6 @@
 import { humanizeFocus } from './humanize.ts';
 import { convertLoadScheme } from './load-scheme.ts';
+import { isTimedExercise } from './exercise-catalog.ts';
 // Server-side port of src/session/liveSessionState.ts's buildLiveSessionSnapshot/
 // describeLiveSessionSnapshot — kept in sync manually since Supabase Edge Functions only bundle
 // supabase/functions/, the same reason resolveTodaySession/estimateRestSeconds are duplicated
@@ -101,6 +102,9 @@ export function buildLiveSessionSnapshot(input: SnapshotInput): LiveSessionSnaps
 const formatWeight = (kg: number, units: 'metric' | 'imperial'): string =>
   units === 'imperial' ? `${Math.round(kg * 2.20462 * 10) / 10} lb` : `${kg} kg`;
 
+const formatDuration = (seconds: number): string =>
+  seconds >= 60 && seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds}s held`;
+
 export function describeLiveSessionSnapshot(
   snapshot: LiveSessionSnapshot,
   units: 'metric' | 'imperial' = 'metric',
@@ -124,7 +128,7 @@ export function describeLiveSessionSnapshot(
         ? c.loggedSets
             .map((s) =>
               s.unit === 'seconds'
-                ? `${s.reps}s held`
+                ? formatDuration(s.reps)
                 : `${s.weight != null ? formatWeight(s.weight, units) : 'bodyweight'}×${s.reps}`,
             )
             .join(', ')
@@ -139,8 +143,9 @@ export function describeLiveSessionSnapshot(
     // target 8-10", the coach announced "Romanian Deadlift, six to eight reps" — carrying over the
     // previous exercise's range after five turns of repeating it. A number said many times in the
     // conversation beats a number listed once, unless the listing is explicit that it wins.
+    const targetLabel = isTimedExercise(c.name) ? 'target time' : 'target reps';
     lines.push(
-      `- Current exercise: "${c.name}" — target reps ${c.repScheme}` +
+      `- Current exercise: "${c.name}" — ${targetLabel} ${c.repScheme}` +
         `${c.loadScheme ? `, load ${convertLoadScheme(c.loadScheme, units)}` : ''}. When you say the target out loud, say ` +
         `EXACTLY ${c.repScheme} — never a rep range carried over from an earlier exercise in this ` +
         `session, however many times you just said it.`,
@@ -161,6 +166,17 @@ export function describeLiveSessionSnapshot(
             `a set failed to register, and never accuse them of repeating one; if the two disagree, ` +
             `believe the more recent one and move on.`
         : `- Sets COMPLETED on it: ${done} of ${c.totalSets}. This exercise is finished.`,
+    );
+    lines.push(
+      `- Counting reps out loud together, even all the way to or past the target, is NOT a ` +
+        `completed set and never changes the number above — confirmed live: after counting to ten ` +
+        `together with the user, the coach announced "that's ten reps, solid first set" and "rest ` +
+        `is starting now," neither of which had happened, then argued with the user before backing ` +
+        `down. The COMPLETED count above is the only thing that says a set happened; if it hasn't ` +
+        `moved, nothing was logged, whatever was just said out loud. Never announce a set as done, ` +
+        `never say rest is starting, and never invent a reason a rep total went over target, unless ` +
+        `this exact block already shows it. If the user tells you it was just counting, agree ` +
+        `immediately on the first correction — don't defend a claim this block already disproves.`,
     );
     lines.push(`- Loads logged so far on this exercise: ${loggedDesc}.`);
   } else {

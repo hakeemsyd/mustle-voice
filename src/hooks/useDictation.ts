@@ -7,8 +7,13 @@ import {
 } from 'expo-audio';
 
 import { transcribeRecording } from '../lib/elevenLabsVoice';
+import { getInputSampleRate } from '../../modules/mustle-audio-session';
+import { reclaimMicrophone } from '../lib/micReclaim';
 
 const RECORDING_OPTIONS = { ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: false };
+
+const recordingOptionsForHardware = (sampleRate: number | null) =>
+  sampleRate ? { ...RECORDING_OPTIONS, sampleRate, numberOfChannels: 1 } : RECORDING_OPTIONS;
 
 export type DictationState = 'idle' | 'recording' | 'transcribing';
 
@@ -41,8 +46,16 @@ export const useDictation = (onText: (text: string) => void) => {
         console.warn('[dictation] microphone permission denied');
         return;
       }
-      await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
-      await recorder.prepareToRecordAsync(RECORDING_OPTIONS);
+      await reclaimMicrophone().catch((err) =>
+        console.warn('[dictation] audio session reset failed:', err),
+      );
+      await setAudioModeAsync({
+        allowsRecording: true,
+        playsInSilentMode: true,
+        interruptionMode: 'doNotMix',
+      });
+      const sampleRate = await getInputSampleRate().catch(() => null);
+      await recorder.prepareToRecordAsync(recordingOptionsForHardware(sampleRate));
       setSeconds(0);
       recorder.record();
       setState('recording');

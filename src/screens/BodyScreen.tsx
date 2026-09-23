@@ -71,12 +71,19 @@ export function BodyScreen() {
   const weekDeltaDisplay = weekDeltaKg !== null ? kgToDisplayWeight(Math.abs(weekDeltaKg), unitPrefs) : null;
 
   const checkin = !hasTrend
-    ? {
-        icon: <MoonIcon size={20} color={CHECKIN_ICON_COLOR} />,
-        greeting: "Body check-in",
-        main: "No weigh-ins logged this week.\nTell your coach your weight to start tracking a trend.",
-        sub: "Body composition · no data yet",
-      }
+    ? latestEntry
+      ? {
+          icon: <MoonIcon size={20} color={CHECKIN_ICON_COLOR} />,
+          greeting: "Body check-in",
+          main: `${kgToDisplayWeight(latestEntry.weightKg, unitPrefs)} on record.\nLog another weigh-in to start tracking a trend.`,
+          sub: `Body composition · updated ${relativeDayLabel(latestEntry.date, { capitalized: false })}`,
+        }
+      : {
+          icon: <MoonIcon size={20} color={CHECKIN_ICON_COLOR} />,
+          greeting: "Body check-in",
+          main: "No weigh-ins logged yet.\nTell your coach your weight to start tracking a trend.",
+          sub: "Body composition · no data yet",
+        }
     : flaggedZones.length > 0
       ? {
           icon: <MoonIcon size={20} color={CHECKIN_ICON_COLOR} />,
@@ -135,7 +142,11 @@ export function BodyScreen() {
                 {hasTrend ? `${weekDeltaDisplay} ${down ? "down" : "up"}` : "No trend yet"}
               </Text>
               <Text style={[styles.statusSub, hasTrend && styles.statusSubActive]}>
-                {hasTrend ? "vs last week" : "Tell your coach your weight to see a weekly trend"}
+                {hasTrend
+                  ? "vs last week"
+                  : latestEntry
+                    ? "Log another weigh-in to see a weekly trend"
+                    : "Tell your coach your weight to see a weekly trend"}
               </Text>
 
               {hasTrend && (

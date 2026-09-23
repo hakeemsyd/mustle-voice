@@ -1,7 +1,7 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
 import { runBrainTurn } from '../_shared/brain-orchestrator.ts';
 import { replayHistory } from '../_shared/replay-history.ts';
-import { dropLeadingConcession } from '../_shared/humanize.ts';
+import { dropLeadingConcession, dropSelfCorrection } from '../_shared/humanize.ts';
 import {
   buildStaticSystemPrompt,
   createCallModel,
@@ -15,6 +15,7 @@ import { buildLiveSessionSnapshot, describeLiveSessionSnapshot, LIVE_STATE_MAX_A
 import { resolveTurnText } from '../_shared/system-cue.ts';
 import { verbalizeUnitsForSpeech } from '../_shared/verbalize-for-speech.ts';
 import { stripSystemNote, createSystemNoteFilter } from '../_shared/strip-system-note.ts';
+import { scrubInternalLanguage } from '../_shared/scrub-internal.ts';
 
 const callModel = createCallModel(VOICE_TOOLS);
 
@@ -68,7 +69,7 @@ function isSilencePlaceholder(text: string): boolean {
 }
 
 function sanitizeForSpeech(text: string): string {
-  return dropLeadingConcession(verbalizeUnitsForSpeech(text))
+  return scrubInternalLanguage(dropSelfCorrection(dropLeadingConcession(verbalizeUnitsForSpeech(text))))
     .replace(/\[\[SYSTEM_CUE\]\]\s*\S*/gi, '')
     .replace(/\s*[—–]\s*/g, ', ');
 }
@@ -96,7 +97,7 @@ function extractContext(messages: any[]): { userId: string | null; timezone: str
 
 async function prepareTurn(userId: string, userText: string, timezone: string | null, isFirstTurnOfCall: boolean) {
   const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
-  const handlers = createHandlers(supabase, userId, timezone);
+  const handlers = createHandlers(supabase, userId, timezone, { currentUserText: userText });
 
   const askedAt = new Date();
   const isSystemCue = userText.startsWith(SYSTEM_CUE_PREFIX);
@@ -124,7 +125,7 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
   const [{ data: history, error: historyError }, contextBlock, { data: liveRow }, { data: profileRow }] =
     await Promise.all([
       historyQuery,
-      buildContextBlock(supabase, userId, timezone),
+      buildContextBlock(supabase, userId, timezone, isSystemCue ? null : userText),
       supabase.from('live_session_state').select('state, updated_at').eq('user_id', userId).maybeSingle(),
       supabase.from('profile').select('timezone, unit_prefs').eq('user_id', userId).maybeSingle(),
     ]);
@@ -266,7 +267,8 @@ async function logConversation(
   rawReply: string,
   turnBlocks: any[],
 ) {
-  const reply = stripSystemNote(rawReply);
+  const strippedReply = stripSystemNote(rawReply);
+  const reply = isSilencePlaceholder(strippedReply) ? '' : strippedReply;
   const repliedAt = new Date(Math.max(Date.now(), askedAt.getTime() + 1));
   const isSystemCue = userText.startsWith(SYSTEM_CUE_PREFIX);
   if (!isSystemCue) await dropSupersededTurn(supabase, userId, userText, askedAt);

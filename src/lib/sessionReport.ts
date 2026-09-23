@@ -1,4 +1,5 @@
 import { kgToDisplayWeight, type Units } from './units';
+import { titleCase } from './textFormat';
 export interface LoggedExercise {
   name: string;
   sets: number;
@@ -213,6 +214,12 @@ function mentionsPain(note: string | null, tags: string[]): boolean {
   return tags.some((tag) => PAIN_PATTERN.test(tag));
 }
 
+function resolveStatedReason(note: string | null, tags: string[]): string | null {
+  const raw = note?.trim() || tags.map((tag) => tag.trim().toLowerCase()).filter(Boolean).join(' and ');
+  if (!raw) return null;
+  return /[.!?]$/.test(raw) ? raw : `${raw}.`;
+}
+
 /**
  * A short, real coaching summary built from this session's own numbers — completion, volume
  * trend, top set, the note/tags the user actually left. Deterministic and data-driven rather
@@ -256,7 +263,7 @@ export function buildDebrief(
 
   if (isPartial) {
     const remaining = targetSets - totalSets;
-    const statedReason = note?.trim() ? note.trim() : null;
+    const statedReason = resolveStatedReason(note, tags);
     return {
       summary: statedReason
         ? `Ended early after ${totalSets} of ${targetSets} planned sets on ${exerciseLabel.toLowerCase()} — ${statedReason} ${deltaLine}`
@@ -323,8 +330,8 @@ export function buildSessionReport(
   const at = new Date(log.at);
 
   const title = isCardio
-    ? (log.cardio_activity ?? 'Cardio').toUpperCase()
-    : (plan?.focus ?? 'Training').toUpperCase();
+    ? titleCase(log.cardio_activity ?? 'Cardio').toUpperCase()
+    : titleCase(plan?.focus ?? 'Training').toUpperCase();
 
   return {
     logId: log.id,

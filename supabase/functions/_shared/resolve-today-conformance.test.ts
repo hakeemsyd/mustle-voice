@@ -12,6 +12,7 @@ interface Case {
   now: Date;
   restDayDates?: Set<string>;
   dayOverride?: any;
+  planStartDate?: string | null;
   expected: string | null;
 }
 
@@ -54,6 +55,36 @@ const cases: Case[] = [
     logs: [log('2026-09-14T09:00:00Z', 'push', 'partial')],
     now: MONDAY,
     expected: 'push',
+  },
+  {
+    name: 'pinned plan completed today stops showing as upcoming',
+    sessions: PINNED,
+    logs: [log('2026-09-14T09:00:00Z', 'mon', 'completed')],
+    now: MONDAY,
+    expected: null,
+  },
+  {
+    name: 'pinned plan only PARTLY done today is still offered back',
+    sessions: PINNED,
+    logs: [log('2026-09-14T09:00:00Z', 'mon', 'partial')],
+    now: MONDAY,
+    expected: 'mon',
+  },
+  {
+    name: 'a custom session completed today stops showing as upcoming',
+    sessions: PUSH_PULL_LEGS,
+    logs: [log('2026-09-14T09:00:00Z', 'custom', 'completed')],
+    now: MONDAY,
+    dayOverride: session('custom', 0, null),
+    expected: null,
+  },
+  {
+    name: 'a custom session still stands after an UNRELATED session was completed today',
+    sessions: PUSH_PULL_LEGS,
+    logs: [log('2026-09-14T09:00:00Z', 'push', 'completed')],
+    now: MONDAY,
+    dayOverride: session('custom', 0, null),
+    expected: 'custom',
   },
   {
     name: 'THE DIVERGENCE: partial YESTERDAY lapses and the rotation moves on',
@@ -111,14 +142,56 @@ const cases: Case[] = [
     expected: 'push',
   },
   { name: 'no sessions and no override is null', sessions: [], logs: [], now: MONDAY, expected: null },
+  {
+    name: "a flexible plan not yet started never hands back day 0 (Damion's bug)",
+    sessions: PUSH_PULL_LEGS,
+    logs: [],
+    now: MONDAY,
+    planStartDate: '2026-09-15',
+    expected: null,
+  },
+  {
+    name: 'a pinned plan matching weekday but not yet started is not due either',
+    sessions: PINNED,
+    logs: [],
+    now: MONDAY,
+    planStartDate: '2026-09-15',
+    expected: null,
+  },
+  {
+    name: 'the start date itself is a valid training day (< not <=)',
+    sessions: PUSH_PULL_LEGS,
+    logs: [],
+    now: MONDAY,
+    planStartDate: '2026-09-14',
+    expected: 'push',
+  },
+  {
+    name: 'a start date already in the past never gates an already-running plan',
+    sessions: PUSH_PULL_LEGS,
+    logs: [],
+    now: MONDAY,
+    planStartDate: '2026-09-01',
+    expected: 'push',
+  },
+  {
+    name: 'a day override still wins even before the plan has started',
+    sessions: PUSH_PULL_LEGS,
+    logs: [],
+    now: MONDAY,
+    planStartDate: '2026-09-15',
+    dayOverride: session('custom', 99, null),
+    expected: 'custom',
+  },
 ];
 
 for (const c of cases) {
   test(`app and coach agree: ${c.name}`, () => {
     const rest = c.restDayDates ?? new Set<string>();
     const override = c.dayOverride ?? null;
-    const server = serverResolve(c.sessions, c.logs, c.now, rest, override);
-    const client = clientResolve(c.sessions, c.logs, c.now, rest, override);
+    const planStartDate = c.planStartDate ?? null;
+    const server = serverResolve(c.sessions, c.logs, c.now, rest, override, planStartDate);
+    const client = clientResolve(c.sessions, c.logs, c.now, rest, override, planStartDate);
 
     assert.equal(server?.id ?? null, c.expected, 'coach (brain-context) disagrees with the expected answer');
     assert.equal(client?.id ?? null, c.expected, 'app (resolveTodaySession) disagrees with the expected answer');

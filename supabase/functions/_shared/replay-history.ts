@@ -65,5 +65,23 @@ export function replayHistory(rows: StoredMessage[]): any[] {
     entries.push({ role: row.role === 'assistant' ? 'assistant' : 'user', content });
   }
 
-  return trimToValidStart(entries);
+  return coalesceAdjacentUserTurns(trimToValidStart(entries));
+}
+
+function coalesceAdjacentUserTurns(entries: any[]): any[] {
+  const out: any[] = [];
+  for (const entry of entries) {
+    const prev = out[out.length - 1];
+    const bothPlainUser =
+      prev?.role === 'user' &&
+      entry?.role === 'user' &&
+      typeof prev.content === 'string' &&
+      typeof entry.content === 'string';
+    if (bothPlainUser) {
+      out[out.length - 1] = { ...prev, content: `${prev.content}\n${entry.content}` };
+      continue;
+    }
+    out.push(entry);
+  }
+  return out;
 }

@@ -1,6 +1,6 @@
 import { supabase } from './supabase';
 import { setCachedDisplayName } from './profileStore';
-import { looksRecoverable } from './recoverableError';
+import { worthRecovering } from './recoverableError';
 
 export type BrainModality = 'voice' | 'text' | 'image' | 'file' | 'live_photo';
 
@@ -103,6 +103,7 @@ export interface BrainRequest {
   modality?: BrainModality;
   /** Scaffolding the app fires on its own (the daily greeting) — kept out of the visible chat. */
   hidden?: boolean;
+  hideReply?: boolean;
   timeoutMs?: number;
   liveSessionState?: string;
   /** Short-lived signed URL, for the model's fetch on this turn only. Never persisted. */
@@ -117,7 +118,6 @@ export interface BrainRequest {
   /** Home's daily-greeting call only — the plan_session id the greeting is about (or 'rest'),
    *  stamped onto the stored reply so a cached greeting is dropped once the due session changes. */
   greetingKey?: string | null;
-  isOnboarding?: boolean;
 }
 
 /**
@@ -153,6 +153,7 @@ const recoverPersistedReply = async (userId: string, sentText: string): Promise<
       .select('content, card')
       .eq('user_id', userId)
       .eq('role', 'assistant')
+      .eq('hidden', false)
       .gt('at', askedRow.at)
       .order('at', { ascending: true })
       .limit(1)
@@ -169,13 +170,13 @@ export async function callBrain({
   message,
   modality = 'text',
   hidden = false,
+  hideReply,
   timeoutMs = BRAIN_TIMEOUT_MS,
   liveSessionState,
   attachmentUrl,
   attachmentPath,
   isDailyGreeting = false,
   greetingKey = null,
-  isOnboarding = false,
 }: BrainRequest): Promise<BrainResult> {
   // The device's own current timezone, sent every call — profile.timezone is only written once
   // at onboarding and never refreshed, which silently drifted after travel/DST and misclassified
@@ -184,15 +185,24 @@ export async function callBrain({
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const { data, error } = await supabase.functions.invoke('brain', {
     body: {
-      userId, message, modality, hidden, liveSessionState, timezone, attachmentUrl, attachmentPath,
-      isDailyGreeting, greetingKey, isOnboarding,
+      userId, message, modality, hidden, hideReply, liveSessionState, timezone, attachmentUrl,
+      attachmentPath, isDailyGreeting, greetingKey,
     },
     timeout: timeoutMs,
   });
   if (error) {
-    const recovered = looksRecoverable(error.message) ? await recoverPersistedReply(userId, message) : null;
+    const recovered = worthRecovering(error) ? await recoverPersistedReply(userId, message) : null;
     if (recovered) return recovered;
-    throw new Error(`brain invoke failed: ${error.message}`);
+    let detail = '';
+    const response = (error as { context?: Response }).context;
+    if (response && typeof response.text === 'function') {
+      detail = await response
+        .clone()
+        .text()
+        .then((body) => (body ? ` — ${body.slice(0, 500)}` : ''))
+        .catch(() => '');
+    }
+    throw new Error(`brain invoke failed: ${error.message}${detail}`);
   }
   const result = data as BrainResult;
   // Only a real correction should touch the cache — updatedDisplayName is present but null on
