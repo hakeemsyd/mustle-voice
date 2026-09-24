@@ -2,7 +2,7 @@ import { humanizeFocus } from './humanize.ts';
 import { finalizeStaleLiveSession } from './interrupted-session.ts';
 import { LIVE_STATE_MAX_AGE_MS } from './live-session-format.ts';
 import { buildLoadHistory, describeLoadHistory } from './load-history.ts';
-import { describeActiveInjuries, describeUnloggedPainReport } from './injury-context.ts';
+import { describeActiveInjuries, describeMentionedInjury, describeUnloggedPainReport } from './injury-context.ts';
 import { describeTodaysFoodLog } from './food-log-context.ts';
 import { describeImportedWorkout } from './rep-target.ts';
 import { describeConsultationStatus } from './consultation-context.ts';
@@ -537,7 +537,8 @@ export async function buildContextBlock(
     : null;
 
   const injuryLine = describeActiveInjuries(activeInjuries, !!injuriesError);
-  const painReportLine = describeUnloggedPainReport(currentUserText);
+  const painReportLine = describeUnloggedPainReport(currentUserText, (activeInjuries ?? []).length > 0);
+  const mentionedInjuryLine = injuriesError ? null : describeMentionedInjury(currentUserText, activeInjuries);
 
   const importedWorkoutLine = describeImportedWorkout(currentUserText);
 
@@ -569,6 +570,7 @@ export async function buildContextBlock(
     (loadHistoryLine ? `\n- ${loadHistoryLine}` : '') +
     (bodyStatsLine ? `\n- ${bodyStatsLine}` : '') +
     (injuryLine ? `\n- ${injuryLine}` : '') +
+    (mentionedInjuryLine ? `\n- ${mentionedInjuryLine}` : '') +
     (painReportLine ? `\n- ${painReportLine}` : '') +
     (importedWorkoutLine ? `\n- ${importedWorkoutLine}` : '') +
     (foodLogLine ? `\n- ${foodLogLine}` : '')

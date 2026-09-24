@@ -54,7 +54,7 @@ test('area normalization: side + plural still restricts ("knees")', () => {
 });
 
 test('SI joint injury REJECTS squats and deadlifts, however the user phrased the area', () => {
-  for (const area of ['SI joint', 'si_joint', 'sacroiliac', 'right SI joint', 'SI joints', 'pelvis']) {
+  for (const area of ['SI joint', 'si_joint', 'sacroiliac', 'right SI joint', 'SI joints', 'pelvis', 'S.i joint', 'S. I. joint']) {
     assert.equal(normalizeArea(area), 'si_joint', `${area} should normalize to si_joint`);
     const injuries = [{ area, status: 'active' as const }];
     assert.ok(!isPlanSafe([ex('Back Squat')], injuries), `Back Squat must be blocked for "${area}"`);

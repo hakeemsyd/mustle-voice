@@ -28,9 +28,9 @@ export const INJURY_FORBIDS: Record<string, string[]> = {
 
 // 'left_knee', 'Right Knee', 'knees' -> 'knee'; 'lower back' / 'spine' / 'lumbar' -> 'lumbar'.
 export function normalizeArea(area: string): string {
-  let a = area.toLowerCase().replace(/[^a-z]+/g, '_').replace(/^_|_$/g, '');
+  let a = area.toLowerCase().replace(/\./g, '').replace(/[^a-z]+/g, '_').replace(/^_|_$/g, '');
   a = a.replace(/^(left|right)_?/, '').replace(/s$/, '');
-  if (a === 'si' || a.includes('si_joint') || a.includes('sacro') || a.includes('pelvi')) return 'si_joint';
+  if (a === 'si' || a.includes('si_joint') || a.includes('s_i_joint') || a.includes('sacro') || a.includes('pelvi')) return 'si_joint';
   if (a.includes('back') || a.includes('spine') || a.includes('lumbar')) return 'lumbar';
   for (const key of Object.keys(INJURY_FORBIDS)) if (a.includes(key)) return key;
   return a;

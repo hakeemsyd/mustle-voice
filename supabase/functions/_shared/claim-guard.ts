@@ -3,6 +3,7 @@ export interface ClaimGuardState {
   setLoggedThisTurn: boolean;
   restActive: boolean;
   actionSucceededThisTurn: boolean;
+  injuryOnFile?: boolean;
 }
 
 const SET_CLAIMS: RegExp[] = [
@@ -29,6 +30,24 @@ const ACTION_CLAIMS: RegExp[] = [
   /\bi(?:'ve|\s+have)\s+(?:just\s+|now\s+)?(?:cleared|deleted|discarded|dropped|removed|wiped|swapped|switched|saved|cancel+ed|updated|changed|moved|added|created|reset)\b/i,
 ];
 
+const NEGATED = "(?<!(?:not|never|n't)\\s+(?:\\w+\\s+)?)";
+const CONDITIONAL = '(?<!(?:once|until|till|after|before|when|if|unless)\\s+(?:\\w+\\s+){0,4})';
+
+const CLEARANCE_CLAIMS: RegExp[] = [
+  new RegExp(
+    `${CONDITIONAL}\\byou(?:'re|\\s+are)\\s+(?:all\\s+)?(?:good|clear|cleared|fine|safe|ok|okay|set)\\s+to\\s+(?:go|head|train|lift|start|work|hit)\\b`,
+    'i',
+  ),
+  new RegExp(`${CONDITIONAL}${NEGATED}\\bgood\\s+to\\s+go\\b`, 'i'),
+  new RegExp(`${CONDITIONAL}\\bcleared\\s+(?:to|for)\\s+(?:train|lift|work|exercise|go)`, 'i'),
+  new RegExp(`${NEGATED}\\b(?:all\\s+|perfectly\\s+|totally\\s+|completely\\s+)?safe\\s+(?:for|on|with)\\s+(?:your|the|that|this)\\b`, 'i'),
+  /\b(?:is|are|it's|that's|they're|those\s+are|these\s+are)\s+(?:all\s+|perfectly\s+|totally\s+|completely\s+)?(?:safe|fine)\s+(?:for|to|at|with|on)\b/i,
+  /\b(?:both|all)\s+safe\b/i,
+  /\bnothing\s+(?:there|in\s+\w+|here)\s+(?:stresses|loads|aggravates|bothers)\b/i,
+  /\b(?:should|will|would)\s+(?:\w+\s+){0,4}safely\b/i,
+  /\byou(?:'ve|\s+have)?\s+(?:already|just)\s+(?:did|done|finished|completed)\b/i,
+];
+
 const matchesAny = (patterns: RegExp[], text: string): boolean => patterns.some((p) => p.test(text));
 
 export function isUnbackedClaim(clause: string, state: ClaimGuardState): boolean {
@@ -39,6 +58,7 @@ export function isUnbackedClaim(clause: string, state: ClaimGuardState): boolean
     if (!state.restActive && matchesAny(REST_CLAIMS, text)) return true;
   }
   if (!state.actionSucceededThisTurn && matchesAny(ACTION_CLAIMS, text)) return true;
+  if (state.injuryOnFile && matchesAny(CLEARANCE_CLAIMS, text)) return true;
   return false;
 }
 
@@ -116,11 +136,13 @@ export function withGuardedFinalText(blocks: any[], reply: string): any[] {
   return out;
 }
 
-export function claimFallback(liveSession: boolean, userReportedSet: boolean): string {
+export function claimFallback(liveSession: boolean, userReportedSet: boolean, injuryOnFile = false): string {
   if (userReportedSet) return SET_DETAILS_FALLBACK;
-  return liveSession ? LIVE_SESSION_FALLBACK : ACTION_FALLBACK;
+  if (liveSession) return LIVE_SESSION_FALLBACK;
+  return injuryOnFile ? INJURY_FALLBACK : ACTION_FALLBACK;
 }
 
 export const SET_DETAILS_FALLBACK = 'How many reps did you get on that set?';
 export const LIVE_SESSION_FALLBACK = "Tell me when the set's done and how many reps you got.";
 export const ACTION_FALLBACK = "I haven't changed anything yet. Want me to go ahead?";
+export const INJURY_FALLBACK = 'Before anything else, how is the pain feeling right now?';

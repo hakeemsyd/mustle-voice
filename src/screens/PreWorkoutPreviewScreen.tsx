@@ -30,7 +30,6 @@ import { titleCase } from "../lib/textFormat";
 import { callBrain, COACH_UNREACHABLE_MESSAGE } from "../lib/brain";
 import { supabase } from "../lib/supabase";
 import { dispatchQuery } from "../lib/dispatchQuery";
-import { persistChatLine } from "../lib/chatLog";
 import { kgToDisplayWeight, type Units } from "../lib/units";
 import { useUnitPrefsState } from "../hooks/useUnitPrefs";
 import { convertLoadScheme } from "../lib/loadScheme";
@@ -159,13 +158,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
     setMessages((prev) => [...prev, { id, role, text, imageUrl }]);
   }, []);
 
-  const showLine = React.useCallback(
-    (role: "coach" | "user", text: string) => {
-      appendMessage(role, text);
-      persistChatLine(session.userId, role, text);
-    },
-    [appendMessage, session.userId],
-  );
+  const showLine = appendMessage;
 
   // This screen never claimed the shared conversation, so anything spoken here was still being
   // routed to whichever screen registered last (Home, or Global Chat) — the mic connected fine,

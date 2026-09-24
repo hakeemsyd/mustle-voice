@@ -9,6 +9,7 @@ import { stripSystemNote } from '../_shared/strip-system-note.ts';
 import { scrubInternalLanguage } from '../_shared/scrub-internal.ts';
 import { describeCueFacts, describeResumedStart, describeTypedTurnSetOutcome } from '../_shared/turn-set-outcome.ts';
 import { claimFallback, guardClaims, trackToolOutcomes, withGuardedFinalText } from '../_shared/claim-guard.ts';
+import { contextHasInjuryGate } from '../_shared/injury-context.ts';
 import { looksLikeFinishedSetReport } from '../_shared/set-report.ts';
 import { SYSTEM_CUE_PREFIX } from '../_shared/system-cue.ts';
 import { buildLiveSessionSnapshot, LIVE_STATE_MAX_AGE_MS } from '../_shared/live-session-format.ts';
@@ -128,7 +129,7 @@ Deno.serve(async (req) => {
         ? (liveRow.state as any)?.startedAt
         : null;
     const scopedHistory =
-      cueName === SESSION_START_CUE
+      cueName === SESSION_START_CUE || isDailyGreeting
         ? []
         : liveStrengthSession && typeof sessionStartedAt === 'string'
           ? (history ?? []).filter((m: any) => !m.at || m.at >= sessionStartedAt)
@@ -167,8 +168,10 @@ Deno.serve(async (req) => {
 
     const result = await runBrainTurn({ systemPrompt, messages, handlers, callModel });
 
+    const injuryOnFile = contextHasInjuryGate(fullContextBlock);
     const guarded = guardClaims(result.reply, {
       liveSession: liveStrengthSession,
+      injuryOnFile,
       setLoggedThisTurn: (cueName !== null && SET_CONFIRMING_CUES.has(cueName)) || tracked.outcomes.setLogged,
       restActive,
       actionSucceededThisTurn: tracked.outcomes.actionSucceeded,
@@ -177,7 +180,8 @@ Deno.serve(async (req) => {
     const guardedReply =
       guarded.dropped.length === 0
         ? result.reply
-        : guarded.text || claimFallback(liveStrengthSession, cueName === null && looksLikeFinishedSetReport(messageText));
+        : guarded.text ||
+          claimFallback(liveStrengthSession, cueName === null && looksLikeFinishedSetReport(messageText), injuryOnFile);
 
     const turnBlocks =
       guarded.dropped.length === 0

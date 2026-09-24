@@ -190,7 +190,7 @@ export const BRAIN_TOOLS = [
   {
     name: 'record_injury',
     description:
-      'Log a new or worsened injury. This re-checks the active plan — if it’s now unsafe, you must call update_training_plan next.',
+      'Log a new, worsened or improved injury, with its pain level. This re-checks the active plan — if it’s now unsafe, name the conflicting exercises and offer to swap them; call update_training_plan only after the user agrees, in a later turn.',
     input_schema: {
       type: 'object',
       properties: {

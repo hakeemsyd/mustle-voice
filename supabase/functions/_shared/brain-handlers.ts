@@ -9,6 +9,7 @@ import { convertLoadScheme, localizeWeights, normalizeExercisesDone } from './lo
 import { isBodyweightExercise, loadSchemeForExercise } from './exercise-catalog.ts';
 import { issueConfirmToken, verifyConfirmToken } from './confirm-token.ts';
 import { validatePlan, explainViolations, forbiddenTags, type Injury } from './injury-validator.ts';
+import { injuryDirective } from './injury-context.ts';
 import { validateSplit, explainSplitProblems } from './split-validator.ts';
 import { APP_LINE_MODALITY } from './replay-history.ts';
 import { resolveToolSetWeight } from './turn-set-outcome.ts';
@@ -771,6 +772,7 @@ export function createHandlers(
   // Secret for confirm-token signing (see confirm-token.ts) — reused rather than a new env
   // var since it's already injected into every edge function and never leaves this process.
   const confirmSecret = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+  let injuryRecordedThisTurn = false;
 
   let unitsPromise: Promise<'metric' | 'imperial'> | null = null;
   const resolveUnits = (): Promise<'metric' | 'imperial'> => {
@@ -950,7 +952,17 @@ export function createHandlers(
     },
 
     generate_training_plan: (input) => writePlan(supabase, userId, input, { confirmSecret, requireConfirm: true }),
-    update_training_plan: (input) => writePlan(supabase, userId, input),
+    update_training_plan: (input) =>
+      injuryRecordedThisTurn
+        ? Promise.resolve({
+            status: 'not_saved_needs_agreement',
+            instruction:
+              'Nothing was saved. An injury was recorded this turn, and the plan only changes after the ' +
+              'user agrees. Name the exercises that conflict, propose the swap in one line, and ask ' +
+              'whether to update their plan. Call update_training_plan in a later turn, once they say yes. ' +
+              'Answer their actual question in this reply, and never say the plan was updated.',
+          })
+        : writePlan(supabase, userId, input),
 
     generate_nutrition_targets: (input) => writeNutritionTargets(supabase, userId, input.goal),
     update_nutrition_targets: (input) => writeNutritionTargets(supabase, userId, input.goal),
@@ -977,14 +989,17 @@ export function createHandlers(
     },
 
     record_injury: async (input) => {
+      const painLevel = typeof input.pain_level === 'number' ? input.pain_level : null;
       const { error } = await supabase.from('injury').insert({
         user_id: userId,
         area: input.area,
         severity: input.severity ?? null,
-        pain_level: typeof input.pain_level === 'number' ? input.pain_level : null,
+        pain_level: painLevel,
         note: input.note ?? null,
       });
       if (error) throw new Error(`injury insert: ${error.message}`);
+      injuryRecordedThisTurn = true;
+      const guidance = injuryDirective(painLevel);
 
       const injuries = await fetchActiveInjuries(supabase, userId);
       const { data: activePlan } = await supabase
@@ -993,7 +1008,7 @@ export function createHandlers(
         .eq('user_id', userId)
         .eq('status', 'active')
         .maybeSingle();
-      if (!activePlan) return { status: 'recorded', plan_check: 'no_active_plan' };
+      if (!activePlan) return { status: 'recorded', plan_check: 'no_active_plan', guidance };
 
       // Scoped to the active plan on purpose: archiving a plan leaves its plan_session and
       // plan_exercise rows in place, so a user_id-only lookup validates exercises the user no
@@ -1014,10 +1029,14 @@ export function createHandlers(
           status: 'recorded',
           plan_check: 'now_unsafe',
           violations: explainViolations(violations),
-          instruction: 'Call update_training_plan now to replace the unsafe exercises.',
+          instruction:
+            'Nothing in the plan has changed. Tell the user which of these exercises conflict with the ' +
+            'injury and offer to swap them out, then answer their actual question. Call ' +
+            'update_training_plan only in a later turn, after they agree.',
+          guidance,
         };
       }
-      return { status: 'recorded', plan_check: 'still_safe' };
+      return { status: 'recorded', plan_check: 'still_safe', guidance };
     },
 
     log_food: async (input) => {

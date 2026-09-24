@@ -31,6 +31,7 @@ import {
   withGuardedFinalText,
   type ClaimGuardState,
 } from '../_shared/claim-guard.ts';
+import { contextHasInjuryGate } from '../_shared/injury-context.ts';
 import {
   HOLDS_MISSING_WEIGHT_FROM_VERSION,
   looksLikeFinishedSetReport,
@@ -196,14 +197,16 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
   );
   const handlers = tracked.handlers;
   const liveSession = isLiveStrengthSession(liveSnapshot);
+  const injuryOnFile = contextHasInjuryGate(fullContextBlock);
   const guardState = (): ClaimGuardState => ({
     liveSession,
+    injuryOnFile,
     setLoggedThisTurn:
       setOutcome?.kind === 'logged' || (cueName !== null && SET_CONFIRMING_CUES.has(cueName)) || tracked.outcomes.setLogged,
     restActive: liveSnapshot?.status === 'resting',
     actionSucceededThisTurn: tracked.outcomes.actionSucceeded,
   });
-  const fallbackReply = claimFallback(liveSession, !isSystemCue && looksLikeFinishedSetReport(userText));
+  const fallbackReply = claimFallback(liveSession, !isSystemCue && looksLikeFinishedSetReport(userText), injuryOnFile);
 
   // A workout's conversation must not leak into the next one. The app stamps live_session_state
   // with when the current session started; anything older belongs to a previous workout and reads
