@@ -142,7 +142,7 @@ export function useMessageHistory() {
         .eq("user_id", userId)
         .eq("hidden", false)
         .order("at", { ascending: false })
-        .limit(200);
+        .limit(500);
       if (cancelled) return;
       if (error) {
         console.error("[history] failed to load messages:", error.message);

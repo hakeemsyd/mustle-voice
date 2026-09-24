@@ -38,6 +38,7 @@ export interface NutritionSummaryCard {
   type: 'nutrition_summary';
   calories_left: number;
   calories_target: number;
+  calories_consumed?: number;
   /** `current` is a real sum of today's food_log rows — the same records the Fuel screen reads,
    *  never estimated from the calories-consumed ratio. */
   macros: { label: string; target: number; current: number; unit: string }[];

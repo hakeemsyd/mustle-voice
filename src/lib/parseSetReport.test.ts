@@ -5,6 +5,9 @@ import {
   parseStatedWeight,
   describeParsedSet,
   looksLikeSetReport,
+  looksLikeStartSetCommand,
+  needsWeightBeforeLogging,
+  parseWeightReply,
 } from './parseSetReport';
 
 test('pounds are converted to kilograms, not stored as the raw number', () => {
@@ -99,4 +102,45 @@ test('seconds still win over minutes when both could match', () => {
     reps: 45,
     unit: 'seconds',
   });
+});
+
+test("a curly-apostrophe start command ends rest like a straight one", () => {
+  assert.equal(looksLikeStartSetCommand("Let\u2019s go"), true);
+  assert.equal(looksLikeStartSetCommand("Let\u2019s go."), true);
+  assert.equal(looksLikeStartSetCommand("let's go"), true);
+});
+
+test('a bare weight after "at" or "with" follows the user preference', () => {
+  assert.deepEqual(parseSetReport('10 reps at 60', 'imperial'), { weight: 27.2, reps: 10 });
+  assert.deepEqual(parseSetReport('at 60 for 10', 'imperial'), { weight: 27.2, reps: 10 });
+  assert.deepEqual(parseSetReport('set 2 at 60 for 8', 'imperial'), { weight: 27.2, reps: 8 });
+  assert.deepEqual(parseSetReport('10 reps at 60', 'metric'), { weight: 60, reps: 10 });
+});
+
+test('a number that is not a weight is not read as one', () => {
+  assert.deepEqual(parseSetReport('10 reps at 60 percent', 'imperial'), { weight: null, reps: 10 });
+  assert.deepEqual(parseSetReport('10 reps with 2 minutes rest', 'imperial'), { weight: null, reps: 10 });
+  assert.equal(parseSetReport('did 3 sets at 60', 'imperial'), null);
+});
+
+test('"60 x 10" is weight by reps with or without spaces', () => {
+  assert.deepEqual(parseSetReport('60 x 10', 'imperial'), { weight: 27.2, reps: 10 });
+  assert.deepEqual(parseSetReport('60x10', 'imperial'), { weight: 27.2, reps: 10 });
+});
+
+test('an answer to "what weight was that" is read as a weight or as bodyweight', () => {
+  assert.deepEqual(parseWeightReply('60', 'imperial'), { weight: 27.2 });
+  assert.deepEqual(parseWeightReply('sixty pounds', 'imperial'), { weight: 27.2 });
+  assert.deepEqual(parseWeightReply('it was 30 kg', 'imperial'), { weight: 30 });
+  assert.deepEqual(parseWeightReply('just bodyweight', 'imperial'), { weight: null });
+  assert.equal(parseWeightReply('yes', 'imperial'), null);
+  assert.equal(parseWeightReply('10 reps', 'imperial'), null);
+});
+
+test('only a loaded lift with no known weight needs one before logging', () => {
+  assert.equal(needsWeightBeforeLogging({ weight: null, reps: 10 }, null, false), true);
+  assert.equal(needsWeightBeforeLogging({ weight: null, reps: 10 }, null, true), false);
+  assert.equal(needsWeightBeforeLogging({ weight: null, reps: 10 }, 27.2, false), false);
+  assert.equal(needsWeightBeforeLogging({ weight: 27.2, reps: 10 }, null, false), false);
+  assert.equal(needsWeightBeforeLogging({ weight: null, reps: 45, unit: 'seconds' }, null, false), false);
 });

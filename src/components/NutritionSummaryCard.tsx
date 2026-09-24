@@ -42,19 +42,21 @@ const MacroBarRow = ({
   color: string;
 }) => {
   const pct = Math.min(100, Math.round((value / Math.max(1, goal)) * 100));
+  const over = goal > 0 ? Math.round(value - goal) : 0;
   return (
     <View style={barStyles.row}>
       <View style={barStyles.top}>
         <Text style={barStyles.label}>{label}</Text>
-        <Text style={barStyles.values}>
+        <Text style={[barStyles.values, over > 0 && barStyles.valuesOver]}>
           {value.toLocaleString()}
-          <Text style={barStyles.sep}> / </Text>
+          <Text style={[barStyles.sep, over > 0 && barStyles.valuesOver]}> / </Text>
           {goal.toLocaleString()}
           {unit}
+          {over > 0 ? ` · +${over.toLocaleString()}${unit === "g" ? "g" : ""} over` : ""}
         </Text>
       </View>
       <View style={barStyles.track}>
-        <View style={[barStyles.fill, { width: `${pct}%`, backgroundColor: color }]} />
+        <View style={[barStyles.fill, { width: `${pct}%`, backgroundColor: over > 0 ? colors.danger : color }]} />
       </View>
     </View>
   );
@@ -63,7 +65,8 @@ const MacroBarRow = ({
 export const NutritionSummaryCard = ({ card, variant = "dark" }: NutritionSummaryCardProps) => {
   const isLight = variant === "light";
 
-  const consumed = card.calories_target - card.calories_left;
+  const consumed = card.calories_consumed ?? card.calories_target - card.calories_left;
+  const caloriesOver = card.calories_target > 0 ? Math.max(0, Math.round(consumed - card.calories_target)) : 0;
   const progress =
     card.calories_target > 0
       ? Math.max(0, Math.min(1, consumed / card.calories_target))
@@ -129,10 +132,12 @@ export const NutritionSummaryCard = ({ card, variant = "dark" }: NutritionSummar
               size={168}
               strokeWidth={14}
               progress={progress}
-              color={colors.accent}
+              color={caloriesOver > 0 ? colors.danger : colors.accent}
             >
-              <Text style={styles.ringValue}>{card.calories_left}</Text>
-              <Text style={styles.ringLabel}>CAL LEFT</Text>
+              <Text style={[styles.ringValue, caloriesOver > 0 && styles.ringValueOver]}>
+                {caloriesOver > 0 ? `+${caloriesOver}` : card.calories_left}
+              </Text>
+              <Text style={styles.ringLabel}>{caloriesOver > 0 ? "CAL OVER" : "CAL LEFT"}</Text>
             </ProgressRing>
           </View>
 
@@ -158,7 +163,11 @@ export const NutritionSummaryCard = ({ card, variant = "dark" }: NutritionSummar
 
       {isLight ? (
         <View style={[styles.insightRow, styles.insightRowLight]}>
-          <Text style={[styles.insightText, styles.insightTextLight]}>{buildNote(proteinPct)}</Text>
+          <Text style={[styles.insightText, styles.insightTextLight]}>
+            {caloriesOver > 0
+              ? `You're ${caloriesOver.toLocaleString()} calories over today's target, so keep anything else light.`
+              : buildNote(proteinPct)}
+          </Text>
         </View>
       ) : (
         !!card.insight && (
@@ -251,6 +260,7 @@ const styles = StyleSheet.create({
     fontSize: 34,
     color: colors.text,
   },
+  ringValueOver: { color: colors.danger },
   ringLabel: {
     fontFamily: fonts.bodySemiBold,
     fontSize: 11,
@@ -309,6 +319,9 @@ const barStyles = StyleSheet.create({
   },
   sep: {
     color: "rgba(10,10,10,0.5)",
+  },
+  valuesOver: {
+    color: colors.danger,
   },
   track: {
     height: 6,

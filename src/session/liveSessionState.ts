@@ -1,6 +1,7 @@
 import type { LoggedSet, SessionExercise, SessionTarget } from './ActiveSessionContext';
 import { kgToDisplayWeight, type Units } from '../lib/units';
 import { convertLoadScheme } from '../lib/loadScheme';
+import { normalizeLoadScheme } from '../../supabase/functions/_shared/load-intent';
 import { titleCase } from '../lib/textFormat';
 import { isTimedExercise } from '../lib/exerciseCatalog';
 
@@ -19,6 +20,7 @@ export interface LiveSessionSnapshot {
     repScheme: string;
     loadScheme: string | null;
     loggedSets: LoggedSet[];
+    statedWeight?: number | null;
   } | null;
   upcomingExercises: string[];
   restTargetSec: number | null;
@@ -38,6 +40,7 @@ interface SnapshotInput {
   ended: boolean;
   paused: boolean;
   elapsedSec: number;
+  statedWeight?: { exerciseIndex: number; weight: number } | null;
 }
 
 export function buildLiveSessionSnapshot(input: SnapshotInput): LiveSessionSnapshot | null {
@@ -68,11 +71,13 @@ export function buildLiveSessionSnapshot(input: SnapshotInput): LiveSessionSnaps
           repScheme: current.repScheme,
           loadScheme: current.loadScheme,
           loggedSets: input.loggedSets[input.currentExerciseIndex] ?? [],
+          statedWeight:
+            input.statedWeight?.exerciseIndex === input.currentExerciseIndex ? input.statedWeight.weight : null,
         }
       : null,
     upcomingExercises: input.exercises
       .slice(input.currentExerciseIndex + 1)
-      .map((e) => `${e.name} (${e.sets} sets of ${e.repScheme}${e.loadScheme ? `, ${e.loadScheme}` : ''})`),
+      .map((e) => `${e.name} (${e.sets} sets of ${e.repScheme}${e.loadScheme ? `, ${normalizeLoadScheme(e.loadScheme)}` : ''})`),
     restTargetSec: input.resting ? input.restTargetSec : null,
     restRemainingSec,
   };
@@ -111,9 +116,16 @@ export function describeLiveSessionSnapshot(
     // Spelled out as completed-vs-remaining rather than a bare "set N of M" ordinal. Confirmed
     // live: "set 4 of 4" (3 done, the 4th still to do) was read as "4 of 4 finished", and the
     // coach moved on to the next exercise while the app was still waiting on the last set.
+    const lastLoggedKg = [...c.loggedSets].reverse().find((s) => s.weight != null && s.unit !== 'seconds')?.weight ?? null;
+    const currentLoad =
+      lastLoggedKg != null
+        ? `${kgToDisplayWeight(lastLoggedKg, units)} (the weight on their last set, which is what the card shows)`
+        : c.loadScheme
+          ? convertLoadScheme(c.loadScheme, units)
+          : null;
     lines.push(
       `- Current exercise: "${c.name}" — ${isTimedExercise(c.name) ? 'target time' : 'target reps'} ${c.repScheme}` +
-        `${c.loadScheme ? `, load ${convertLoadScheme(c.loadScheme, units)}` : ''}. When you say the target out loud, say ` +
+        `${currentLoad ? `, load ${currentLoad}` : ''}. When you say the target out loud, say ` +
         `EXACTLY ${c.repScheme} — never a rep range carried over from an earlier exercise in this ` +
         `session, however many times you just said it.`,
     );
@@ -125,13 +137,9 @@ export function describeLiveSessionSnapshot(
             `does NOT complete it, and never count one twice because it was discussed more than once ` +
             `— confirmed live, the coach treated its own "set three, go" as set three being finished ` +
             `and challenged the user's real report of it as a duplicate. ` +
-            `IMPORTANT: this count can lag by one set. It is written by the app a moment after a set ` +
-            `is logged, so a set the user reported seconds ago may not be in it yet. If a message in ` +
-            `THIS turn says the app just logged a set, that message is newer than this block and wins ` +
-            `— confirmed live: the coach told a user their set "didn't register" and to tap the screen, ` +
-            `while the app had already logged it and the screen already showed it. Never tell the user ` +
-            `a set failed to register, and never accuse them of repeating one; if the two disagree, ` +
-            `believe the more recent one and move on.`
+            `This count is exact. The only exception is when the "What the app did with THIS message" ` +
+            `note says the app LOGGED this message, in which case count that one set as done. Never ` +
+            `assume a set was logged from what was said, and never accuse them of repeating one.`
         : `- Sets COMPLETED on it: ${done} of ${c.totalSets}. This exercise is finished.`,
     );
     lines.push(

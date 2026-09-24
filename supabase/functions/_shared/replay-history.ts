@@ -12,6 +12,18 @@ export interface StoredMessage {
   role: string;
   content: string | null;
   blocks?: unknown;
+  hidden?: boolean | null;
+  greeting_key?: string | null;
+  modality?: string | null;
+}
+
+export const APP_LINE_MODALITY = 'app';
+
+const GREETING_PROMPT_PREFIX = 'Say hello for the first time today';
+
+export function isGreetingScaffold(row: StoredMessage): boolean {
+  if (row.greeting_key) return true;
+  return row.role === 'user' && row.hidden === true && (row.content ?? '').startsWith(GREETING_PROMPT_PREFIX);
 }
 
 function isToolResultTurn(content: unknown): boolean {
@@ -52,6 +64,7 @@ export function replayHistory(rows: StoredMessage[]): any[] {
   const entries: any[] = [];
 
   for (const row of rows) {
+    if (isGreetingScaffold(row) || row.modality === APP_LINE_MODALITY) continue;
     const blocks = row.blocks;
     if (row.role === 'assistant' && Array.isArray(blocks) && blocks.length > 0) {
       for (const entry of blocks) {

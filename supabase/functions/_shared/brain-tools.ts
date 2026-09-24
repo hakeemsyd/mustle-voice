@@ -33,10 +33,9 @@ const exerciseSchema = {
         "number and simply attach the display unit to it. " +
         "When it does not — which is every brand-new user — give a concrete starting point instead: " +
         "'bodyweight', 'empty bar to start', 'light — find your working weight'. NEVER a percentage " +
-        "of one-rep max ('70-80% 1RM') or an RPE unless read_state actually shows a tested 1RM or " +
-        "prior working sets for this exercise: a beginner does not know their 1RM, so it displays on " +
-        "their workout screen as a number they cannot act on. Confirmed live on a fresh signup, " +
-        "which was handed '70-80% 1RM' for Overhead Press with no lifting history on record at all.",
+        "of one-rep max ('%1RM', '70-80% 1RM') for anyone: the app never records a tested 1RM, so it " +
+        "is replaced on save and the coach reads it aloud as \"at one rep max\", which is meaningless " +
+        "for a set of 8. With prior working sets, write the real weight ('last time: 60 kg').",
     },
   },
   required: ['name', 'sets', 'rep_scheme'],
@@ -50,6 +49,16 @@ const sessionSchema = {
     exercises: { type: 'array', items: exerciseSchema },
   },
   required: ['day_order', 'focus', 'exercises'],
+};
+
+const trainingDaysSchema = {
+  type: 'array',
+  items: { type: 'string', enum: ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'] },
+  description:
+    "The weekdays they train on, exactly as agreed in the consultation (e.g. 6 days Monday to Saturday " +
+    "with Sunday off). Every other weekday is a rest day on Home and the Calendar. The sessions still " +
+    "run in rotation order across these days: a missed day keeps its session next. Omit only when they " +
+    'gave no preference.',
 };
 
 export const BRAIN_TOOLS = [
@@ -87,6 +96,7 @@ export const BRAIN_TOOLS = [
       properties: {
         split: { type: 'string', description: "e.g. 'upper/lower', 'push/pull/legs'" },
         days_per_week: { type: 'integer' },
+        training_days: trainingDaysSchema,
         sessions: { type: 'array', items: sessionSchema },
         confirm: {
           type: 'boolean',
@@ -122,6 +132,7 @@ export const BRAIN_TOOLS = [
         changes_summary: { type: 'string', description: 'One line describing what changed and why.' },
         split: { type: 'string' },
         days_per_week: { type: 'integer' },
+        training_days: { ...trainingDaysSchema, description: `${trainingDaysSchema.description} Omit to keep the current training days.` },
         sessions: { type: 'array', items: sessionSchema },
       },
       required: ['changes_summary', 'split', 'days_per_week', 'sessions'],
@@ -502,6 +513,13 @@ export const BRAIN_TOOLS = [
             'returned. A stale, missing, or invented token is rejected and returns a fresh preview ' +
             'instead of starting anything.',
         },
+        train_on_rest_day: {
+          type: 'boolean',
+          description:
+            'Set true only when today is a scheduled rest day and the user explicitly wants to train ' +
+            'anyway. Their next session in the rotation becomes today\'s session; the order continues ' +
+            'from it afterwards.',
+        },
       },
     },
   },
@@ -569,6 +587,22 @@ export const BRAIN_TOOLS = [
         new_starts_on: { type: 'string', description: 'YYYY-MM-DD. Omit to mean "starting today".' },
         confirm: { type: 'boolean', description: 'Leave false/omitted to preview; true once confident.' },
       },
+    },
+  },
+  {
+    name: 'update_training_days',
+    description:
+      'Change which weekdays they train on, for good ("move my rest day to Saturday", "I can only train ' +
+      'Monday, Wednesday and Friday now"). The sessions and their order stay the same; only the days ' +
+      'change, and Home and the Calendar update straight away. For a single day off use reschedule_today; ' +
+      'for training on one rest day only use start_todays_workout with train_on_rest_day. Only call once ' +
+      'the user has asked for it.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        training_days: { ...trainingDaysSchema, description: 'The full new set of training weekdays.' },
+      },
+      required: ['training_days'],
     },
   },
   {
@@ -703,7 +737,11 @@ export const BRAIN_TOOLS = [
       'IF THE USER NAMED WHAT THEY WANT INSTEAD, pass it as replacement_exercise_name — leaving it out ' +
       'lets the app pick any same-pattern exercise, which is how a user who asked for Incline Dumbbell ' +
       'Press was given Overhead Press instead (confirmed live). Only omit it when they asked you to ' +
-      'choose. Never tell the user what it was swapped to until this returns "requested" — report the ' +
+      'choose. SAYING THEY ARE USING DIFFERENT EQUIPMENT IS A SWAP REQUEST: "I\'m using dumbbells" on ' +
+      'Bench Press means call this with replacement_exercise_name "Dumbbell Bench Press". Confirmed ' +
+      'live: the coach answered "got it, dumbbell bench" without calling this, the card stayed on Bench ' +
+      'Press, and the user spent the session arguing with the app. Never say the new exercise name as ' +
+      'if it were current until this returns "swapped" or "swapped_for_today" — report the ' +
       '`replacement` value it gives back, not the name you had in mind.',
     input_schema: {
       type: 'object',
@@ -762,12 +800,11 @@ export const BRAIN_TOOLS = [
     name: 'log_live_set',
     description:
       "Record one COMPLETED set into the user's active in-app workout when the app has not already " +
-      'recorded it itself. The app logs clear reports on its own (anything with "done"/"finished", a ' +
-      'past-tense report like "I got 8", a set number, or an explicit weight-and-reps pair) and the ' +
-      'live session state block shows you the resulting count every turn — so call this ONLY when the ' +
-      'user has told you a set is finished, the live state block still shows it as not completed, and ' +
-      'you have both numbers. Use it for phrasings the app deliberately stays out of: a rep count on ' +
-      'its own answering a question you asked, or a set described across several turns. ' +
+      'recorded it itself. Never guess whether the app logged something: every turn during a workout ' +
+      'carries a "What the app did with THIS message" note that says exactly that. If the note says ' +
+      'the app LOGGED the message, never call this. If it says NOTHING was logged and the user told you ' +
+      'they finished a set with a rep count, call this; if they gave no rep count, ask for it first. ' +
+      'Only tell them the set is logged or that rest has started once this returns "logged". ' +
       'NEVER call it for a user counting their reps out loud mid-set ("one, two, three... four, five" ' +
       'is counting, not a report, and logging it ends their set early — confirmed live), for a weight ' +
       'they are about to use, for a set you merely announced, or for a set already in the live state ' +
@@ -791,8 +828,9 @@ export const BRAIN_TOOLS = [
     description:
       "Remove the most recently logged set in the user's active in-app workout session — use when " +
       'they say the last one was wrong, misheard, or shouldn\'t have been logged (e.g. "that\'s ' +
-      'wrong, undo that" or "I didn\'t say that"). Only undoes the single most recent set; only ' +
-      'works while a session is actually running and a set was just logged.',
+      'wrong, undo that" or "I didn\'t say that"). Removes only the single most recent set, and ' +
+      'works whether or not rest is still running. Only say it was removed once this returns ' +
+      '"undone"; then ask for the correct numbers.',
     input_schema: { type: 'object', properties: {} },
   },
   {
@@ -828,6 +866,29 @@ export const BRAIN_TOOLS = [
         },
       },
       required: ['completed'],
+    },
+  },
+  {
+    name: 'discard_workout',
+    description:
+      'Throw away the workout running in the app right now: nothing from it is saved, every set logged ' +
+      'in it is deleted, and the app returns to Home. For "drop it", "scrap this workout", "delete this ' +
+      'session", "don\'t save it". NOT for stopping early and keeping what they did (that is end_workout). ' +
+      'Call WITHOUT confirm first — it returns what would be deleted and changes nothing. Only call again ' +
+      'with confirm:true and the exact confirm_token once they explicitly agree. Never say the workout was ' +
+      'cleared, dropped or deleted unless this returns "discarded".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        confirm: {
+          type: 'boolean',
+          description: 'Leave false/omitted to preview with nothing deleted. Set true only after explicit agreement.',
+        },
+        confirm_token: {
+          type: 'string',
+          description: 'Required alongside confirm:true — the exact confirm_token the preview call returned.',
+        },
+      },
     },
   },
   {

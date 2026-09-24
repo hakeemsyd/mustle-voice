@@ -132,6 +132,8 @@ const WORKOUT_SILENCE_TIMEOUT_MS = 10 * 60_000;
 // — long enough to cover a navigation transition, short enough that genuinely leaving voice
 // behind still closes the mic promptly.
 const HANDOFF_GRACE_MS = 600;
+
+const OWED_REPLY_GRACE_MS = 10_000;
 const SILENCE_CHECK_INTERVAL_MS = 5_000;
 
 // Wraps the real ElevenLabs conversation hook (not a decorative animation) —
@@ -161,6 +163,14 @@ export function useVoiceSession(
   const mutedRef = useRef(false);
   mutedRef.current = muted;
   const typedWhileMutedRef = useRef(false);
+  const replyOwedRef = useRef(false);
+  const pendingEndRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearPendingEnd = () => {
+    if (pendingEndRef.current) {
+      clearTimeout(pendingEndRef.current);
+      pendingEndRef.current = null;
+    }
+  };
 
   const {
     startSession,
@@ -173,7 +183,6 @@ export function useVoiceSession(
     getInputVolume,
     setMuted,
   } = useConversation({
-    micMuted: muted,
     onError: (message) => {
       if (TRANSPORT_FAILURE.test(String(message))) {
         console.warn('[voice] transport error, recovering:', message);
@@ -195,8 +204,13 @@ export function useVoiceSession(
       const cleaned = stripNonSpeechArtifacts(message);
       if (!cleaned) return;
       if (mutedRef.current && role === 'user') return;
-      if (mutedRef.current && role !== 'user' && !typedWhileMutedRef.current) return;
+      if (mutedRef.current && role !== 'user' && !typedWhileMutedRef.current && !replyOwedRef.current) return;
       typedWhileMutedRef.current = false;
+      replyOwedRef.current = role === 'user';
+      if (role !== 'user' && pendingEndRef.current) {
+        clearPendingEnd();
+        setTimeout(() => disconnectRef.current(), 0);
+      }
       if (role === 'user') {
         // A system cue is the app prompting the coach, not the user speaking — it just arrives as
         // a user turn because sendUserMessage is the only call that makes the agent reply. Letting
@@ -547,6 +561,7 @@ export function useVoiceSession(
 
   const connect = useCallback(() => {
     cancelRelease();
+    clearPendingEnd();
     connectRef.current();
   }, []);
 
@@ -581,6 +596,7 @@ export function useVoiceSession(
   // is an uncaught red-screen crash, not a caught rejection like the start/end paths above.
   //
   const applyMute = (next: boolean) => {
+    if (!next) clearPendingEnd();
     if (!isActiveRef.current) return;
     if (mutedRef.current === next) return;
     mutedRef.current = next;
@@ -597,11 +613,27 @@ export function useVoiceSession(
 
   const toggleMute = () => applyMute(!mutedRef.current);
 
+  const endWhenAnswered = useCallback(() => {
+    cancelRelease();
+    if (!isActiveRef.current) return;
+    if (!replyOwedRef.current) {
+      disconnectRef.current();
+      return;
+    }
+    clearPendingEnd();
+    pendingEndRef.current = setTimeout(() => {
+      pendingEndRef.current = null;
+      disconnectRef.current();
+    }, OWED_REPLY_GRACE_MS);
+  }, []);
+
   const sendUserMessageGated = useCallback(
     (text: string) => {
       if (mutedRef.current) {
         if (text.startsWith(SYSTEM_CUE_PREFIX)) return;
         typedWhileMutedRef.current = true;
+      } else {
+        replyOwedRef.current = true;
       }
       sendUserMessage(text);
     },
@@ -618,6 +650,7 @@ export function useVoiceSession(
     status,
     sendContextualUpdate,
     sendUserMessage: sendUserMessageGated,
+    endWhenAnswered,
     reconnecting,
     voiceDropped,
     idleClosed,

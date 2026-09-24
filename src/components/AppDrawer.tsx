@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ActivityIndicator,
   Alert,
+  type AlertButton,
   Animated,
   Dimensions,
   Easing,
@@ -13,6 +14,8 @@ import {
   TextInput,
   View,
 } from "react-native";
+import * as Linking from "expo-linking";
+import type { User } from "@supabase/supabase-js";
 import { useProfileName } from "../hooks/useProfileName";
 import { useMessageHistory, type HistoryTag } from "../hooks/useMessageHistory";
 import { useScreenInsets } from "../hooks/useScreenInsets";
@@ -44,6 +47,7 @@ import {
   MailCheckIcon,
   MessageCircleDashedIcon,
   MessageCircleIcon,
+  MoonIcon,
   PersonStandingIcon,
   SearchIcon,
   SettingsIcon,
@@ -429,6 +433,12 @@ const EmptyState = ({ title, subtitle }: { title: string; subtitle: string }) =>
 
 // ---------- Calendar detail ----------
 
+const isScheduledRest = (detail: DayDetail): boolean =>
+  detail.dayKind === "rest" || detail.dayKind === "chosen_rest";
+
+const restDayLabel = (detail: DayDetail): string =>
+  detail.dayKind === "chosen_rest" ? "Rest day (you chose to skip)" : "Rest day";
+
 const CalendarTimelineDay = ({
   detail,
   onOpenSessionReport,
@@ -442,13 +452,22 @@ const CalendarTimelineDay = ({
   const doneFocus = loggedWorkout?.focus ?? null;
   const hasPlan = !!doneFocus || !!detail.plannedFocus;
   const plannedValue = doneFocus ? titleCase(doneFocus) : detail.plannedFocus ? titleCase(detail.plannedFocus) : null;
+  const isRest = !hasPlan && !loggedWorkout && isScheduledRest(detail);
 
-  if (!hasPlan && detail.meals.length === 0 && detail.injuryNotes.length === 0) {
+  if (!hasPlan && !isRest && detail.meals.length === 0 && detail.injuryNotes.length === 0) {
     return <EmptyState title="No facts yet for this day" subtitle="Meals, injuries, and workouts logged this day will show up here." />;
   }
 
   return (
     <View style={styles.calDayBody}>
+      {isRest && (
+        <View style={styles.calPlannedRow}>
+          <View style={styles.calPlannedIcon}>
+            <MoonIcon size={14} color={colors.accent} />
+          </View>
+          <Text style={styles.calPlannedText}>{restDayLabel(detail)}</Text>
+        </View>
+      )}
       {hasPlan &&
         // A logged workout is the entry point to its own report here, the same way the full
         // Calendar screen's day sheet is — this list rendered it as a static row, so a session
@@ -517,6 +536,7 @@ const CalendarDetail = ({
   const selectedFocus =
     selectedWorkout?.focus ?? (isUpcoming ? today.upcomingSession?.focus ?? null : selectedDay.plannedFocus ?? null);
   const selectedUnfinished = !!selectedWorkout && isUnfinishedWorkout(selectedWorkout.status);
+  const selectedIsRest = !selectedWorkout && !selectedFocus && isScheduledRest(selectedDay);
   const heroEyebrow = selectedWorkout
     ? selectedUnfinished
       ? selectedDay.isToday
@@ -527,11 +547,17 @@ const CalendarDetail = ({
         : "COMPLETED"
     : isUpcoming
       ? "UPCOMING"
-      : selectedDay.isToday
-        ? "TODAY'S SESSION"
-        : selectedDay.isFuture
-          ? "PLANNED"
-          : "NOT LOGGED";
+      : selectedIsRest
+        ? selectedDay.isToday
+          ? "TODAY"
+          : selectedDay.isFuture
+            ? "PLANNED"
+            : "PAST"
+        : selectedDay.isToday
+          ? "TODAY'S SESSION"
+          : selectedDay.isFuture
+            ? "PLANNED"
+            : "NOT LOGGED";
 
   const caloriesMacro = fuel.macros?.find((m) => m.key === "calories");
   const proteinMacro = fuel.macros?.find((m) => m.key === "protein");
@@ -798,6 +824,7 @@ const DatePagerRow = ({
 interface ProfileData {
   displayName: string;
   email: string | null;
+  unverifiedEmail: string | null;
   weeklyFrequency: number | null;
   unitPrefs: "metric" | "imperial";
 }
@@ -806,20 +833,66 @@ const SettingsRow = ({
   icon,
   label,
   value,
+  badge,
   onPress,
 }: {
   icon: ReactNode;
   label: string;
   value?: string;
+  badge?: string;
   onPress: () => void;
 }) => (
   <Pressable style={styles.settingsRow} onPress={onPress}>
     <View style={styles.settingsRowIcon}>{icon}</View>
     <Text style={styles.settingsRowLabel}>{label}</Text>
-    {value != null && <Text style={styles.settingsRowValue}>{value}</Text>}
+    {value != null && (
+      <View style={styles.settingsRowValueWrap}>
+        <Text style={styles.settingsRowValue} numberOfLines={1}>
+          {value}
+        </Text>
+        {badge && <Text style={styles.settingsRowBadge}>{badge}</Text>}
+      </View>
+    )}
     <ChevronRightIcon size={14} color={colors.muted} />
   </Pressable>
 );
+
+const currentAuthUser = async (): Promise<User | null> => {
+  const { data } = await supabase.auth.getUser();
+  if (data.user) return data.user;
+  return (await supabase.auth.getSession()).data.session?.user ?? null;
+};
+
+const unverifiedEmailOf = (user: User | null): string | null =>
+  user && !user.email ? user.new_email ?? null : null;
+
+const resendEmailConfirmation = async (email: string) => {
+  const { error } = await supabase.auth.updateUser(
+    { email },
+    { emailRedirectTo: Linking.createURL("email-confirmed") },
+  );
+  if (error) {
+    if (error.status === 429 || /only request this after|rate limit/i.test(error.message)) {
+      console.warn("[drawer] email confirmation resend rate-limited:", error.message);
+      Alert.alert("Link already sent", `We sent one a moment ago. Check ${email}, or try again in a minute.`);
+      return;
+    }
+    console.error("[drawer] failed to resend email confirmation:", error.message);
+    Alert.alert("Couldn't send the link", error.message);
+    return;
+  }
+  Alert.alert("Link sent", `Check ${email} and tap the link to verify your email.`);
+};
+
+const offerEmailConfirmation = (email: string) =>
+  Alert.alert(
+    "Verify your email",
+    `Tap the link we sent to ${email}. Until you do, you won't be able to log back in if you log out.`,
+    [
+      { text: "Cancel", style: "cancel" },
+      { text: "Resend Link", onPress: () => void resendEmailConfirmation(email) },
+    ],
+  );
 
 const ProfileSectionLabel = ({ icon, label }: { icon: ReactNode; label: string }) => (
   <View style={styles.profileSectionLabelRow}>
@@ -842,14 +915,8 @@ const ProfileDetail = ({ userId, userName }: { userId: string | null; userName: 
     if (!userId) return;
     let cancelled = false;
     (async () => {
-      const [
-        {
-          data: { session },
-        },
-        biometricsRes,
-        profileRes,
-      ] = await Promise.all([
-        supabase.auth.getSession(),
+      const [authUser, biometricsRes, profileRes] = await Promise.all([
+        currentAuthUser(),
         supabase.from("biometrics").select("weekly_frequency").eq("user_id", userId).maybeSingle(),
         supabase.from("profile").select("display_name, unit_prefs").eq("user_id", userId).maybeSingle(),
       ]);
@@ -857,7 +924,8 @@ const ProfileDetail = ({ userId, userName }: { userId: string | null; userName: 
       const displayName = profileRes.data?.display_name ?? "";
       setData({
         displayName,
-        email: session?.user.email ?? null,
+        email: authUser?.email || null,
+        unverifiedEmail: unverifiedEmailOf(authUser),
         weeklyFrequency: biometricsRes.data?.weekly_frequency ?? null,
         unitPrefs: (profileRes.data?.unit_prefs as "metric" | "imperial" | undefined) ?? "metric",
       });
@@ -884,26 +952,41 @@ const ProfileDetail = ({ userId, userName }: { userId: string | null; userName: 
     setTimeout(() => setNameSaved(false), 1500);
   };
 
-  const confirmLogOut = () => {
+  const logOut = async () => {
+    setLoggingOut(true);
+    const { error } = await supabase.auth.signOut();
+    if (error) {
+      console.error("[drawer] failed to log out:", error.message);
+      const { error: localError } = await supabase.auth.signOut({ scope: "local" });
+      if (localError) {
+        console.error("[drawer] failed to clear local session:", localError.message);
+        Alert.alert("Log out failed", "Check your connection and try again.");
+        setLoggingOut(false);
+      }
+    }
+  };
+
+  const confirmLogOut = async () => {
+    const user = await currentAuthUser();
+    if (user && !user.email) {
+      const unverified = unverifiedEmailOf(user);
+      const buttons: AlertButton[] = [{ text: "Cancel", style: "cancel" }];
+      if (unverified) {
+        buttons.push({ text: "Resend Link", onPress: () => void resendEmailConfirmation(unverified) });
+      }
+      buttons.push({ text: "Log Out Anyway", style: "destructive", onPress: () => void logOut() });
+      Alert.alert(
+        "Your email isn't verified",
+        unverified
+          ? `If you log out now you won't be able to log back in, and your plan and history will be lost. Tap the link we sent to ${unverified} first.`
+          : "This account has no email, so you won't be able to log back in after logging out.",
+        buttons,
+      );
+      return;
+    }
     Alert.alert("Log out?", "You can log back in any time with your email and password.", [
       { text: "Cancel", style: "cancel" },
-      {
-        text: "Log Out",
-        style: "destructive",
-        onPress: async () => {
-          setLoggingOut(true);
-          const { error } = await supabase.auth.signOut();
-          if (error) {
-            console.error("[drawer] failed to log out:", error.message);
-            const { error: localError } = await supabase.auth.signOut({ scope: "local" });
-            if (localError) {
-              console.error("[drawer] failed to clear local session:", localError.message);
-              Alert.alert("Log out failed", "Check your connection and try again.");
-              setLoggingOut(false);
-            }
-          }
-        },
-      },
+      { text: "Log Out", style: "destructive", onPress: () => void logOut() },
     ]);
   };
 
@@ -1003,14 +1086,22 @@ const ProfileDetail = ({ userId, userName }: { userId: string | null; userName: 
           ) : null}
         </View>
       </View>
-      {data?.email && (
+      {data?.email ? (
         <SettingsRow
           icon={<MailCheckIcon size={16} color={colors.muted} />}
           label="Email"
           value={data.email}
           onPress={() => comingSoon("Changing email")}
         />
-      )}
+      ) : data?.unverifiedEmail ? (
+        <SettingsRow
+          icon={<MailCheckIcon size={16} color={colors.muted} />}
+          label="Email"
+          value={data.unverifiedEmail}
+          badge="Not verified"
+          onPress={() => offerEmailConfirmation(data.unverifiedEmail!)}
+        />
+      ) : null}
 
       <ProfileSectionLabel icon={<CreditCardIcon size={12} color={colors.muted} />} label="Subscription" />
       <View style={styles.planCard}>
@@ -1562,7 +1653,9 @@ const styles = StyleSheet.create({
   },
   settingsRowIcon: { width: 16, alignItems: "center" },
   settingsRowLabel: { flex: 1, fontFamily: fonts.body, fontSize: 13, color: colors.text },
+  settingsRowValueWrap: { flexShrink: 1, alignItems: "flex-end" },
   settingsRowValue: { fontFamily: fonts.body, fontSize: 12, color: colors.muted },
+  settingsRowBadge: { fontFamily: fonts.bodySemiBold, fontSize: 11, color: colors.danger, marginTop: 2 },
   nameEdit: { flexDirection: "row", alignItems: "center", gap: 8 },
   nameInput: {
     fontFamily: fonts.bodyMedium,

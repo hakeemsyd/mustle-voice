@@ -7,6 +7,14 @@ import { buildContextBlock, startOfLocalDayUtc } from '../_shared/brain-context.
 import { createHandlers } from '../_shared/brain-handlers.ts';
 import { stripSystemNote } from '../_shared/strip-system-note.ts';
 import { scrubInternalLanguage } from '../_shared/scrub-internal.ts';
+import { describeCueFacts, describeResumedStart, describeTypedTurnSetOutcome } from '../_shared/turn-set-outcome.ts';
+import { claimFallback, guardClaims, trackToolOutcomes, withGuardedFinalText } from '../_shared/claim-guard.ts';
+import { looksLikeFinishedSetReport } from '../_shared/set-report.ts';
+import { SYSTEM_CUE_PREFIX } from '../_shared/system-cue.ts';
+import { buildLiveSessionSnapshot, LIVE_STATE_MAX_AGE_MS } from '../_shared/live-session-format.ts';
+
+const SET_CONFIRMING_CUES = new Set(['set_logged', 'exercise_advanced']);
+const SESSION_START_CUE = 'session_start';
 
 // How far back a still-unfinished consultation stays readable. Long enough to cover leaving it
 // overnight or for a few days, short enough that an abandoned one doesn't haunt a later signup.
@@ -22,7 +30,7 @@ Deno.serve(async (req) => {
       message,
       modality = 'text',
       hidden = false,
-      hideReply = hidden,
+      hideReply,
       liveSessionState,
       timezone,
       attachmentUrl,
@@ -42,9 +50,19 @@ Deno.serve(async (req) => {
     }
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
-    const handlers = createHandlers(supabase, userId, timezone, {
-      currentUserText: message,
-    });
+    const messageText = typeof message === 'string' ? message : '';
+    const cueName = messageText.startsWith(SYSTEM_CUE_PREFIX) ? messageText.slice(SYSTEM_CUE_PREFIX.length).trim() : null;
+    const tracked = trackToolOutcomes(
+      createHandlers(supabase, userId, timezone, {
+        currentUserText: message,
+        appLoggedThisTurn: cueName !== null && SET_CONFIRMING_CUES.has(cueName),
+      }),
+    );
+    const handlers = tracked.handlers;
+    const liveBlockText = typeof liveSessionState === 'string' ? liveSessionState : '';
+    const liveStrengthSession =
+      liveBlockText.includes('- Current exercise:') && !/Status: finished/.test(liveBlockText);
+    const restActive = /Status: resting/.test(liveBlockText);
 
     const askedAt = new Date();
     // Global Chat is a continuous scrollback with no session boundary of its own, so without a
@@ -75,7 +93,7 @@ Deno.serve(async (req) => {
     const fetchHistory = () =>
       supabase
         .from('message')
-        .select('role,content,blocks')
+        .select('role,content,blocks,hidden,greeting_key,modality,at')
         .eq('user_id', userId)
         .gte(
           'at',
@@ -87,9 +105,11 @@ Deno.serve(async (req) => {
         .order('role', { ascending: true })
         .limit(MESSAGE_HISTORY_LIMIT);
 
-    let [{ data: history, error: historyError }, contextBlock] = await Promise.all([
+    let [{ data: history, error: historyError }, contextBlock, { data: liveRow }, { data: unitsRow }] = await Promise.all([
       fetchHistory(),
       buildContextBlock(supabase, userId, timezone, typeof message === 'string' ? message : null),
+      supabase.from('live_session_state').select('state, updated_at').eq('user_id', userId).maybeSingle(),
+      supabase.from('profile').select('unit_prefs').eq('user_id', userId).maybeSingle(),
     ]);
 
     // Clock skew between Supabase edge nodes can reject a valid service-role token ("JWT issued at
@@ -103,7 +123,17 @@ Deno.serve(async (req) => {
       }
     }
 
-    const priorMessages = replayHistory((history ?? []).reverse());
+    const sessionStartedAt =
+      liveRow && Date.now() - new Date(liveRow.updated_at).getTime() < LIVE_STATE_MAX_AGE_MS
+        ? (liveRow.state as any)?.startedAt
+        : null;
+    const scopedHistory =
+      cueName === SESSION_START_CUE
+        ? []
+        : liveStrengthSession && typeof sessionStartedAt === 'string'
+          ? (history ?? []).filter((m: any) => !m.at || m.at >= sessionStartedAt)
+          : (history ?? []);
+    const priorMessages = replayHistory(scopedHistory.slice().reverse());
 
     const userContent = hasAttachment
       ? [
@@ -113,10 +143,14 @@ Deno.serve(async (req) => {
       : message;
     const messages = [...priorMessages, { role: 'user', content: userContent }];
 
-    const fullContextBlock =
-      typeof liveSessionState === 'string' && liveSessionState.length > 0
-        ? `${contextBlock}\n\n${liveSessionState}`
-        : contextBlock;
+    const typedSetNote = liveStrengthSession && cueName === null ? describeTypedTurnSetOutcome(restActive) : null;
+    const turnUnits = unitsRow?.unit_prefs === 'imperial' ? 'imperial' : 'metric';
+    const liveSnapshot = typeof sessionStartedAt === 'string' ? buildLiveSessionSnapshot(liveRow!.state) : null;
+    const resumeNote = cueName === SESSION_START_CUE ? describeResumedStart(liveSnapshot, turnUnits) : null;
+    const cueFacts = describeCueFacts(cueName, liveSnapshot, turnUnits);
+    const fullContextBlock = [contextBlock, liveBlockText || null, typedSetNote, resumeNote, cueFacts]
+      .filter(Boolean)
+      .join('\n\n');
     const systemPrompt = buildSystemPrompt((history ?? []).length > 0, fullContextBlock, 'text', isDailyGreeting);
 
     const { error: askedLogError } = await supabase.from('message').insert({
@@ -126,13 +160,29 @@ Deno.serve(async (req) => {
       modality,
       hidden,
       attachment_url: hasAttachment ? (attachmentPath ?? attachmentUrl) : null,
+      greeting_key: isDailyGreeting ? (greetingKey ?? 'greeting') : null,
       at: askedAt.toISOString(),
     });
     if (askedLogError) console.error('[brain] failed to log the user turn:', askedLogError.message);
 
     const result = await runBrainTurn({ systemPrompt, messages, handlers, callModel });
 
-    const turnBlocks = result.messages.slice(messages.length);
+    const guarded = guardClaims(result.reply, {
+      liveSession: liveStrengthSession,
+      setLoggedThisTurn: (cueName !== null && SET_CONFIRMING_CUES.has(cueName)) || tracked.outcomes.setLogged,
+      restActive,
+      actionSucceededThisTurn: tracked.outcomes.actionSucceeded,
+    });
+    if (guarded.dropped.length > 0) console.warn('[brain] dropped unbacked claims:', guarded.dropped.join(' | '));
+    const guardedReply =
+      guarded.dropped.length === 0
+        ? result.reply
+        : guarded.text || claimFallback(liveStrengthSession, cueName === null && looksLikeFinishedSetReport(messageText));
+
+    const turnBlocks =
+      guarded.dropped.length === 0
+        ? result.messages.slice(messages.length)
+        : withGuardedFinalText(result.messages.slice(messages.length), guardedReply);
 
     const repliedAt = new Date(Math.max(Date.now(), askedAt.getTime() + 1));
 
@@ -153,14 +203,14 @@ Deno.serve(async (req) => {
     );
     const updatedDisplayName = profileUpdateCall?.result.display_name ?? null;
 
-    const reply = scrubInternalLanguage(dropSelfCorrection(dropLeadingConcession(stripSystemNote(result.reply))));
+    const reply = scrubInternalLanguage(dropSelfCorrection(dropLeadingConcession(stripSystemNote(guardedReply))));
 
     const { error: logError } = await supabase.from('message').insert({
       user_id: userId,
       role: 'assistant',
       content: reply,
       modality: 'text',
-      hidden: hideReply,
+      hidden: hideReply ?? (hidden && cueName === null),
       blocks: turnBlocks.length > 0 ? turnBlocks : null,
       card,
       greeting_key: isDailyGreeting ? greetingKey : null,

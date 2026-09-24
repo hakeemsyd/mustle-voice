@@ -36,6 +36,8 @@ const READ_IDENTIFIERS = [
   'HKQuantityTypeIdentifierStepCount',
   'HKQuantityTypeIdentifierActiveEnergyBurned',
   'HKQuantityTypeIdentifierHeartRate',
+  'HKQuantityTypeIdentifierRestingHeartRate',
+  'HKQuantityTypeIdentifierBodyTemperature',
   'HKCategoryTypeIdentifierSleepAnalysis',
   'HKWorkoutTypeIdentifier',
 ] as const;
@@ -139,6 +141,29 @@ const readLatestHeartRateBpm = async (): Promise<number | null> => {
   }
 };
 
+export const readRestingHeartRateBpm = async (): Promise<number | null> => {
+  try {
+    const sample = await getMostRecentQuantitySample('HKQuantityTypeIdentifierRestingHeartRate');
+    return sample ? Math.round(sample.quantity) : null;
+  } catch (err) {
+    console.error('[appleHealth] resting heart rate read failed:', err);
+    return null;
+  }
+};
+
+const toCelsius = (quantity: number, unit: string): number =>
+  unit.toLowerCase().startsWith('degf') ? ((quantity - 32) * 5) / 9 : quantity;
+
+export const readBodyTemperatureC = async (): Promise<number | null> => {
+  try {
+    const sample = await getMostRecentQuantitySample('HKQuantityTypeIdentifierBodyTemperature');
+    return sample ? Math.round(toCelsius(sample.quantity, sample.unit) * 10) / 10 : null;
+  } catch (err) {
+    console.error('[appleHealth] body temperature read failed:', err);
+    return null;
+  }
+};
+
 const readTodayQuantityTotal = async (
   identifier: 'HKQuantityTypeIdentifierStepCount' | 'HKQuantityTypeIdentifierActiveEnergyBurned',
 ): Promise<number | null> => {
@@ -155,6 +180,56 @@ const readTodayQuantityTotal = async (
     return samples.quantity;
   } catch (err) {
     console.error(`[appleHealth] ${identifier} read failed:`, err);
+    return null;
+  }
+};
+
+export interface SleepStageBreakdown {
+  deepMinutes: number;
+  remMinutes: number;
+  lightMinutes: number;
+  awakeMinutes: number;
+  inBedMinutes: number | null;
+  efficiencyPct: number | null;
+}
+
+const sleepStageWindow = (dateKey: string): { start: Date; end: Date } => {
+  const [year, month, day] = dateKey.split('-').map(Number);
+  return {
+    start: new Date(year, month - 1, day - 1, 18, 0, 0, 0),
+    end: new Date(year, month - 1, day, 12, 0, 0, 0),
+  };
+};
+
+export const readSleepStagesForNight = async (dateKey: string): Promise<SleepStageBreakdown | null> => {
+  try {
+    const { start, end } = sleepStageWindow(dateKey);
+    const samples = await queryCategorySamples('HKCategoryTypeIdentifierSleepAnalysis', {
+      filter: { date: { startDate: start, endDate: end } },
+      limit: 100,
+    });
+    if (!samples || samples.length === 0) return null;
+
+    const minutesOf = (value: number): number =>
+      samples
+        .filter((s) => s.value === value)
+        .reduce((total, s) => total + (new Date(s.endDate).getTime() - new Date(s.startDate).getTime()) / 60_000, 0);
+
+    const deepMinutes = Math.round(minutesOf(4));
+    const remMinutes = Math.round(minutesOf(5));
+    const lightMinutes = Math.round(minutesOf(3) + minutesOf(1));
+    const awakeMinutes = Math.round(minutesOf(2));
+    const hasInBedSamples = samples.some((s) => s.value === 0);
+    const inBedMinutes = hasInBedSamples ? Math.round(minutesOf(0)) : null;
+    const totalAsleep = deepMinutes + remMinutes + lightMinutes;
+    const efficiencyPct =
+      inBedMinutes && inBedMinutes > 0 ? Math.round((totalAsleep / inBedMinutes) * 100) : null;
+
+    if (totalAsleep === 0 && awakeMinutes === 0) return null;
+
+    return { deepMinutes, remMinutes, lightMinutes, awakeMinutes, inBedMinutes, efficiencyPct };
+  } catch (err) {
+    console.error('[appleHealth] sleep stage read failed:', err);
     return null;
   }
 };

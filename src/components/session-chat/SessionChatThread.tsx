@@ -1,11 +1,22 @@
 import React, { useEffect, useRef } from "react";
-import { Image, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import {
+  Image,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { colors, fonts } from "../../constants/theme";
 import { MMark } from "../../icons/MMark";
 import { ArrowRightIcon } from "../../icons/ArrowRightIcon";
 import { CoachMessageText } from "../CoachMessageText";
 import { useKeyboardOpen } from "../../hooks/useKeyboardOpen";
+
+const BOTTOM_PIN_THRESHOLD = 48;
 
 export interface SessionChatMessage {
   id: string;
@@ -35,11 +46,20 @@ export function SessionChatThread({ messages, typing = false, footer }: SessionC
   const hasFooter = footer != null;
 
   const keyboardOpen = useKeyboardOpen();
+  const pinnedToBottomRef = useRef(true);
+  const lastRole = messages[messages.length - 1]?.role;
 
   useEffect(() => {
+    if (lastRole === "user" || keyboardOpen) pinnedToBottomRef.current = true;
+    if (!pinnedToBottomRef.current) return;
     const timer = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 80);
     return () => clearTimeout(timer);
-  }, [messages.length, typing, hasFooter, keyboardOpen]);
+  }, [messages.length, lastRole, typing, hasFooter, keyboardOpen]);
+
+  const handleScroll = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+    pinnedToBottomRef.current = contentSize.height - contentOffset.y - layoutMeasurement.height <= BOTTOM_PIN_THRESHOLD;
+  };
 
   return (
     <View style={styles.stage}>
@@ -49,6 +69,8 @@ export function SessionChatThread({ messages, typing = false, footer }: SessionC
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="on-drag"
         showsVerticalScrollIndicator={false}
+        onScroll={handleScroll}
+        scrollEventThrottle={64}
       >
         {messages.map((m) =>
           m.role === "user" ? (

@@ -6,6 +6,14 @@ import { describeActiveInjuries, describeUnloggedPainReport } from './injury-con
 import { describeTodaysFoodLog } from './food-log-context.ts';
 import { describeImportedWorkout } from './rep-target.ts';
 import { describeConsultationStatus } from './consultation-context.ts';
+import {
+  addDaysToKey,
+  describeTrainingDays,
+  projectSchedule,
+  resolveTrainingDays,
+  weekdayLabel,
+  type ScheduleDay,
+} from './training-schedule.ts';
 
 interface PlanSessionRow {
   id: string;
@@ -144,6 +152,7 @@ export function resolveTodaySession(
   restDayDates: Set<string> = new Set(),
   dayOverride: PlanSessionRow | null = null,
   planStartDate: string | null = null,
+  trainingDays: number[] | null = null,
 ): PlanSessionRow | null {
   // Checked before everything else, including the rest-day short-circuit: an override is the user
   // explicitly asking for this session today, so it outranks both a rest day and the rotation.
@@ -158,6 +167,7 @@ export function resolveTodaySession(
 
   const flexible = sessions.every((s) => s.weekday === null || s.weekday === undefined);
   if (!flexible) return null;
+  if (trainingDays && trainingDays.length > 0 && !trainingDays.includes(now.getDay())) return null;
 
   const completedToday = logs.some((log) => !isPartial(log) && sameLocalDay(new Date(log.at), now));
   if (completedToday) return null;
@@ -201,7 +211,7 @@ const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', '
 // week look like" question that just repeated the focus names with no real per-day structure.
 // This gives every turn the real week/rotation as plain ground truth, independent of whether any
 // tool gets called.
-function describeWeeklyPlan(sessions: PlanSessionRow[]): string {
+function describeWeeklyPlan(sessions: PlanSessionRow[], trainingDays: number[]): string {
   const pinned = sessions.some((s) => s.weekday !== null && s.weekday !== undefined);
   if (pinned) {
     const byWeekday = new Map(sessions.map((s) => [s.weekday, s]));
@@ -214,9 +224,29 @@ function describeWeeklyPlan(sessions: PlanSessionRow[]): string {
 
   const rotation = sessions.slice().sort((a, b) => a.day_order - b.day_order);
   return (
-    `Training rotation (repeats in this order, NOT tied to specific weekdays — which real ` +
-    `calendar day each falls on depends on when the last one was actually done): ` +
-    `${rotation.map((s) => humanizeFocus(s.focus)).join(' → ')}, then repeats.`
+    `Training rotation (runs in this order on their training days, NOT fixed to weekdays; a missed ` +
+    `day keeps its session next): ${rotation.map((s) => humanizeFocus(s.focus)).join(' → ')}, then ` +
+    `repeats. ${describeTrainingDays(trainingDays)}`
+  );
+}
+
+function describeUpcomingSchedule(days: ScheduleDay<PlanSessionRow>[], todayKey: string): string {
+  const parts = days.map((d) => {
+    const label = `${d.dateKey === todayKey ? 'Today, ' : ''}${weekdayLabel(d.weekday)} ${d.dateKey}`;
+    const focus = d.session ? humanizeFocus(d.session.focus) : 'Workout';
+    if (d.status === 'completed') return `${label}: ${focus} (done)`;
+    if (d.status === 'partial') return `${label}: ${focus} (started, not finished)`;
+    if (d.kind === 'not_started') return `${label}: before the plan starts`;
+    if (d.kind === 'chosen_rest') return `${label}: rest (they chose to skip it)`;
+    if (!d.session) return `${label}: rest day`;
+    return `${label}: ${focus}${d.kind === 'custom' ? ' (one-off session for today)' : ''}`;
+  });
+  return (
+    `The schedule exactly as Home and the Calendar show it for the next 7 days: ${parts.join('; ')}. ` +
+    'When they ask what is on a day or what their week looks like, read it from this list. Never work ' +
+    'out which session falls on which weekday yourself and never promise a session a fixed weekday: ' +
+    'sessions run in order on the training days, and a missed day keeps its session next, which moves ' +
+    'everything after it along by one training day.'
   );
 }
 
@@ -277,7 +307,7 @@ export async function buildContextBlock(
     supabase.from('profile').select('timezone, unit_prefs, display_name').eq('user_id', userId).maybeSingle(),
     supabase
       .from('training_plan')
-      .select('starts_on, plan_session(id, day_order, weekday, focus, plan_exercise(ord, exercise(name)))')
+      .select('created_at, starts_on, days_per_week, training_days, plan_session(id, day_order, weekday, focus, plan_exercise(ord, exercise(name)))')
       .eq('user_id', userId)
       .eq('status', 'active')
       .maybeSingle(),
@@ -384,14 +414,43 @@ export async function buildContextBlock(
   const logs: WorkoutLogRow[] = logsInTimezone(recentLogs ?? [], timezone);
   const planStartDate: string | null = activePlan?.starts_on ?? null;
   const notYetStarted = !!planStartDate && todayKey < planStartDate;
+  const trainingDays = resolveTrainingDays(activePlan, sessions);
 
-  const weeklyPlanLine = sessions.length > 0 ? describeWeeklyPlan(sessions) : null;
+  const weeklyPlanLine = sessions.length > 0 ? describeWeeklyPlan(sessions, trainingDays) : null;
+
+  const today =
+    sessions.length === 0 && !dayOverride
+      ? null
+      : resolveTodaySession(sessions, logs, now, restDayDates, dayOverride, planStartDate, trainingDays);
+
+  const planCreatedKey = activePlan?.created_at
+    ? toTimezone(new Date(activePlan.created_at), timezone).toISOString().slice(0, 10)
+    : null;
+  const activeFromKey = [planCreatedKey, planStartDate].filter((k): k is string => !!k).sort().pop() ?? null;
+  const scheduleLine =
+    sessions.length > 0
+      ? describeUpcomingSchedule(
+          projectSchedule({
+            sessions,
+            trainingDays,
+            logs: logs.map((log) => ({ ...log, dateKey: log.at.slice(0, 10) })),
+            restDayDates,
+            activeFromKey,
+            todayKey,
+            todayDue: today,
+            todayOverride: dayOverride,
+            fromKey: todayKey,
+            toKey: addDaysToKey(todayKey, 6),
+            extraSessions: dayOverride ? [dayOverride] : [],
+          }),
+          todayKey,
+        )
+      : null;
 
   let planLine: string;
   if (sessions.length === 0 && !dayOverride) {
     planLine = 'No active training plan yet.';
   } else {
-    const today = resolveTodaySession(sessions, logs, now, restDayDates, dayOverride, planStartDate);
     if (!today) {
       planLine = notYetStarted
         ? `A plan is set up and confirmed but hasn't started yet — it begins ${planStartDate}. Today is ` +
@@ -399,7 +458,8 @@ export async function buildContextBlock(
           `otherwise it begins on its own on that date.`
         : restDayDates.has(todayKey)
           ? 'Today is a rest day — the user chose to skip it.'
-          : 'Today is a rest day — no scheduled session.';
+          : 'Today is a rest day in their plan — no session is due. If they clearly want to train anyway, ' +
+            'start_todays_workout with train_on_rest_day:true runs their next session today.';
     } else if (dayOverride) {
       // Spelled out as a one-off so the model doesn't start describing it as part of the program
       // and contradict the weekly schedule line sitting right next to it.
@@ -502,6 +562,7 @@ export async function buildContextBlock(
     `- ${nameLine}\n- ${dateLine}\n- ${upcomingLine}\n- ${unitsLine}\n- ${planLine}\n` +
     (startDateLine ? `- ${startDateLine}\n` : '') +
     (weeklyPlanLine ? `- ${weeklyPlanLine}\n` : '') +
+    (scheduleLine ? `- ${scheduleLine}\n` : '') +
     (consultationLine ? `- ${consultationLine}\n` : '') +
     (interruptedLine ? `- ${interruptedLine}\n` : '') +
     `- ${historyLine}` +

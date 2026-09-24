@@ -157,6 +157,7 @@ export function FuelScreen() {
     Math.round(caloriesGoal - caloriesCurrent),
   );
   const caloriesOver = Math.max(0, Math.round(caloriesCurrent - caloriesGoal));
+  const caloriesAreOver = caloriesGoal > 0 && caloriesCurrent > caloriesGoal;
   const overLimit =
     !!macros && macros.some((m) => m.goal > 0 && m.current > m.goal);
   // The ring now tracks whichever day is being browsed (see useFuelData), not always literally
@@ -197,18 +198,18 @@ export function FuelScreen() {
                   size={172}
                   strokeWidth={10}
                   progress={ringProgress}
-                  color={overLimit ? colors.danger : colors.accent}
+                  color={caloriesAreOver ? colors.danger : colors.accent}
                 >
                   <Text
                     style={[
                       styles.ringValue,
-                      overLimit && styles.ringValueAlert,
+                      caloriesAreOver && styles.ringValueAlert,
                     ]}
                   >
-                    {overLimit ? `+${caloriesOver}` : caloriesRemaining}
+                    {caloriesAreOver ? `+${caloriesOver}` : caloriesRemaining}
                   </Text>
                   <Text style={styles.ringLabel}>
-                    {overLimit ? "CAL OVER" : "CAL LEFT"}
+                    {caloriesAreOver ? "CAL OVER" : "CAL LEFT"}
                   </Text>
                 </ProgressRing>
               </View>
@@ -224,24 +225,26 @@ export function FuelScreen() {
                   { label: "Protein", macro: proteinMacro },
                   { label: "Carbs", macro: carbsMacro },
                   { label: "Fat", macro: fatMacro },
-                ].map(({ label, macro }) => (
-                  <View key={label} style={styles.statChip}>
-                    <View
-                      style={[
-                        styles.statDot,
-                        { backgroundColor: macro?.color ?? colors.muted },
-                      ]}
-                    />
-                    <Text style={styles.statValue}>
-                      {Math.max(
-                        0,
-                        Math.round((macro?.goal ?? 0) - (macro?.current ?? 0)),
-                      )}
-                      {macro?.unit ?? "g"}
-                    </Text>
-                    <Text style={styles.statLabel}>{label}</Text>
-                  </View>
-                ))}
+                ].map(({ label, macro }) => {
+                  const goal = macro?.goal ?? 0;
+                  const current = macro?.current ?? 0;
+                  const over = goal > 0 && current > goal;
+                  return (
+                    <View key={label} style={styles.statChip}>
+                      <View
+                        style={[
+                          styles.statDot,
+                          { backgroundColor: macro?.color ?? colors.muted },
+                        ]}
+                      />
+                      <Text style={[styles.statValue, over && styles.ringValueAlert]}>
+                        {over ? `+${Math.round(current - goal)}` : Math.max(0, Math.round(goal - current))}
+                        {macro?.unit ?? "g"}
+                      </Text>
+                      <Text style={styles.statLabel}>{over ? `${label} over` : label}</Text>
+                    </View>
+                  );
+                })}
               </View>
             </View>
           )}

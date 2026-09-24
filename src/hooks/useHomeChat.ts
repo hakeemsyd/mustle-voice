@@ -80,7 +80,7 @@ export function useHomeChat(userId: string | null) {
         .eq('hidden', false)
         .gte('at', startOfDay.toISOString())
         .order('at', { ascending: false })
-        .limit(50);
+        .limit(200);
       if (cancelled) return;
       if (error) {
         console.error('[useHomeChat] failed to load history:', error.message);
@@ -129,11 +129,15 @@ export function useHomeChat(userId: string | null) {
   }, []);
 
   const latestRequestRef = useRef(0);
+  const inFlightTextsRef = useRef(new Set<string>());
 
   const sendMessage = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
       if (!trimmed || !userId) return;
+      const inFlightKey = trimmed.toLowerCase();
+      if (inFlightTextsRef.current.has(inFlightKey)) return;
+      inFlightTextsRef.current.add(inFlightKey);
 
       const requestId = ++latestRequestRef.current;
       setTranscript((prev) => [
@@ -157,6 +161,7 @@ export function useHomeChat(userId: string | null) {
           { id: `local-${Date.now()}-e`, role: 'assistant', text: COACH_UNREACHABLE_MESSAGE, at: new Date().toISOString() },
         ]);
       } finally {
+        inFlightTextsRef.current.delete(inFlightKey);
         if (latestRequestRef.current === requestId) setCoachTyping(false);
       }
     },
@@ -186,7 +191,7 @@ export function useHomeChat(userId: string | null) {
         .eq('hidden', false)
         .lte('at', target.at)
         .order('at', { ascending: false })
-        .limit(50);
+        .limit(200);
       if (error || !data) {
         console.error('[useHomeChat] failed to load message context:', error?.message);
         return false;

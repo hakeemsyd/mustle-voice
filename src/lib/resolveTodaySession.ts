@@ -100,6 +100,7 @@ export function resolveTodaySession<T extends PlanSessionRow>(
   restDayDates: Set<string> = new Set(),
   dayOverride: T | null = null,
   planStartDate: string | null = null,
+  trainingDays: number[] | null = null,
 ): T | null {
   // A one-off session the user asked the coach for (see write_custom_session) outranks everything
   // — the rotation, the weekday pinning, and a rest day. Checked first for that reason, and
@@ -116,6 +117,7 @@ export function resolveTodaySession<T extends PlanSessionRow>(
   // weekday, a day with no match is a real rest day and must stay one.
   const flexible = sessions.every((s) => s.weekday === null || s.weekday === undefined);
   if (!flexible) return null;
+  if (trainingDays && trainingDays.length > 0 && !trainingDays.includes(now.getDay())) return null;
 
   const completedToday = logs.some((log) => !isPartial(log) && sameLocalDay(new Date(log.at), now));
   if (completedToday) return null;

@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import type { SessionExercise } from '../session/ActiveSessionContext';
+import { normalizeLoadScheme } from '../../supabase/functions/_shared/load-intent';
+import type { ResumePlanEntry } from '../session/resumeSession';
 
 interface LoggedExercise {
   name: string;
@@ -19,7 +21,14 @@ export interface SessionPreview {
    *  resumes from (see ActiveSessionContext.start's resumeExercisesDone param), and `id` is what
    *  Restart Instead deletes — choosing to restart is an explicit "discard this attempt", so the
    *  partial row it was offered from must not survive as accepted history once declined. */
-  lastTime: { id: string; at: string; status: 'completed' | 'partial'; exercises: LoggedExercise[] } | null;
+  lastTime: {
+    id: string;
+    at: string;
+    status: 'completed' | 'partial';
+    exercises: LoggedExercise[];
+    sessionPlan: ResumePlanEntry[] | null;
+    durationSec: number | null;
+  } | null;
 }
 
 interface PlanExerciseRow {
@@ -68,7 +77,7 @@ export function useSessionPreview(planSessionId: string): SessionPreview {
           .maybeSingle(),
         supabase
           .from('workout_log')
-          .select('id, at, status, exercises_done')
+          .select('id, at, status, exercises_done, vs_planned, duration_sec')
           .eq('user_id', userId)
           .eq('plan_session_id', planSessionId)
           .order('at', { ascending: false })
@@ -98,6 +107,10 @@ export function useSessionPreview(planSessionId: string): SessionPreview {
             at: lastRow.at as string,
             status: (lastRow.status ?? 'completed') as 'completed' | 'partial',
             exercises: (lastRow.exercises_done ?? []) as LoggedExercise[],
+            sessionPlan: Array.isArray(lastRow.vs_planned?.exercises)
+              ? (lastRow.vs_planned.exercises as ResumePlanEntry[])
+              : null,
+            durationSec: typeof lastRow.duration_sec === 'number' ? lastRow.duration_sec : null,
           }
         : null;
 
@@ -111,7 +124,7 @@ export function useSessionPreview(planSessionId: string): SessionPreview {
           name: exerciseName(row),
           sets: row.sets,
           repScheme: row.rep_scheme,
-          loadScheme: row.load_scheme,
+          loadScheme: normalizeLoadScheme(row.load_scheme),
         })),
         lastTime,
       });

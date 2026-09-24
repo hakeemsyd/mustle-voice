@@ -11,6 +11,7 @@ import {
   useMonthCalendar,
   useDayDetail,
   startOfWeek,
+  type DayDetailWorkout,
 } from "../hooks/useCalendarData";
 import { addDays, formatWeekRange, localDateKey, startOfLocalDay } from "../lib/calendarDate";
 import { useScreenInsets } from "../hooks/useScreenInsets";
@@ -41,9 +42,33 @@ import {
 } from "../icons";
 import type { RootStackParamList } from "../navigation/types";
 import { titleCase } from "../lib/textFormat";
+import { isUnfinishedWorkout } from "../lib/resolveTodaySession";
 
 type Scope = "today" | "week" | "month";
 type Props = NativeStackScreenProps<RootStackParamList, "Calendar">;
+
+const loggedReps = (reps: unknown, sets: number): number => {
+  const text = String(reps ?? "");
+  if (/[a-z]/i.test(text)) return 0;
+  const numbers = (text.match(/\d+/g) ?? []).map(Number);
+  if (numbers.length === 1 && sets > 1) return numbers[0] * sets;
+  return numbers.reduce((sum, n) => sum + n, 0);
+};
+
+const workoutSummaryLine = (workout: DayDetailWorkout): string => {
+  const names = workout.exercisesDone.map((ex) => ex.name).filter(Boolean);
+  return names.length > 0 ? names.join(", ") : titleCase(workout.sessionType);
+};
+
+const workoutVolumeLine = (workout: DayDetailWorkout): string => {
+  const sets = workout.exercisesDone.reduce((sum, ex) => sum + (Number(ex.sets) || 0), 0);
+  const reps = workout.exercisesDone.reduce((sum, ex) => sum + loggedReps(ex.reps, Number(ex.sets) || 0), 0);
+  const parts: string[] = [];
+  if (sets > 0) parts.push(`${sets} ${sets === 1 ? "set" : "sets"}`);
+  if (reps > 0) parts.push(`${reps} reps`);
+  if (workout.durationSec) parts.push(`${Math.max(1, Math.round(workout.durationSec / 60))} min`);
+  return parts.join(" · ");
+};
 
 export const CalendarScreen = ({ route, navigation }: Props) => {
   const insets = useScreenInsets();
@@ -483,10 +508,29 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
               const dateObj = startOfLocalDay(detailDate);
               const loggedWorkout = detail.workouts[0] ?? null;
               const doneFocus = loggedWorkout?.focus ?? null;
-              const plannedValue = doneFocus ? titleCase(doneFocus) : detail.plannedFocus ? titleCase(detail.plannedFocus) : "No session scheduled";
-              const hasPlan = !!doneFocus || !!detail.plannedFocus;
-              const showStatusBadge = detail.isPast && hasPlan;
+              const isRestDay =
+                !loggedWorkout &&
+                !detail.plannedFocus &&
+                (detail.dayKind === "rest" || detail.dayKind === "chosen_rest");
+              const plannedValue = doneFocus
+                ? titleCase(doneFocus)
+                : detail.plannedFocus
+                  ? titleCase(detail.plannedFocus)
+                  : isRestDay
+                    ? detail.dayKind === "chosen_rest"
+                      ? "Rest day (you chose to skip)"
+                      : "Rest day"
+                    : "No session scheduled";
+              const hasPlan = !!doneFocus || !!detail.plannedFocus || isRestDay;
+              const showStatusBadge = detail.isPast && hasPlan && !isRestDay;
+              const planned = detail.plannedSummary;
+              const workoutPlanLine = isRestDay
+                ? "Focus on recovery: sleep, hydration and light mobility work."
+                : planned
+                  ? `${planned.exercises} ${planned.exercises === 1 ? "exercise" : "exercises"} · ${planned.sets} sets · ${titleCase(planned.sessionType)}`
+                  : null;
               const isDone = !!loggedWorkout;
+              const endedEarly = !!loggedWorkout && isUnfinishedWorkout(loggedWorkout.status);
 
               return (
                 <>
@@ -517,31 +561,40 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                             <CircleIcon size={11} color={colors.muted} />
                           )}
                           <Text style={[styles.statusBadgeText, isDone && styles.statusBadgeTextDone]}>
-                            {isDone ? "Completed" : "Not logged"}
+                            {isDone ? (endedEarly ? "Partially completed" : "Completed") : "Not logged"}
                           </Text>
                         </View>
                       )}
                     </View>
                   )}
 
-                  {detail.isToday && !isDone && detail.plannedFocus && (
-                    <View style={styles.todayActions}>
-                      <Pressable
-                        style={styles.startBtn}
-                        onPress={() => {
-                          if (!detail.plannedSessionId) return;
-                          session.start({ type: "strength", planSessionId: detail.plannedSessionId });
-                          setDetailDate(null);
-                          navigation.navigate("ActiveSession");
-                        }}
-                      >
-                        <PlayIcon size={13} color={colors.accentOn} />
-                        <Text style={styles.startBtnText}>Start Session</Text>
-                      </Pressable>
-                      <Pressable style={styles.switchWorkoutBtn} onPress={() => setSwitchOpen(true)}>
-                        <SwitchIcon size={13} color={colors.muted} />
-                        <Text style={styles.switchWorkoutBtnText}>Switch Workout</Text>
-                      </Pressable>
+                  {hasPlan && workoutPlanLine && (
+                    <View style={styles.planSection}>
+                      <View style={styles.factSectionHeader}>
+                        <DumbbellIcon size={13} color={colors.accent} />
+                        <Text style={styles.factSectionLabel}>Workout</Text>
+                      </View>
+                      <Text style={styles.planSub}>{workoutPlanLine}</Text>
+                      {detail.isToday && !isDone && detail.plannedFocus && (
+                        <View style={styles.todayActions}>
+                          <Pressable
+                            style={styles.startBtn}
+                            onPress={() => {
+                              if (!detail.plannedSessionId) return;
+                              session.start({ type: "strength", planSessionId: detail.plannedSessionId });
+                              setDetailDate(null);
+                              navigation.navigate("ActiveSession");
+                            }}
+                          >
+                            <PlayIcon size={13} color={colors.accentOn} />
+                            <Text style={styles.startBtnText}>Start Session</Text>
+                          </Pressable>
+                          <Pressable style={styles.switchWorkoutBtn} onPress={() => setSwitchOpen(true)}>
+                            <SwitchIcon size={13} color={colors.muted} />
+                            <Text style={styles.switchWorkoutBtnText}>Switch Workout</Text>
+                          </Pressable>
+                        </View>
+                      )}
                     </View>
                   )}
 
@@ -642,7 +695,7 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                             <Text style={styles.factSectionLabel}>Workout summary</Text>
                             <View style={styles.factLink}>
                               <Text style={styles.factLinkText}>View report</Text>
-                              <ChevronRightIcon size={12} color={colors.muted} />
+                              <ChevronRightIcon size={12} color={colors.accent} />
                             </View>
                           </View>
                           <Text style={styles.sourceLabel}>
@@ -652,11 +705,8 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                                 ? "Completed Independently"
                                 : "Logged with MUSTLE"}
                           </Text>
-                          {loggedWorkout.exercisesDone.map((ex, j) => (
-                            <Text key={j} style={styles.detailLine}>
-                              {ex.name} — {ex.sets}×{ex.reps} @ {ex.load}
-                            </Text>
-                          ))}
+                          <Text style={styles.detailLine}>{workoutSummaryLine(loggedWorkout)}</Text>
+                          <Text style={styles.factSub}>{workoutVolumeLine(loggedWorkout)}</Text>
                         </Pressable>
                       )}
                     </View>
@@ -1081,7 +1131,10 @@ const styles = StyleSheet.create({
     color: colors.muted,
   },
   factLink: { flexDirection: "row", alignItems: "center", gap: 3 },
-  factLinkText: { fontFamily: fonts.bodyMedium, fontSize: 11, color: colors.muted },
+  factLinkText: { fontFamily: fonts.bodySemiBold, fontSize: 11, color: colors.accent },
+  factSub: { fontFamily: fonts.body, fontSize: 11.5, color: colors.muted },
+  planSection: { gap: 8 },
+  planSub: { fontFamily: fonts.body, fontSize: 13, lineHeight: 19.5, color: colors.muted },
   detailEmpty: {
     alignItems: "center",
     gap: 8,

@@ -53,6 +53,9 @@ export function AppActionBridge({ userId }: AppActionBridgeProps) {
           (action.payload?.reason as string | null) ?? null,
         );
         break;
+      case 'discard_workout':
+        void session.discardSession().then(() => navigateFromAppAction('Home'));
+        break;
       case 'start_workout': {
         const planSessionId = String(action.payload?.plan_session_id ?? '');
         if (planSessionId) {
@@ -70,6 +73,7 @@ export function AppActionBridge({ userId }: AppActionBridgeProps) {
           session.swapQueuedExercise(match.id, {
             id: String(action.payload?.to_exercise_id ?? ''),
             name: String(action.payload?.to_name ?? ''),
+            loadScheme: typeof action.payload?.load_scheme === 'string' ? action.payload.load_scheme : null,
           });
         }
         break;

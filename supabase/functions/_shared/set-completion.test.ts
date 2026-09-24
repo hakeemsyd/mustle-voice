@@ -78,3 +78,14 @@ test('no history and no signal means no log', async () => {
   assert.equal(await userClaimedSetFinished(stubSupabase([]), 'u1', '8 reps'), false);
   assert.equal(await userClaimedSetFinished(stubSupabase([]), 'u1', null), false);
 });
+
+test("Damion's planned rep count is never loggable, even right after a real 'done'", async () => {
+  const history = [{ content: 'Set one done, 10 reps.' }];
+  assert.equal(await userClaimedSetFinished(stubSupabase(history), 'u1', "I'll do about 10 reps"), false);
+  assert.equal(await userClaimedSetFinished(stubSupabase([]), 'u1', "I'll do about 10 reps"), false);
+});
+
+test('a finished set said without the word done passes the gate', async () => {
+  assert.equal(await userClaimedSetFinished(stubSupabase([]), 'u1', 'I just did 10 push-ups.'), true);
+  assert.equal(await userClaimedSetFinished(stubSupabase([]), 'u1', 'I just told you, I just did ten.'), true);
+});

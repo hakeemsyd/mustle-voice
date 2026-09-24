@@ -158,6 +158,56 @@ test("Damion's exact transcript produces no phantom set", () => {
   expectIgnore('Six.');
 });
 
+test("Damion's 2026-09-24 report: a finished set said without the word reps logs", () => {
+  expectLog('All right. I said I just did 10 push-ups.', { weight: null, reps: 10 });
+  expectLog('I just told you, I just did ten.', { weight: null, reps: 10 });
+  expectLog('I just did 10.', { weight: null, reps: 10 });
+  expectLog('Got 8.', { weight: null, reps: 8 });
+  expectLog('Did 12 on that one.', { weight: null, reps: 12 });
+  expectLog('Done, 12.', { weight: null, reps: 12 });
+  expectLog('Set 2 done, 8.', { weight: null, reps: 8 });
+  expectLog('10 push-ups done.', { weight: null, reps: 10 });
+  expectLog('I did 10 with the 75s.', { weight: 34, reps: 10 });
+  expectLog('Finished 8 at 75 pounds.', { weight: 34, reps: 8 });
+});
+
+test("Damion's 2026-09-24 report: a planned rep count never logs", () => {
+  expectIgnore("I'll do about 10 reps.");
+  expectIgnore("I'll do about 10.");
+  expectIgnore('I want to do 10 reps.');
+  expectIgnore('Should I do 10 reps?');
+  expectIgnore('Going to go for 10.');
+});
+
+test('loose report phrasing that is not a finished set stays with the coach', () => {
+  expectIgnore("I didn't get 10.");
+  expectIgnore('I did 10 last time.');
+  expectIgnore('Yesterday I got 8.');
+  expectIgnore('Did I do 10?');
+  expectIgnore('I did 3 sets.');
+  expectIgnore('I got 2 more in me.');
+  expectIgnore('I did 8, then 2 partials.');
+  expectIgnore('I got 1.');
+  expectNeedsDetails('Finished that one.');
+  expectNeedsDetails('Done with this one.');
+});
+
+test('loose reps never land on a timed exercise', () => {
+  const onTimedExercise = { ...idle, timedExercise: true };
+  expectNeedsDetails('Done, 45.', onTimedExercise);
+  expectIgnore('I did 10.', onTimedExercise);
+});
+
+test('typed input logs a plain count but never a plan or a question', () => {
+  const typed = { ...idle, typed: true };
+  expectLog('8 reps', { weight: null, reps: 8 }, typed);
+  expectLog('60 8', { weight: 60, reps: 8 }, typed, 'metric');
+  expectLog('75 lb 8', { weight: 34, reps: 8 }, typed);
+  expectIgnore("I'll do about 10 reps", typed);
+  expectIgnore('How about 10 reps?', typed);
+  expectStatedWeight('75 pounds', 34, typed);
+});
+
 test('a spoken cardio duration logs on a timed exercise and is ignored off one', () => {
   assert.deepEqual(
     classifySpokenSet('done, 25 minutes', 'metric', { awaitingDetails: false, timedExercise: true }),
@@ -167,4 +217,13 @@ test('a spoken cardio duration logs on a timed exercise and is ignored off one',
     classifySpokenSet('give me 2 minutes', 'metric', { awaitingDetails: false }).kind,
     'ignore',
   );
+});
+
+test("iPhone smart punctuation: curly apostrophes read exactly like straight ones", () => {
+  const typed = { ...idle, typed: true };
+  expectIgnore("I\u2019ll do about 10 reps", typed);
+  expectIgnore("I\u2019ll do about 10 reps.");
+  expectIgnore("Let\u2019s do 8 reps at 75 pounds.");
+  expectIgnore("I didn\u2019t get 10.");
+  expectLog("That\u2019s it, 6 reps at 75 lb.", { weight: 34, reps: 6 });
 });

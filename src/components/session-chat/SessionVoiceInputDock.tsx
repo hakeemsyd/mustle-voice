@@ -27,6 +27,7 @@ interface SessionVoiceInputDockProps {
   onModeChange: (m: DockMode) => void;
   isVoiceActive: boolean;
   onToggleVoice: () => void;
+  onLeaveVoice?: () => void;
   orbState?: string;
   /** Raw connection status + reconnect flag, so the banner can say "connecting"/"reconnecting"
    *  rather than mapping both onto the orb's generic "processing" state. */
@@ -111,6 +112,7 @@ export const SessionVoiceInputDock = forwardRef<TextInput, SessionVoiceInputDock
       onModeChange,
       isVoiceActive,
       onToggleVoice,
+      onLeaveVoice,
       orbState,
       voiceStatus,
       reconnecting = false,
@@ -137,7 +139,7 @@ export const SessionVoiceInputDock = forwardRef<TextInput, SessionVoiceInputDock
     };
 
     const handleKeyboardPress = () => {
-      if (isVoiceActive) onToggleVoice();
+      if (isVoiceActive) (onLeaveVoice ?? onToggleVoice)();
       onModeChange("keyboard");
     };
 

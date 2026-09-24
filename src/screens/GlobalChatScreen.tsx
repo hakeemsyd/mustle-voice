@@ -157,7 +157,7 @@ export const GlobalChatScreen = ({ route, navigation }: Props) => {
       />
 
       {!isActive && !keyboardOpen && (
-        <QuickPromptChips onPick={handleQuickPrompt} options={GLOBAL_CHAT_PROMPT_OPTIONS} />
+        <QuickPromptChips onPick={handleQuickPrompt} options={GLOBAL_CHAT_PROMPT_OPTIONS} disabled={coachTyping} />
       )}
 
       <View style={[styles.dock, { paddingBottom: insets.bottom + 52 }]}>

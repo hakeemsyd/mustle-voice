@@ -1,6 +1,6 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
 import { runBrainTurn } from '../_shared/brain-orchestrator.ts';
-import { replayHistory } from '../_shared/replay-history.ts';
+import { APP_LINE_MODALITY, replayHistory } from '../_shared/replay-history.ts';
 import { dropLeadingConcession, dropSelfCorrection } from '../_shared/humanize.ts';
 import {
   buildStaticSystemPrompt,
@@ -16,6 +16,26 @@ import { resolveTurnText } from '../_shared/system-cue.ts';
 import { verbalizeUnitsForSpeech } from '../_shared/verbalize-for-speech.ts';
 import { stripSystemNote, createSystemNoteFilter } from '../_shared/strip-system-note.ts';
 import { scrubInternalLanguage } from '../_shared/scrub-internal.ts';
+import {
+  describeCueFacts,
+  describeResumedStart,
+  isLiveStrengthSession,
+  resolveTurnSetOutcome,
+  type TurnSetOutcome,
+} from '../_shared/turn-set-outcome.ts';
+import {
+  claimFallback,
+  guardClaims,
+  isUnbackedClaim,
+  trackToolOutcomes,
+  withGuardedFinalText,
+  type ClaimGuardState,
+} from '../_shared/claim-guard.ts';
+import {
+  HOLDS_MISSING_WEIGHT_FROM_VERSION,
+  looksLikeFinishedSetReport,
+  SHARED_PARSER_FROM_VERSION,
+} from '../_shared/set-report.ts';
 
 const callModel = createCallModel(VOICE_TOOLS);
 
@@ -68,6 +88,12 @@ function isSilencePlaceholder(text: string): boolean {
   return bare === '' || SILENCE_PLACEHOLDER.test(bare);
 }
 
+function sanitizeForChat(text: string): string {
+  return scrubInternalLanguage(dropSelfCorrection(dropLeadingConcession(text)))
+    .replace(/\[\[SYSTEM_CUE\]\]\s*\S*/gi, '')
+    .trim();
+}
+
 function sanitizeForSpeech(text: string): string {
   return scrubInternalLanguage(dropSelfCorrection(dropLeadingConcession(verbalizeUnitsForSpeech(text))))
     .replace(/\[\[SYSTEM_CUE\]\]\s*\S*/gi, '')
@@ -95,14 +121,15 @@ function extractContext(messages: any[]): { userId: string | null; timezone: str
   }
 }
 
+const SET_CONFIRMING_CUES = new Set(['set_logged', 'exercise_advanced']);
+
 async function prepareTurn(userId: string, userText: string, timezone: string | null, isFirstTurnOfCall: boolean) {
   const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
-  const handlers = createHandlers(supabase, userId, timezone, { currentUserText: userText });
 
   const askedAt = new Date();
   const isSystemCue = userText.startsWith(SYSTEM_CUE_PREFIX);
-  const isSessionStart =
-    isSystemCue && userText.slice(SYSTEM_CUE_PREFIX.length).trim() === SESSION_START_CUE;
+  const cueName = isSystemCue ? userText.slice(SYSTEM_CUE_PREFIX.length).trim() : null;
+  const isSessionStart = cueName === SESSION_START_CUE;
   const historyLimit = isSessionStart ? 0 : isSystemCue ? CUE_MESSAGE_HISTORY_LIMIT : MESSAGE_HISTORY_LIMIT;
   // TEMPORARY — voice-timing instrumentation to find the session-start latency source. Remove
   // once the slow phase is identified.
@@ -116,7 +143,7 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
       ? Promise.resolve({ data: [], error: null })
       : supabase
           .from('message')
-          .select('role,content,blocks,at')
+          .select('role,content,blocks,at,hidden,greeting_key,modality')
           .eq('user_id', userId)
           .gte('at', new Date(Date.now() - HISTORY_LOOKBACK_MS).toISOString())
           .order('at', { ascending: false })
@@ -136,7 +163,47 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
   const liveSnapshot = isLiveStateFresh ? buildLiveSessionSnapshot(liveRow!.state) : null;
   const units = profileRow?.unit_prefs === 'imperial' ? 'imperial' : 'metric';
   const liveBlock = liveSnapshot ? describeLiveSessionSnapshot(liveSnapshot, units) : null;
-  const fullContextBlock = liveBlock ? `${contextBlock}\n\n${liveBlock}` : contextBlock;
+
+  const lastCoachRow = (history ?? []).find(
+    (m: any) => m.role === 'assistant' && !m.greeting_key && m.modality !== APP_LINE_MODALITY,
+  );
+  const recentUserMessages = (history ?? [])
+    .filter((m: any) => m.role === 'user' && !m.hidden && !String(m.content ?? '').startsWith(SYSTEM_CUE_PREFIX))
+    .slice(0, 3)
+    .map((m: any) => ({ content: String(m.content ?? ''), at: m.at ?? null }));
+  const clientParserVersion = Number((liveRow?.state as any)?.setParser ?? 1);
+  const setOutcome: TurnSetOutcome | null = isSystemCue
+    ? null
+    : resolveTurnSetOutcome({
+        userText,
+        snapshot: liveSnapshot,
+        units,
+        lastCoachMessage: lastCoachRow ? { content: String(lastCoachRow.content ?? ''), at: lastCoachRow.at ?? null } : null,
+        recentUserMessages,
+        legacyClient: clientParserVersion < SHARED_PARSER_FROM_VERSION,
+        holdsMissingWeight: clientParserVersion >= HOLDS_MISSING_WEIGHT_FROM_VERSION,
+      });
+  const resumeNote = isSessionStart ? describeResumedStart(liveSnapshot, units) : null;
+  const cueFacts = describeCueFacts(cueName, liveSnapshot, units);
+  const contextParts = [contextBlock, liveBlock, setOutcome?.note, resumeNote, cueFacts].filter(Boolean);
+  const fullContextBlock = contextParts.join('\n\n');
+
+  const tracked = trackToolOutcomes(
+    createHandlers(supabase, userId, timezone, {
+      currentUserText: userText,
+      appLoggedThisTurn: setOutcome?.kind === 'logged' || (cueName !== null && SET_CONFIRMING_CUES.has(cueName)),
+    }),
+  );
+  const handlers = tracked.handlers;
+  const liveSession = isLiveStrengthSession(liveSnapshot);
+  const guardState = (): ClaimGuardState => ({
+    liveSession,
+    setLoggedThisTurn:
+      setOutcome?.kind === 'logged' || (cueName !== null && SET_CONFIRMING_CUES.has(cueName)) || tracked.outcomes.setLogged,
+    restActive: liveSnapshot?.status === 'resting',
+    actionSucceededThisTurn: tracked.outcomes.actionSucceeded,
+  });
+  const fallbackReply = claimFallback(liveSession, !isSystemCue && looksLikeFinishedSetReport(userText));
 
   // A workout's conversation must not leak into the next one. The app stamps live_session_state
   // with when the current session started; anything older belongs to a previous workout and reads
@@ -166,8 +233,16 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
     dynamic: fullContextBlock,
   };
   console.log(`[voice-timing:server] prepareTurn: done, +${Date.now() - tPrepare0}ms total`);
+  if (setOutcome) console.log(`[brain-voice] set outcome for this turn: ${setOutcome.kind}`);
 
-  return { supabase, handlers, turnMessages, systemPrompt, askedAt };
+  return { supabase, handlers, turnMessages, systemPrompt, askedAt, guardState, fallbackReply };
+}
+
+function guardReply(reply: string, state: ClaimGuardState, fallback: string): string {
+  const { text, dropped } = guardClaims(reply, state);
+  if (dropped.length === 0) return reply;
+  console.warn('[brain-voice] dropped unbacked claims:', dropped.join(' | '));
+  return text || fallback;
 }
 
 // ElevenLabs calls this function more than once for a single spoken turn — first on a preliminary
@@ -268,7 +343,7 @@ async function logConversation(
   turnBlocks: any[],
 ) {
   const strippedReply = stripSystemNote(rawReply);
-  const reply = isSilencePlaceholder(strippedReply) ? '' : strippedReply;
+  const reply = isSilencePlaceholder(strippedReply) ? '' : sanitizeForChat(strippedReply);
   const repliedAt = new Date(Math.max(Date.now(), askedAt.getTime() + 1));
   const isSystemCue = userText.startsWith(SYSTEM_CUE_PREFIX);
   if (!isSystemCue) await dropSupersededTurn(supabase, userId, userText, askedAt);
@@ -286,7 +361,7 @@ async function logConversation(
       role: 'assistant',
       content: reply,
       modality: 'voice',
-      hidden: false,
+      hidden: isSystemCue && !reply,
       blocks: turnBlocks.length > 0 ? turnBlocks : null,
       at: repliedAt.toISOString(),
     },
@@ -352,6 +427,7 @@ async function waitForLeaderReply(supabase: any, userId: string, followerArrived
         .select('content, at')
         .eq('user_id', userId)
         .eq('role', 'assistant')
+        .neq('modality', APP_LINE_MODALITY)
         .gte('at', notBefore)
         .order('at', { ascending: false })
         .limit(1)
@@ -387,7 +463,7 @@ async function resolveReplyBuffered(
   // TEMPORARY — voice-timing instrumentation. Remove once the slow phase is identified.
   const tTurn0 = Date.now();
   try {
-    const { supabase, handlers, turnMessages, systemPrompt, askedAt } = await prepareTurn(
+    const { supabase, handlers, turnMessages, systemPrompt, askedAt, guardState, fallbackReply } = await prepareTurn(
       userId,
       userText,
       timezone,
@@ -396,10 +472,11 @@ async function resolveReplyBuffered(
     console.log(`[voice-timing:server] runBrainTurn: starting, +${Date.now() - tTurn0}ms since resolveReplyBuffered began`);
     const result = await runBrainTurn({ systemPrompt, messages: turnMessages, handlers, callModel });
     console.log(`[voice-timing:server] runBrainTurn: done, +${Date.now() - tTurn0}ms total, ${result.toolCalls.length} tool call(s): ${result.toolCalls.map((t) => t.name).join(',')}`);
-    const turnBlocks = result.messages.slice(turnMessages.length);
-    await logConversation(supabase, userId, userText, askedAt, result.reply, turnBlocks);
+    const reply = guardReply(result.reply, guardState(), fallbackReply);
+    const turnBlocks = withGuardedFinalText(result.messages.slice(turnMessages.length), reply);
+    await logConversation(supabase, userId, userText, askedAt, reply, turnBlocks);
     console.log(`[voice-timing:server] resolveReplyBuffered: done, +${Date.now() - tTurn0}ms total`);
-    return result.reply;
+    return reply;
   } catch (err) {
     console.error('[brain-voice] error:', err);
     return VOICE_ERROR_REPLY;
@@ -521,6 +598,9 @@ Deno.serve(async (req) => {
       const MAX_HOLD_CHARS = 90;
       let pending = '';
       let emittedAny = false;
+      let activeGuard: (() => ClaimGuardState) | null = null;
+      let droppedClaim = false;
+      const spokenParts: string[] = [];
       const filterSystemNote = createSystemNoteFilter();
 
       const emitChunk = (chunk: string) => {
@@ -531,7 +611,13 @@ Deno.serve(async (req) => {
         // it no longer has to guess from a fragment — but it still only applies before anything
         // has been spoken, since a later "silence" is part of a real sentence.
         if (!emittedAny && isSilencePlaceholder(visible)) return;
+        if (activeGuard && isUnbackedClaim(visible, activeGuard())) {
+          droppedClaim = true;
+          console.warn('[brain-voice] dropped unbacked claim:', visible.trim());
+          return;
+        }
         emittedAny = true;
+        spokenParts.push(visible);
         send(sanitizeForSpeech(visible));
       };
 
@@ -592,12 +678,9 @@ Deno.serve(async (req) => {
           send(sanitizeForSpeech(NO_IDENTITY_REPLY));
         } else {
           try {
-            const { supabase, handlers, turnMessages, systemPrompt, askedAt } = await prepareTurn(
-              userId,
-              userText,
-              timezone,
-              isFirstTurnOfCall,
-            );
+            const { supabase, handlers, turnMessages, systemPrompt, askedAt, guardState, fallbackReply } =
+              await prepareTurn(userId, userText, timezone, isFirstTurnOfCall);
+            activeGuard = guardState;
             const result = await runBrainTurn({
               systemPrompt,
               messages: turnMessages,
@@ -609,9 +692,18 @@ Deno.serve(async (req) => {
               },
             });
             flushGate();
+            let loggedReply = result.reply;
+            if (droppedClaim) {
+              if (!emittedAny) {
+                emittedAny = true;
+                spokenParts.push(fallbackReply);
+                send(sanitizeForSpeech(fallbackReply));
+              }
+              loggedReply = spokenParts.join('').trim();
+            }
             ensureNonEmptyCompletion();
-            const turnBlocks = result.messages.slice(turnMessages.length);
-            await logConversation(supabase, userId, userText, askedAt, result.reply, turnBlocks);
+            const turnBlocks = withGuardedFinalText(result.messages.slice(turnMessages.length), loggedReply);
+            await logConversation(supabase, userId, userText, askedAt, loggedReply, turnBlocks);
           } catch (err) {
             console.error('[brain-voice] error:', err);
             pending = '';

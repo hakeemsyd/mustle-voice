@@ -20,8 +20,9 @@ test('an unfilled %1RM with no load history on file never reaches the screen', (
   assert.equal(loadSchemeForExercise('Overhead Press', '70-80% 1RM', false), null);
 });
 
-test('a %1RM scheme is kept once the user has real load history for that exercise', () => {
-  assert.equal(loadSchemeForExercise('Overhead Press', '70-80% 1RM', true), '70-80% 1RM');
+test('even with load history a 1RM scheme is stored as something actionable, never a percentage', () => {
+  assert.equal(loadSchemeForExercise('Overhead Press', '70-80% 1RM', true), 'moderate');
+  assert.equal(loadSchemeForExercise('Bench Press', '%1RM', true), 'working weight');
 });
 
 test('an ordinary concrete load scheme is untouched either way', () => {

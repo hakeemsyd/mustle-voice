@@ -10,10 +10,14 @@ import React, {
 import * as Crypto from "expo-crypto";
 import { supabase } from "../lib/supabase";
 import { dispatchQuery } from "../lib/dispatchQuery";
+import { persistChatLine } from "../lib/chatLog";
 import { callBrain, COACH_UNREACHABLE_MESSAGE } from "../lib/brain";
 import { DEFAULT_REST_SEC, suggestRestSeconds, type RestSuggestionReason } from "../lib/restSuggestion";
 import { useProfileName } from "../hooks/useProfileName";
 import { buildLiveSessionSnapshot, describeLiveSessionSnapshot } from "./liveSessionState";
+import { SET_PARSER_VERSION } from "../../supabase/functions/_shared/set-report";
+import { normalizeLoadScheme } from "../../supabase/functions/_shared/load-intent";
+import { rebuildResumedSession, type ResumePlanEntry } from "./resumeSession";
 import { useUnitPrefs } from "../hooks/useUnitPrefs";
 
 // Previously a module-level counter combined with Date.now() — confirmed live: two messages
@@ -68,6 +72,13 @@ export interface ResumeExerciseEntry {
   sets: number;
   reps: string;
   load: string;
+}
+
+export interface SessionResume {
+  exercisesDone: ResumeExerciseEntry[];
+  sessionPlan?: ResumePlanEntry[] | null;
+  workoutLogId?: string | null;
+  elapsedSec?: number | null;
 }
 
 interface LastSetSnapshot {
@@ -151,6 +162,8 @@ interface ActiveSessionValue {
   currentExerciseIndex: number;
   currentExercise: SessionExercise | null;
   loggedSets: LoggedSet[][];
+  statedWeight: StatedWeight | null;
+  rememberStatedWeight: (exerciseIndex: number, weight: number) => void;
   resting: boolean;
   restKey: number;
   /** The suggested duration for the current/last rest period — a fixed target, not a live
@@ -181,6 +194,7 @@ interface ActiveSessionValue {
   coachThinking: boolean;
   messages: SessionThreadMessage[];
   appendMessage: (role: "coach" | "user", text: string) => void;
+  persistUserMessage: (text: string) => void;
   elapsedSec: number;
   /** When the current session was started, ISO. Written into live_session_state so brain-voice can
    *  scope replayed conversation to THIS workout — without it the coach reads the previous
@@ -190,7 +204,7 @@ interface ActiveSessionValue {
   minimized: boolean;
   start: (
     target: SessionTarget,
-    resumeExercisesDone?: ResumeExerciseEntry[],
+    resume?: SessionResume,
     preloaded?: { focus: string | null; exercises: SessionExercise[] },
   ) => void;
   minimize: () => void;
@@ -205,18 +219,24 @@ interface ActiveSessionValue {
    *  rest-day choice that doesn't go through start() (which already does this itself). */
   resolveOutgoingSession: () => Promise<void>;
   removeQueuedExercise: (exerciseRowId: string) => void;
-  swapQueuedExercise: (exerciseRowId: string, replacement: { id: string; name: string }) => void;
+  swapQueuedExercise: (
+    exerciseRowId: string,
+    replacement: { id: string; name: string; loadScheme?: string | null },
+  ) => void;
   finishRest: () => void;
   endSession: (status: SessionStatus, reason?: string | null) => Promise<void>;
+  discardSession: () => Promise<void>;
   submitFeedback: (note: string, tags: string[]) => Promise<void>;
   askCoach: (text: string) => Promise<void>;
-  noteSetLogged: (summary: string) => void;
-  announce: (text: string) => void;
+  noteSetLogged: (summary: string, followUp?: string | null) => void;
+  announce: (text: string, options?: { persist?: boolean }) => void;
   describeForCoach: () => string | undefined;
   publishLiveState: () => Promise<unknown>;
   setPaused: (paused: boolean) => void;
   clear: () => void;
 }
+
+type StatedWeight = { exerciseIndex: number; weight: number };
 
 const ActiveSessionCtx = createContext<ActiveSessionValue | null>(null);
 
@@ -242,6 +262,7 @@ export function ActiveSessionProvider({
   const [currentExerciseIndex, setCurrentExerciseIndex] = useState(0);
   const [loggedSets, setLoggedSets] = useState<LoggedSet[][]>([]);
   const [lastSetLoggedAt, setLastSetLoggedAt] = useState<number | null>(null);
+  const [statedWeight, setStatedWeight] = useState<StatedWeight | null>(null);
   const [resting, setResting] = useState(false);
   const [restKey, setRestKey] = useState(0);
   const [restTargetSec, setRestTargetSec] = useState(DEFAULT_REST_SEC);
@@ -266,7 +287,7 @@ export function ActiveSessionProvider({
 
   const userIdRef = useRef<string | null>(null);
   const logIdRef = useRef<string | null>(null);
-  const resumeDataRef = useRef<ResumeExerciseEntry[] | null>(null);
+  const resumeDataRef = useRef<SessionResume | null>(null);
   // Set inside start() to the exact `target` object it just passed to setTarget when the caller
   // (Preview, which already loaded and displayed this exact plan_session's exercises for the user
   // to review) hands the same data straight through — the fetch effect below checks this by
@@ -302,7 +323,7 @@ export function ActiveSessionProvider({
   const start = useCallback(
     (
       next: SessionTarget,
-      resumeExercisesDone?: ResumeExerciseEntry[],
+      resume?: SessionResume,
       preloaded?: { focus: string | null; exercises: SessionExercise[] },
     ) => {
       // Persist whatever was in progress before resetting — the outgoing session's own
@@ -314,13 +335,13 @@ export function ActiveSessionProvider({
       workoutLogWrittenRef.current = false;
       loggingRef.current = false;
       lastSetSnapshotRef.current = null;
-      resumeDataRef.current = resumeExercisesDone ?? null;
+      resumeDataRef.current = resume ?? null;
       setTarget(next);
       setError(null);
       // Resuming deliberately forfeits the preload fast-path: resumeDataRef is only ever consumed
       // by the fetch effect below, which the preload skips, so a resumed session would silently
       // come back with none of its already-completed sets.
-      const canUsePreload = !!preloaded && next.type === "strength" && !resumeExercisesDone;
+      const canUsePreload = !!preloaded && next.type === "strength" && !resume;
       preloadedTargetRef.current = canUsePreload ? next : null;
       setLoading(next.type === "strength" && !canUsePreload);
       setFocus(next.type === "cardio" ? next.activity : canUsePreload ? preloaded!.focus : null);
@@ -331,6 +352,7 @@ export function ActiveSessionProvider({
       // it. Left empty, logSet spread `undefined` and threw before recording anything: no set
       // logged, no rest timer, the card stuck on set 1 while the coach carried on as if it had.
       setLoggedSets(canUsePreload ? preloaded!.exercises.map(() => []) : []);
+      setStatedWeight(null);
       setResting(false);
       setRestTargetSec(DEFAULT_REST_SEC);
       setRestEndAt(null);
@@ -340,12 +362,12 @@ export function ActiveSessionProvider({
       setEndedStatus(null);
       setCoachMessage("Ready when you are.");
       setMessages([]);
-      setElapsedSec(0);
+      setElapsedSec(Math.max(0, Math.round(resume?.elapsedSec ?? 0)));
       setStartedAt(new Date().toISOString());
       setPaused(false);
       setMinimized(false);
-      logIdRef.current = null;
-      setWorkoutLogId(null);
+      logIdRef.current = resume?.workoutLogId ?? null;
+      setWorkoutLogId(resume?.workoutLogId ?? null);
     },
     [target, ended, loggedSets],
   );
@@ -356,6 +378,10 @@ export function ActiveSessionProvider({
   const appendMessage = useCallback((role: "coach" | "user", text: string) => {
     if (!text.trim()) return;
     setMessages((prev) => [...prev, { id: Crypto.randomUUID(), role, text }]);
+  }, []);
+
+  const persistUserMessage = useCallback((text: string) => {
+    persistChatLine(userIdRef.current, "user", text);
   }, []);
 
   // Resolved once, independent of any running session: the voice agent needs the user's id
@@ -396,6 +422,7 @@ export function ActiveSessionProvider({
     setEndedStatus(null);
     setExercises([]);
     setLoggedSets([]);
+    setStatedWeight(null);
     setElapsedSec(0);
     setStartedAt(null);
     setMinimized(false);
@@ -458,21 +485,35 @@ export function ActiveSessionProvider({
         name: exerciseName(row),
         sets: row.sets,
         repScheme: row.rep_scheme,
-        loadScheme: row.load_scheme,
+        loadScheme: normalizeLoadScheme(row.load_scheme),
       }));
 
       setFocus(data.focus ?? null);
-      setExercises(detail);
 
       const resume = resumeDataRef.current;
       resumeDataRef.current = null;
       if (resume) {
-        const byName = new Map(resume.map((r) => [r.name.toLowerCase(), r]));
-        const resumedSets = detail.map((ex) => parseResumeSets(byName.get(ex.name.toLowerCase())));
-        const firstUnfinished = detail.findIndex((ex, i) => resumedSets[i].length < ex.sets);
+        let rebuilt = rebuildResumedSession(
+          detail,
+          resume.sessionPlan,
+          resume.exercisesDone.map((r) => r.name),
+        );
+        const unresolved = rebuilt.filter((ex) => !ex.exerciseId).map((ex) => ex.name);
+        if (unresolved.length > 0) {
+          const { data: found } = await supabase.from("exercise").select("id, name").in("name", unresolved);
+          if (cancelled) return;
+          const idByName = new Map(((found ?? []) as { id: string; name: string }[]).map((r) => [r.name.toLowerCase(), r.id]));
+          rebuilt = rebuilt.map((ex) => (ex.exerciseId ? ex : { ...ex, exerciseId: idByName.get(ex.name.toLowerCase()) ?? "" }));
+        }
+        const byName = new Map(resume.exercisesDone.map((r) => [r.name.toLowerCase(), r]));
+        const resumedSets = rebuilt.map((ex) => parseResumeSets(byName.get(ex.name.toLowerCase())));
+        rebuilt = rebuilt.map((ex, i) => (resumedSets[i].length > ex.sets ? { ...ex, sets: resumedSets[i].length } : ex));
+        const firstUnfinished = rebuilt.findIndex((ex, i) => resumedSets[i].length < ex.sets);
+        setExercises(rebuilt);
         setLoggedSets(resumedSets);
-        setCurrentExerciseIndex(firstUnfinished === -1 ? Math.max(detail.length - 1, 0) : firstUnfinished);
+        setCurrentExerciseIndex(firstUnfinished === -1 ? Math.max(rebuilt.length - 1, 0) : firstUnfinished);
       } else {
+        setExercises(detail);
         setLoggedSets(detail.map(() => []));
       }
       setLoading(false);
@@ -551,6 +592,9 @@ export function ActiveSessionProvider({
               name: exercise.name,
               planned_sets: exercise.sets,
               completed_sets: (sets[i] ?? []).length,
+              exercise_id: exercise.exerciseId || null,
+              rep_scheme: exercise.repScheme,
+              load_scheme: exercise.loadScheme ?? null,
             })),
           };
 
@@ -696,32 +740,64 @@ export function ActiveSessionProvider({
 
   const undoLastSet = useCallback(async () => {
     const snap = lastSetSnapshotRef.current;
-    if (!snap) return;
     lastSetSnapshotRef.current = null;
+
+    let restored: LoggedSet[][];
+    let restoredIndex: number;
+    if (snap) {
+      restored = snap.loggedSets;
+      restoredIndex = snap.currentExerciseIndex;
+      setCurrentExerciseIndex(snap.currentExerciseIndex);
+      setResting(snap.resting);
+      setRestKey(snap.restKey);
+      setRestTargetSec(snap.restTargetSec);
+      setRestEndAt(snap.restEndAt);
+      setRestPausedRemainingSec(snap.restPausedRemainingSec);
+    } else {
+      let index = -1;
+      for (let i = Math.min(currentExerciseIndex, loggedSets.length - 1); i >= 0; i--) {
+        if ((loggedSets[i]?.length ?? 0) > 0) {
+          index = i;
+          break;
+        }
+      }
+      if (index === -1) return;
+      restored = loggedSets.map((sets) => sets.slice());
+      restored[index].pop();
+      restoredIndex = index;
+      setCurrentExerciseIndex(index);
+      setResting(false);
+      setRestEndAt(null);
+      setRestPausedRemainingSec(null);
+    }
+
     // The row is no longer created by the finishing set — it exists from the first one — so
     // deleting it here would throw away the whole run rather than the set being undone. It is
     // rewritten with the pre-set state instead, and only deleted when the undo empties the run.
     const existingLogId = logIdRef.current;
     if (existingLogId) {
       workoutLogWrittenRef.current = false;
-      if (snap.loggedSets.some((sets) => sets.length > 0)) {
-        void writeWorkoutLogRef.current?.(snap.loggedSets, "partial");
+      if (restored.some((sets) => sets.length > 0)) {
+        void writeWorkoutLogRef.current?.(restored, "partial");
       } else {
         await supabase.from("workout_log").delete().eq("id", existingLogId);
         logIdRef.current = null;
         setWorkoutLogId(null);
       }
     }
-    setLoggedSets(snap.loggedSets);
-    setCurrentExerciseIndex(snap.currentExerciseIndex);
-    setResting(snap.resting);
-    setRestKey(snap.restKey);
-    setRestTargetSec(snap.restTargetSec);
-    setRestEndAt(snap.restEndAt);
-    setRestPausedRemainingSec(snap.restPausedRemainingSec);
+    const removedWeight = (loggedSets[restoredIndex] ?? [])
+      .slice(restored[restoredIndex]?.length ?? 0)
+      .reverse()
+      .find((set) => set.weight != null && set.unit !== "seconds")?.weight;
+    if (removedWeight != null) setStatedWeight({ exerciseIndex: restoredIndex, weight: removedWeight });
+    setLoggedSets(restored);
     setRestReasonLabel(null);
     setEnded(false);
     setEndedStatus(null);
+  }, [currentExerciseIndex, loggedSets]);
+
+  const rememberStatedWeight = useCallback((exerciseIndex: number, weight: number) => {
+    setStatedWeight({ exerciseIndex, weight });
   }, []);
 
   const skipExercise = useCallback(() => {
@@ -781,17 +857,39 @@ export function ActiveSessionProvider({
   );
 
   const swapQueuedExercise = useCallback(
-    (exerciseRowId: string, replacement: { id: string; name: string }) => {
+    (exerciseRowId: string, replacement: { id: string; name: string; loadScheme?: string | null }) => {
       const index = exercises.findIndex((e) => e.id === exerciseRowId);
       if (index === -1 || index < currentExerciseIndex) return;
-      // The current exercise can still be swapped as long as it hasn't been started yet —
-      // matches the coach's own tool description ("only works on an exercise that hasn't
-      // started yet"). Only a strictly earlier or already-in-progress exercise is off-limits.
-      const alreadyStarted = index === currentExerciseIndex && (loggedSets[index]?.length ?? 0) > 0;
-      if (alreadyStarted) return;
-      setExercises((prev) =>
-        prev.map((e) => (e.id === exerciseRowId ? { ...e, exerciseId: replacement.id, name: replacement.name } : e)),
-      );
+      const withLoad = (e: SessionExercise): SessionExercise => ({
+        ...e,
+        exerciseId: replacement.id,
+        name: replacement.name,
+        loadScheme: replacement.loadScheme !== undefined && replacement.loadScheme !== null ? replacement.loadScheme : e.loadScheme,
+      });
+      const setsDone = index === currentExerciseIndex ? (loggedSets[index]?.length ?? 0) : 0;
+      if (setsDone === 0) {
+        setExercises((prev) => prev.map((e) => (e.id === exerciseRowId ? withLoad(e) : e)));
+        return;
+      }
+      const current = exercises[index];
+      const continued = {
+        ...withLoad(current),
+        id: `${current.id}:swap:${Date.now()}`,
+        sets: Math.max(1, current.sets - setsDone),
+      };
+      lastSetSnapshotRef.current = null;
+      setExercises((prev) => {
+        const next = prev.slice();
+        next[index] = { ...current, sets: setsDone };
+        next.splice(index + 1, 0, continued);
+        return next;
+      });
+      setLoggedSets((prev) => {
+        const next = prev.map((sets) => sets.slice());
+        next.splice(index + 1, 0, []);
+        return next;
+      });
+      setCurrentExerciseIndex(index + 1);
     },
     [exercises, currentExerciseIndex, loggedSets],
   );
@@ -877,6 +975,18 @@ export function ActiveSessionProvider({
     [exercises, loggedSets, writeWorkoutLog],
   );
 
+  const discardSession = useCallback(async () => {
+    lastSetSnapshotRef.current = null;
+    workoutLogWrittenRef.current = true;
+    await writeChainRef.current.catch(() => undefined);
+    const logId = logIdRef.current;
+    if (logId) {
+      const { error: deleteError } = await supabase.from("workout_log").delete().eq("id", logId);
+      if (deleteError) console.error("[active session] failed to discard workout:", deleteError.message, logId);
+    }
+    clear();
+  }, [clear]);
+
   const submitFeedback = useCallback(async (note: string, tags: string[]) => {
     const logId = logIdRef.current;
     if (!logId) return;
@@ -913,6 +1023,7 @@ export function ActiveSessionProvider({
       ended,
       paused,
       elapsedSec,
+      statedWeight,
     });
     return snapshot ? describeLiveSessionSnapshot(snapshot, units) : undefined;
   }, [
@@ -928,6 +1039,7 @@ export function ActiveSessionProvider({
     ended,
     paused,
     elapsedSec,
+    statedWeight,
     units,
   ]);
 
@@ -938,6 +1050,7 @@ export function ActiveSessionProvider({
       ? {
           user_id: userId,
           state: {
+            setParser: SET_PARSER_VERSION,
             startedAt,
             target,
             focus,
@@ -951,6 +1064,7 @@ export function ActiveSessionProvider({
             ended,
             paused,
             elapsedSec,
+            statedWeight,
           },
         }
       : null;
@@ -984,6 +1098,7 @@ export function ActiveSessionProvider({
     restPausedRemainingSec,
     paused,
     ended,
+    statedWeight,
     publishLiveState,
   ]);
 
@@ -1016,6 +1131,7 @@ export function ActiveSessionProvider({
           ended,
           paused,
           elapsedSec,
+          statedWeight,
         });
         liveSessionState = snapshot ? describeLiveSessionSnapshot(snapshot, units) : undefined;
       } catch (err) {
@@ -1063,22 +1179,24 @@ export function ActiveSessionProvider({
       ended,
       paused,
       elapsedSec,
+      statedWeight,
       units,
       appendMessage,
     ],
   );
 
   const announce = useCallback(
-    (text: string) => {
+    (text: string, options?: { persist?: boolean }) => {
       setCoachMessage(text);
       appendMessage("coach", text);
+      if (options?.persist !== false) persistChatLine(userIdRef.current, "coach", text);
     },
     [appendMessage],
   );
 
   const noteSetLogged = useCallback(
-    (summary: string) => {
-      announce(`Logged — ${summary}.`);
+    (summary: string, followUp?: string | null) => {
+      announce(`Logged — ${summary}.${followUp ? ` ${followUp}` : ""}`);
     },
     [announce],
   );
@@ -1096,6 +1214,8 @@ export function ActiveSessionProvider({
       currentExerciseIndex,
       currentExercise: exercises[currentExerciseIndex] ?? null,
       loggedSets,
+      statedWeight,
+      rememberStatedWeight,
       resting,
       restKey,
       restTargetSec,
@@ -1111,6 +1231,7 @@ export function ActiveSessionProvider({
       coachThinking,
       messages,
       appendMessage,
+      persistUserMessage,
       elapsedSec,
       startedAt,
       paused,
@@ -1129,6 +1250,7 @@ export function ActiveSessionProvider({
       swapQueuedExercise,
       finishRest,
       endSession,
+      discardSession,
       submitFeedback,
       askCoach,
       noteSetLogged,
@@ -1152,6 +1274,8 @@ export function ActiveSessionProvider({
       exercises,
       currentExerciseIndex,
       loggedSets,
+      statedWeight,
+      rememberStatedWeight,
       resting,
       restKey,
       restTargetSec,
@@ -1166,6 +1290,7 @@ export function ActiveSessionProvider({
       coachThinking,
       messages,
       appendMessage,
+      persistUserMessage,
       elapsedSec,
       startedAt,
       paused,
@@ -1184,6 +1309,7 @@ export function ActiveSessionProvider({
       swapQueuedExercise,
       finishRest,
       endSession,
+      discardSession,
       submitFeedback,
       askCoach,
       noteSetLogged,

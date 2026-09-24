@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Alert, KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useFocusEffect } from "@react-navigation/native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
@@ -30,6 +30,7 @@ import { titleCase } from "../lib/textFormat";
 import { callBrain, COACH_UNREACHABLE_MESSAGE } from "../lib/brain";
 import { supabase } from "../lib/supabase";
 import { dispatchQuery } from "../lib/dispatchQuery";
+import { persistChatLine } from "../lib/chatLog";
 import { kgToDisplayWeight, type Units } from "../lib/units";
 import { useUnitPrefsState } from "../hooks/useUnitPrefs";
 import { convertLoadScheme } from "../lib/loadScheme";
@@ -83,7 +84,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
   const session = useActiveSessionContext();
   const {
     orbState, isActive, toggle, connect, release, status: voiceStatus, reconnecting,
-    isMuted, toggleMute, setMuteState, setMessageHandler, setSessionConfig,
+    isMuted, toggleMute, setMuteState, setMessageHandler, setSessionConfig, endWhenAnswered,
   } = useSharedVoiceSession();
   const { alternatives: switchAlternatives } = usePlanAlternatives(planSessionId);
 
@@ -158,6 +159,14 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
     setMessages((prev) => [...prev, { id, role, text, imageUrl }]);
   }, []);
 
+  const showLine = React.useCallback(
+    (role: "coach" | "user", text: string) => {
+      appendMessage(role, text);
+      persistChatLine(session.userId, role, text);
+    },
+    [appendMessage, session.userId],
+  );
+
   // This screen never claimed the shared conversation, so anything spoken here was still being
   // routed to whichever screen registered last (Home, or Global Chat) — the mic connected fine,
   // but the turns landed in someone else's thread, which looked exactly like "it isn't
@@ -226,7 +235,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
 
     beats.forEach((text, i) => {
       introTimersRef.current.push(
-        setTimeout(() => appendMessage("coach", text), INTRO_DELAY_MS + i * INTRO_GAP_MS),
+        setTimeout(() => showLine("coach", text), INTRO_DELAY_MS + i * INTRO_GAP_MS),
       );
     });
     introTimersRef.current.push(
@@ -271,7 +280,14 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
       !pending.target.switchedFromSessionId;
     session.start(
       pending.target,
-      pending.resume && lastTime ? lastTime.exercises : undefined,
+      pending.resume && lastTime
+        ? {
+            exercisesDone: lastTime.exercises,
+            sessionPlan: lastTime.sessionPlan,
+            workoutLogId: lastTime.id,
+            elapsedSec: lastTime.durationSec,
+          }
+        : undefined,
       isThisSession ? { focus, exercises } : undefined,
     );
     navigation.replace("ActiveSession");
@@ -286,31 +302,44 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
 
   const handleIdleChip = (label: string) => {
     if (label === "Continue Session" || label === "Start Session") {
-      appendMessage("user", label);
+      showLine("user", label);
       startSession({ type: "strength", planSessionId }, canResume);
     } else if (label === "Restart Instead") {
-      appendMessage("user", label);
-      const discardedId = lastTime?.id;
-      startSession({ type: "strength", planSessionId }, false);
-      if (discardedId) {
-        supabase
-          .from("workout_log")
-          .delete()
-          .eq("id", discardedId)
-          .then(({ error }) => {
-            if (error) console.error("[preview] failed to discard interrupted session:", error.message, discardedId);
-            else console.log("[preview] discarded interrupted session:", discardedId);
-          });
-      } else {
-        console.warn("[preview] Restart Instead had no lastTime.id to discard");
-      }
+      const loggedSetCount = (lastTime?.exercises ?? []).reduce((sum, ex) => sum + (Number(ex.sets) || 0), 0);
+      const restart = () => {
+        showLine("user", label);
+        const discardedId = lastTime?.id;
+        startSession({ type: "strength", planSessionId }, false);
+        if (discardedId) {
+          supabase
+            .from("workout_log")
+            .delete()
+            .eq("id", discardedId)
+            .then(({ error }) => {
+              if (error) console.error("[preview] failed to discard interrupted session:", error.message, discardedId);
+              else console.log("[preview] discarded interrupted session:", discardedId);
+            });
+        } else {
+          console.warn("[preview] Restart Instead had no lastTime.id to discard");
+        }
+      };
+      Alert.alert(
+        "Restart this workout?",
+        loggedSetCount > 0
+          ? `This deletes the ${loggedSetCount} set${loggedSetCount === 1 ? "" : "s"} you already logged in this workout and starts it again from the first exercise.`
+          : "This starts the workout again from the first exercise.",
+        [
+          { text: "Cancel", style: "cancel" },
+          { text: "Delete and Restart", style: "destructive", onPress: restart },
+        ],
+      );
     } else if (label === "Manage Workout") {
-      appendMessage("user", label);
-      appendMessage("coach", "Would you like to change an exercise, add one, or swap the entire workout?");
+      showLine("user", label);
+      showLine("coach", "Would you like to change an exercise, add one, or swap the entire workout?");
       setChips({ kind: "manage" });
     } else if (label === "Guide me") {
-      appendMessage("user", label);
-      appendMessage("coach", "Which exercise do you want a guide for?");
+      showLine("user", label);
+      showLine("coach", "Which exercise do you want a guide for?");
       setChips({ kind: "guide-pick" });
     }
   };
@@ -320,18 +349,18 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
       setChips({ kind: "idle" });
       return;
     }
-    appendMessage("user", label);
+    showLine("user", label);
     if (label === "Change an Exercise") {
-      appendMessage("coach", "Which one would you like to swap?");
+      showLine("coach", "Which one would you like to swap?");
       setChips({ kind: "change-target" });
     } else if (label === "Add an Exercise") {
-      appendMessage(
+      showLine(
         "coach",
         "I can't add an exercise mid-preview yet — talk to me about it once you're in the session, or ask for a full plan change.",
       );
       setChips({ kind: "idle" });
     } else if (label === "Change Workout") {
-      appendMessage("coach", "Sure — let's find you a different workout.");
+      showLine("coach", "Sure — let's find you a different workout.");
       setSwitchOpen(true);
     }
   };
@@ -345,11 +374,11 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
     if (chips.kind === "change-target") {
       const exercise = exercises.find((e) => e.name === label);
       if (!exercise) return;
-      appendMessage("user", label);
-      appendMessage("coach", "One sec — checking safe alternates…");
+      showLine("user", label);
+      showLine("coach", "One sec — checking safe alternates…");
       const candidates = session.userId ? await getSwapCandidates(session.userId, exercise.exerciseId) : [];
       if (candidates.length === 0) {
-        appendMessage("coach", "No safe alternates found for that one.");
+        showLine("coach", "No safe alternates found for that one.");
         resetChips();
         return;
       }
@@ -360,8 +389,8 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
     if (chips.kind === "change-pick") {
       const candidate = chips.candidates.find((c) => c.name === label);
       if (!candidate) return;
-      appendMessage("user", label);
-      appendMessage(
+      showLine("user", label);
+      showLine(
         "coach",
         `${candidate.name} looks like a safe alternate for ${chips.exerciseName}. Open the exercise menu once you start the session to swap it in.`,
       );
@@ -643,6 +672,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
               onModeChange={setInputMode}
               isVoiceActive={isActive}
               onToggleVoice={toggle}
+              onLeaveVoice={endWhenAnswered}
               orbState={orbState}
               voiceStatus={voiceStatus}
               reconnecting={reconnecting}

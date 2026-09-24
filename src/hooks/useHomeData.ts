@@ -15,7 +15,10 @@ import { startOfLocalDay } from '../lib/calendarDate';
 import { HOME_CACHE_KEY } from '../lib/localUserData';
 import { MACRO_META, getTimeBand, type MacroTarget } from '../screens/homeFormat';
 import { greetingIsFreshToday as isGreetingFreshToday } from '../lib/greetingFreshness';
+import { alignGreetingToTimeBand } from '../lib/greetingTimeOfDay';
 import { useLocalDayRollover } from './useLocalDayRollover';
+import { useActiveSessionContext } from '../session/ActiveSessionContext';
+import { resolveTrainingDays } from '../../supabase/functions/_shared/training-schedule';
 
 export interface TodaySession {
   hasSession: boolean;
@@ -141,9 +144,13 @@ function buildGreetingPrompt(
   const now = new Date();
   const clock = now.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
   const day = now.toLocaleDateString(undefined, { weekday: 'long' });
+  const band = getTimeBand(now.getHours());
+  const bandRule =
+    band === 'Night'
+      ? 'It is night for them, so never open with good morning, afternoon or evening; a plain hello fits.'
+      : `It is ${band.toLowerCase()} for them, so if you greet by time of day, say ${band.toLowerCase()} and no other.`;
   const timeNote =
-    ` It is currently ${clock} on ${day}. Let that inform the greeting naturally (never "good ` +
-    'morning" in the evening, and a late-night greeting reads differently than an early one) ' +
+    ` It is currently ${clock} on ${day}. ${bandRule} Let that inform the greeting naturally ` +
     'without literally stating the clock time. Never ask for the time and never mention needing ' +
     'it — you have it.';
 
@@ -213,7 +220,7 @@ export function looksLikeMetaLeak(text: string): boolean {
 
 function sanitizeCoachMessage(raw: string): string {
   const stripped = canonicalizeExerciseNames(
-    raw
+    alignGreetingToTimeBand(raw.trim(), getTimeBand(new Date().getHours()))
       .replace(/\*\*(.*?)\*\*/g, '$1')
       .replace(/\*(.*?)\*/g, '$1')
       .replace(/`(.*?)`/g, '$1')
@@ -259,6 +266,9 @@ export function useHomeData(): HomeData {
   // fabricated-not-corrupted duplicate greeting at worst, not the P0 class of bug.
   const greetingInFlightRef = useRef(false);
   const loadedFromNetworkRef = useRef(false);
+  const activeSession = useActiveSessionContext();
+  const workoutRunningRef = useRef(false);
+  workoutRunningRef.current = !!activeSession.target && !activeSession.ended;
 
   // Runs once, in parallel with the real fetch below — an AsyncStorage read resolves in a few ms,
   // long before any network round-trip, so this reliably wins the race and replaces the plain
@@ -318,7 +328,7 @@ export function useHomeData(): HomeData {
           supabase
             .from('training_plan')
             .select(
-              'id, created_at, starts_on, plan_session(id, day_order, weekday, focus, plan_exercise(id, ord, exercise:exercise_id(name)))',
+              'id, created_at, starts_on, days_per_week, training_days, plan_session(id, day_order, weekday, focus, plan_exercise(id, ord, exercise:exercise_id(name)))',
             )
             .eq('user_id', userId)
             .eq('status', 'active')
@@ -344,6 +354,7 @@ export function useHomeData(): HomeData {
             .eq('user_id', userId)
             .eq('role', 'assistant')
             .eq('hidden', true)
+            .not('greeting_key', 'is', null)
             .order('at', { ascending: false })
             .limit(1)
             .maybeSingle(),
@@ -422,6 +433,7 @@ export function useHomeData(): HomeData {
               restDayDates,
               overrideSession,
               planStartDate,
+              resolveTrainingDays(plan, (plan?.plan_session ?? []) as any[]),
             );
         todaySession = sessionToday
           ? {
@@ -502,6 +514,11 @@ export function useHomeData(): HomeData {
         coachMessage = DEFAULT_COACH_MESSAGE_NO_PLAN;
       } else if (greetingInFlightRef.current) {
         coachMessage = DEFAULT_COACH_MESSAGE_HAS_PLAN;
+      } else if (workoutRunningRef.current) {
+        coachMessage =
+          lastGreeting?.content && !looksLikeMetaLeak(lastGreeting.content)
+            ? sanitizeCoachMessage(lastGreeting.content)
+            : DEFAULT_COACH_MESSAGE_HAS_PLAN;
       } else {
         greetingInFlightRef.current = true;
         try {

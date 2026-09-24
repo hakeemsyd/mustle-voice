@@ -134,3 +134,17 @@ test('ordinary alternating history is untouched by the coalescing', () => {
   ];
   assert.deepEqual(replayHistory(rows), rows);
 });
+
+test("the app's own chat lines are shown to the user but never replayed as the coach's words", () => {
+  const rows: StoredMessage[] = [
+    { role: 'user', content: '10 reps', modality: 'text' },
+    { role: 'assistant', content: 'Got 10 reps. What weight was that? Nothing logged yet.', modality: 'app' },
+    { role: 'user', content: '60', modality: 'text' },
+    { role: 'assistant', content: 'Logged — 60 lb × 10 reps.', modality: 'app' },
+    { role: 'assistant', content: 'Solid first set. Rest is starting.', modality: 'text' },
+  ];
+  assert.deepEqual(replayHistory(rows), [
+    { role: 'user', content: '10 reps\n60' },
+    { role: 'assistant', content: 'Solid first set. Rest is starting.' },
+  ]);
+});

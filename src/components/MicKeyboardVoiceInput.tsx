@@ -283,37 +283,14 @@ export const MicKeyboardVoiceInput = ({
     ],
   }));
 
-  const Toggle = ({ inline }: { inline: boolean }) => (
-    <View style={[styles.toggle, inline && styles.toggleInline]}>
-      <Animated.View
-        style={[
-          styles.toggleThumb,
-          inline && styles.toggleThumbInline,
-          thumbStyle,
-        ]}
-      />
-      <Pressable
-        style={[styles.toggleBtn, inline && styles.toggleBtnInline]}
-        onPress={switchToMic}
-        disabled={disabled || micDisabled}
-      >
-        <MicIcon
-          size={inline ? 14 : 15}
-          color={mode === "mic" ? colors.bg : "rgba(255,255,255,0.55)"}
-        />
-      </Pressable>
-      <Pressable
-        style={[styles.toggleBtn, inline && styles.toggleBtnInline]}
-        onPress={switchToKeyboard}
-        disabled={disabled}
-      >
-        <KeyboardIcon
-          size={inline ? 14 : 15}
-          color={mode === "keyboard" ? colors.bg : "rgba(255,255,255,0.55)"}
-        />
-      </Pressable>
-    </View>
-  );
+  const toggleProps = {
+    mode,
+    disabled,
+    micDisabled,
+    thumbStyle,
+    onMic: switchToMic,
+    onKeyboard: switchToKeyboard,
+  };
 
   return (
     <View style={[styles.wrap, disabled && styles.wrapDisabled]}>
@@ -353,7 +330,7 @@ export const MicKeyboardVoiceInput = ({
           pointerEvents={mode === "keyboard" ? "auto" : "none"}
         >
           <View style={styles.inputBar}>
-            <Toggle inline />
+            <ModeToggle inline {...toggleProps} />
             <TextInput
               style={styles.input}
               placeholder={value.trim() ? "Add anything else…" : placeholder}
@@ -389,7 +366,7 @@ export const MicKeyboardVoiceInput = ({
           pointerEvents={mode === "mic" ? "auto" : "none"}
         >
           <View style={styles.toggleRowSpacer} />
-          <Toggle inline={false} />
+          <ModeToggle inline={false} {...toggleProps} />
           <View style={styles.rowActions}>
             <Animated.View style={sendStyle}>
               <Pressable
@@ -414,6 +391,41 @@ export const MicKeyboardVoiceInput = ({
     </View>
   );
 };
+
+interface ModeToggleProps {
+  inline: boolean;
+  mode: Mode;
+  disabled: boolean;
+  micDisabled: boolean;
+  thumbStyle: React.ComponentProps<typeof Animated.View>["style"];
+  onMic: () => void;
+  onKeyboard: () => void;
+}
+
+const MIC_HIT_SLOP = { top: 10, bottom: 10, left: 8, right: 0 };
+const KEYBOARD_HIT_SLOP = { top: 10, bottom: 10, left: 0, right: 8 };
+
+const ModeToggle = ({ inline, mode, disabled, micDisabled, thumbStyle, onMic, onKeyboard }: ModeToggleProps) => (
+  <View style={[styles.toggle, inline && styles.toggleInline]}>
+    <Animated.View style={[styles.toggleThumb, inline && styles.toggleThumbInline, thumbStyle]} />
+    <Pressable
+      style={[styles.toggleBtn, inline && styles.toggleBtnInline]}
+      onPress={onMic}
+      disabled={disabled || micDisabled}
+      hitSlop={MIC_HIT_SLOP}
+    >
+      <MicIcon size={inline ? 14 : 15} color={mode === "mic" ? colors.bg : "rgba(255,255,255,0.55)"} />
+    </Pressable>
+    <Pressable
+      style={[styles.toggleBtn, inline && styles.toggleBtnInline]}
+      onPress={onKeyboard}
+      disabled={disabled}
+      hitSlop={KEYBOARD_HIT_SLOP}
+    >
+      <KeyboardIcon size={inline ? 14 : 15} color={mode === "keyboard" ? colors.bg : "rgba(255,255,255,0.55)"} />
+    </Pressable>
+  </View>
+);
 
 const styles = StyleSheet.create({
   wrap: {

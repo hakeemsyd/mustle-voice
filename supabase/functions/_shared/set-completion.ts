@@ -1,8 +1,7 @@
-const COMPLETION =
-  /\b(done|completed|finished|that'?s\s+it|that\s+was\s+it|racked|logged\s+it|in\s+the\s+bank)\b|(?<!\b(?:to|let'?s)\s)\bcomplete\b/i;
+import { describesPlannedSet, looksLikeFinishedSetReport } from './set-report.ts';
 
 export function hasSetCompletionSignal(text: string): boolean {
-  return COMPLETION.test(text ?? '');
+  return looksLikeFinishedSetReport(text ?? '');
 }
 
 export const COMPLETION_LOOKBACK_MS = 3 * 60 * 1000;
@@ -14,6 +13,7 @@ export async function userClaimedSetFinished(
   currentUserText: string | null,
 ): Promise<boolean> {
   if (currentUserText && hasSetCompletionSignal(currentUserText)) return true;
+  if (currentUserText && describesPlannedSet(currentUserText)) return false;
 
   const { data } = await supabase
     .from('message')

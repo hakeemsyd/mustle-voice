@@ -1,4 +1,4 @@
-import { createNavigationContainerRef } from '@react-navigation/native';
+import { StackActions, createNavigationContainerRef } from '@react-navigation/native';
 import type { RootStackParamList } from './types';
 
 export const navigationRef = createNavigationContainerRef<RootStackParamList>();
@@ -10,6 +10,8 @@ export function navigateFromAppAction(screen: string, params?: Record<string, un
   const navigate = navigationRef.navigate as (name: string, params?: object) => void;
 
   if (TAB_SCREENS.has(screen)) {
+    const root = navigationRef.getRootState();
+    if (root && root.routes[root.index]?.name !== 'Tabs') navigationRef.dispatch(StackActions.popTo('Tabs'));
     navigate('Tabs', { screen, params });
     return;
   }

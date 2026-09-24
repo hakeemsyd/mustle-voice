@@ -5,6 +5,8 @@
 // NOTE: tags are a reasonable first pass, NOT a clinical S&C review — flag for a coach/PT to
 // vet before launch. The validator only enforces what's tagged here, so accuracy matters.
 
+import { normalizeLoadScheme, referencesOneRepMax } from './load-intent.ts';
+
 export interface CatalogExercise {
   name: string;
   movementPattern: string;
@@ -160,8 +162,6 @@ export const CARDIO_EXERCISES = new Set(
 
 export const isCardioExercise = (name: string): boolean => CARDIO_EXERCISES.has(name.trim());
 
-const REFERENCES_ONE_REP_MAX = /1\s*RM/i;
-
 export const loadSchemeForExercise = (
   name: string,
   requested: string | null | undefined,
@@ -169,6 +169,6 @@ export const loadSchemeForExercise = (
 ): string | null => {
   if (isCardioExercise(name)) return null;
   if (isBodyweightExercise(name)) return 'bodyweight';
-  if (requested && REFERENCES_ONE_REP_MAX.test(requested) && !hasLoadHistory) return null;
-  return requested ?? null;
+  if (referencesOneRepMax(requested) && !hasLoadHistory) return null;
+  return requested ? normalizeLoadScheme(requested) : null;
 };
