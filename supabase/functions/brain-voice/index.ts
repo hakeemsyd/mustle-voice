@@ -9,7 +9,8 @@ import {
   MESSAGE_HISTORY_LIMIT,
 } from '../_shared/brain-config.ts';
 import { buildContextBlock, startOfLocalDayUtc } from '../_shared/brain-context.ts';
-import { createHandlers } from '../_shared/brain-handlers.ts';
+import { createHandlers, logSetFromServer, resolveDispute, undoLockFor } from '../_shared/brain-handlers.ts';
+import { describeDisputeOutcome, detectSetCountDispute } from '../_shared/set-dispute.ts';
 import { VOICE_TOOLS } from '../_shared/brain-tools.ts';
 import { buildLiveSessionSnapshot, describeLiveSessionSnapshot, LIVE_STATE_MAX_AGE_MS } from '../_shared/live-session-format.ts';
 import { resolveTurnText } from '../_shared/system-cue.ts';
@@ -20,7 +21,9 @@ import {
   describeCueFacts,
   describeResumedStart,
   isLiveStrengthSession,
+  describeUnconfirmedLog,
   resolveTurnSetOutcome,
+  TURN_NOTE_HEADER,
   type TurnSetOutcome,
 } from '../_shared/turn-set-outcome.ts';
 import {
@@ -33,8 +36,10 @@ import {
 } from '../_shared/claim-guard.ts';
 import { contextHasInjuryGate } from '../_shared/injury-context.ts';
 import {
+  CONFIRMS_BARE_REPS_FROM_VERSION,
   HOLDS_MISSING_WEIGHT_FROM_VERSION,
   looksLikeFinishedSetReport,
+  RESTATEMENT_RULE_FROM_VERSION,
   SHARED_PARSER_FROM_VERSION,
 } from '../_shared/set-report.ts';
 
@@ -79,7 +84,7 @@ const VOICE_ERROR_REPLY = "I'm having trouble reaching your plan right now — l
 // from whatever this function returns, so suppressing it has to happen here.
 const SILENCE_PLACEHOLDER = /^(?:silence|no response|no reply|nothing|\.{2,}|…)$/i;
 
-function isSilencePlaceholder(text: string): boolean {
+const isSilencePlaceholder = (text: string): boolean => {
   const bare = text
     .replace(/[[(][^\])]*[\])]/g, '')
     .replace(/\s+/g, ' ')
@@ -87,19 +92,19 @@ function isSilencePlaceholder(text: string): boolean {
     .replace(/[.!?,]+$/, '')
     .trim();
   return bare === '' || SILENCE_PLACEHOLDER.test(bare);
-}
+};
 
-function sanitizeForChat(text: string): string {
+const sanitizeForChat = (text: string): string => {
   return scrubInternalLanguage(dropSelfCorrection(dropLeadingConcession(text)))
     .replace(/\[\[SYSTEM_CUE\]\]\s*\S*/gi, '')
     .trim();
-}
+};
 
-function sanitizeForSpeech(text: string): string {
+const sanitizeForSpeech = (text: string): string => {
   return scrubInternalLanguage(dropSelfCorrection(dropLeadingConcession(verbalizeUnitsForSpeech(text))))
     .replace(/\[\[SYSTEM_CUE\]\]\s*\S*/gi, '')
     .replace(/\s*[—–]\s*/g, ', ');
-}
+};
 
 // Both userId and timezone travel in via the same MUSTLE_CONTEXT marker, embedded in the
 // ElevenLabs agent's system prompt template (dashboard-configured, not this repo) from
@@ -107,7 +112,7 @@ function sanitizeForSpeech(text: string): string {
 // timezone requires the dashboard template to actually include {{user_timezone}} in the marker,
 // same as it already does for {{user_id}}; until that's added there, this falls back to null and
 // buildContextBlock/createHandlers fall back to the stored profile value.
-function extractContext(messages: any[]): { userId: string | null; timezone: string | null } {
+const extractContext = (messages: any[]): { userId: string | null; timezone: string | null } => {
   const systemMessage = messages.find((m: any) => m?.role === 'system');
   const content = systemMessage?.content;
   const match = typeof content === 'string' ? content.match(USER_ID_MARKER) : null;
@@ -120,11 +125,11 @@ function extractContext(messages: any[]): { userId: string | null; timezone: str
   } catch {
     return { userId: null, timezone: null };
   }
-}
+};
 
 const SET_CONFIRMING_CUES = new Set(['set_logged', 'exercise_advanced']);
 
-async function prepareTurn(userId: string, userText: string, timezone: string | null, isFirstTurnOfCall: boolean) {
+const prepareTurn = async (userId: string, userText: string, timezone: string | null, isFirstTurnOfCall: boolean) => {
   const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
 
   const askedAt = new Date();
@@ -150,7 +155,7 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
           .order('at', { ascending: false })
           .order('role', { ascending: true })
           .limit(historyLimit);
-  const [{ data: history, error: historyError }, contextBlock, { data: liveRow }, { data: profileRow }] =
+  const [{ data: history, error: historyError }, contextBlock, { data: fetchedLiveRow }, { data: profileRow }] =
     await Promise.all([
       historyQuery,
       buildContextBlock(supabase, userId, timezone, isSystemCue ? null : userText),
@@ -160,7 +165,18 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
   console.log(`[voice-timing:server] prepareTurn: parallel fetch done, +${Date.now() - tPrepare0}ms`);
   if (historyError) throw new Error(`message fetch: ${historyError.message}`);
 
+  let liveRow = fetchedLiveRow;
   const isLiveStateFresh = !!liveRow && Date.now() - new Date(liveRow.updated_at).getTime() < LIVE_STATE_MAX_AGE_MS;
+  const dispute = !isSystemCue && isLiveStateFresh ? detectSetCountDispute(userText, liveRow!.state) : null;
+  const disputeResolution = dispute ? await resolveDispute(supabase, userId, dispute) : null;
+  if (disputeResolution === 'undone') {
+    const { data: refreshed } = await supabase
+      .from('live_session_state')
+      .select('state, updated_at')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (refreshed) liveRow = refreshed;
+  }
   const liveSnapshot = isLiveStateFresh ? buildLiveSessionSnapshot(liveRow!.state) : null;
   const units = profileRow?.unit_prefs === 'imperial' ? 'imperial' : 'metric';
   const liveBlock = liveSnapshot ? describeLiveSessionSnapshot(liveSnapshot, units) : null;
@@ -173,7 +189,8 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
     .slice(0, 3)
     .map((m: any) => ({ content: String(m.content ?? ''), at: m.at ?? null }));
   const clientParserVersion = Number((liveRow?.state as any)?.setParser ?? 1);
-  const setOutcome: TurnSetOutcome | null = isSystemCue
+  const phoneParsesSpeech = (liveRow?.state as any)?.parsing !== false;
+  let setOutcome: TurnSetOutcome | null = isSystemCue
     ? null
     : resolveTurnSetOutcome({
         userText,
@@ -181,18 +198,28 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
         units,
         lastCoachMessage: lastCoachRow ? { content: String(lastCoachRow.content ?? ''), at: lastCoachRow.at ?? null } : null,
         recentUserMessages,
-        legacyClient: clientParserVersion < SHARED_PARSER_FROM_VERSION,
-        holdsMissingWeight: clientParserVersion >= HOLDS_MISSING_WEIGHT_FROM_VERSION,
+        legacyClient: phoneParsesSpeech && clientParserVersion < SHARED_PARSER_FROM_VERSION,
+        holdsMissingWeight: !phoneParsesSpeech || clientParserVersion >= HOLDS_MISSING_WEIGHT_FROM_VERSION,
+        appliesRestatementRule: !phoneParsesSpeech || clientParserVersion >= RESTATEMENT_RULE_FROM_VERSION,
+        confirmsBareReps: !phoneParsesSpeech || clientParserVersion >= CONFIRMS_BARE_REPS_FROM_VERSION,
       });
+  if (setOutcome?.kind === 'logged' && setOutcome.set && !phoneParsesSpeech) {
+    const landed = await logSetFromServer(supabase, userId, setOutcome.set, userText);
+    if (!landed) setOutcome = { kind: 'not_logged', note: describeUnconfirmedLog() };
+  }
   const resumeNote = isSessionStart ? describeResumedStart(liveSnapshot, units) : null;
   const cueFacts = describeCueFacts(cueName, liveSnapshot, units);
-  const contextParts = [contextBlock, liveBlock, setOutcome?.note, resumeNote, cueFacts].filter(Boolean);
+  const turnNote =
+    dispute && disputeResolution
+      ? describeDisputeOutcome(dispute, disputeResolution, TURN_NOTE_HEADER, liveSnapshot ? liveSnapshot.status === 'resting' : null)
+      : setOutcome?.note;
+  const contextParts = [contextBlock, liveBlock, turnNote, resumeNote, cueFacts].filter(Boolean);
   const fullContextBlock = contextParts.join('\n\n');
 
   const tracked = trackToolOutcomes(
     createHandlers(supabase, userId, timezone, {
       currentUserText: userText,
-      appLoggedThisTurn: setOutcome?.kind === 'logged' || (cueName !== null && SET_CONFIRMING_CUES.has(cueName)),
+      undoLock: undoLockFor(disputeResolution),
     }),
   );
   const handlers = tracked.handlers;
@@ -201,10 +228,9 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
   const guardState = (): ClaimGuardState => ({
     liveSession,
     injuryOnFile,
-    setLoggedThisTurn:
-      setOutcome?.kind === 'logged' || (cueName !== null && SET_CONFIRMING_CUES.has(cueName)) || tracked.outcomes.setLogged,
+    setLoggedThisTurn: setOutcome?.kind === 'logged' || (cueName !== null && SET_CONFIRMING_CUES.has(cueName)),
     restActive: liveSnapshot?.status === 'resting',
-    actionSucceededThisTurn: tracked.outcomes.actionSucceeded,
+    actionSucceededThisTurn: tracked.outcomes.actionSucceeded || disputeResolution === 'undone',
   });
   const fallbackReply = claimFallback(liveSession, !isSystemCue && looksLikeFinishedSetReport(userText), injuryOnFile);
 
@@ -237,16 +263,21 @@ async function prepareTurn(userId: string, userText: string, timezone: string | 
   };
   console.log(`[voice-timing:server] prepareTurn: done, +${Date.now() - tPrepare0}ms total`);
   if (setOutcome) console.log(`[brain-voice] set outcome for this turn: ${setOutcome.kind}`);
+  if (dispute) {
+    console.log(
+      `[brain-voice] set-count dispute on ${dispute.exerciseName}: ${dispute.done} -> ${dispute.targetDone}, ${disputeResolution}`,
+    );
+  }
 
   return { supabase, handlers, turnMessages, systemPrompt, askedAt, guardState, fallbackReply };
-}
+};
 
-function guardReply(reply: string, state: ClaimGuardState, fallback: string): string {
+const guardReply = (reply: string, state: ClaimGuardState, fallback: string): string => {
   const { text, dropped } = guardClaims(reply, state);
   if (dropped.length === 0) return reply;
   console.warn('[brain-voice] dropped unbacked claims:', dropped.join(' | '));
   return text || fallback;
-}
+};
 
 // ElevenLabs calls this function more than once for a single spoken turn — first on a preliminary
 // transcript, then again on the corrected one — and only the last reply is ever spoken. Confirmed
@@ -273,14 +304,14 @@ const turnTokens = (text: string): string[] =>
 // ("set one done eight reps" -> "set one done eight reps of 50 kg"), which Jaccard scores far too
 // low to catch. Deliberately tight enough that consecutive real sets stay distinct — "set two done
 // eight reps" against "set one done eight reps" scores 0.8 and is left alone.
-function turnContainment(a: string, b: string): number {
+const turnContainment = (a: string, b: string): number => {
   const first = new Set(turnTokens(a));
   const second = new Set(turnTokens(b));
   if (first.size === 0 || second.size === 0) return 0;
   let shared = 0;
   for (const token of first) if (second.has(token)) shared += 1;
   return shared / Math.min(first.size, second.size);
-}
+};
 
 // The delete below keeps the stored record clean, but it runs after the reply has already been
 // generated, so on its own it never stopped the model *seeing* the turn it supersedes. Confirmed
@@ -288,7 +319,7 @@ function turnContainment(a: string, b: string): number {
 // have set two logged", because prepareTurn had fetched history before the cleanup ran. This
 // filters the same pair out of the replayed history instead, so the corrected transcript is the
 // only version of that turn the model is ever shown.
-function dropSupersededFromHistory(ordered: any[], userText: string): any[] {
+const dropSupersededFromHistory = (ordered: any[], userText: string): any[] => {
   if (userText.startsWith(SYSTEM_CUE_PREFIX)) return ordered;
   if (turnTokens(userText).length < SUPERSEDED_TURN_MIN_TOKENS) return ordered;
   for (let i = ordered.length - 1; i >= 0; i--) {
@@ -302,9 +333,9 @@ function dropSupersededFromHistory(ordered: any[], userText: string): any[] {
     return ordered.slice(0, i);
   }
   return ordered;
-}
+};
 
-async function dropSupersededTurn(supabase: any, userId: string, userText: string, askedAt: Date) {
+const dropSupersededTurn = async (supabase: any, userId: string, userText: string, askedAt: Date) => {
   const { data, error } = await supabase
     .from('message')
     .select('id, role, content, at')
@@ -335,16 +366,16 @@ async function dropSupersededTurn(supabase: any, userId: string, userText: strin
     return;
   }
   console.log(`[brain-voice] dropped superseded turn (${supersededIds.length} rows): ${lastUser.content}`);
-}
+};
 
-async function logConversation(
+const logConversation = async (
   supabase: any,
   userId: string,
   userText: string,
   askedAt: Date,
   rawReply: string,
   turnBlocks: any[],
-) {
+) => {
   const strippedReply = stripSystemNote(rawReply);
   const reply = isSilencePlaceholder(strippedReply) ? '' : sanitizeForChat(strippedReply);
   const repliedAt = new Date(Math.max(Date.now(), askedAt.getTime() + 1));
@@ -370,7 +401,7 @@ async function logConversation(
     },
   ]);
   if (error) console.error('[brain-voice] failed to log conversation:', error.message);
-}
+};
 
 // A row older than this is from an invocation that crashed or got killed before its `finally`
 // could clean up — treated as abandoned so a genuinely stuck lock can't wedge a user's voice
@@ -397,7 +428,7 @@ const TURN_LOCK_LEADER_GRACE_MS = 20_000;
 // rate-limit budget, making every one of them slower and provoking still more retries. Only the
 // first request for a user's turn (the "leader") is allowed to actually call Anthropic; anything
 // else arriving while that row exists is a retry of the same turn, not a new one.
-async function claimTurnLock(supabase: any, userId: string): Promise<boolean> {
+const claimTurnLock = async (supabase: any, userId: string): Promise<boolean> => {
   await supabase
     .from('voice_turn_inflight')
     .delete()
@@ -405,17 +436,17 @@ async function claimTurnLock(supabase: any, userId: string): Promise<boolean> {
     .lt('started_at', new Date(Date.now() - TURN_LOCK_STALE_MS).toISOString());
   const { error } = await supabase.from('voice_turn_inflight').insert({ user_id: userId });
   return !error;
-}
+};
 
-async function releaseTurnLock(supabase: any, userId: string): Promise<void> {
+const releaseTurnLock = async (supabase: any, userId: string): Promise<void> => {
   await supabase.from('voice_turn_inflight').delete().eq('user_id', userId);
-}
+};
 
 // Polls for the leader's row to disappear (it deletes its own lock in a `finally` once
 // logConversation has written the real reply), then reads that reply back rather than generating
 // a second one — gated to messages no older than TURN_LOCK_LEADER_GRACE_MS before this follower's
 // own arrival, so a stale row from a killed invocation can't hand back an unrelated old reply.
-async function waitForLeaderReply(supabase: any, userId: string, followerArrivedAt: number): Promise<string | null> {
+const waitForLeaderReply = async (supabase: any, userId: string, followerArrivedAt: number): Promise<string | null> => {
   const deadline = Date.now() + TURN_LOCK_WAIT_MS;
   const notBefore = new Date(followerArrivedAt - TURN_LOCK_LEADER_GRACE_MS).toISOString();
   while (Date.now() < deadline) {
@@ -442,9 +473,9 @@ async function waitForLeaderReply(supabase: any, userId: string, followerArrived
   }
   console.log('[voice-timing:server] follower: gave up waiting for leader');
   return null;
-}
+};
 
-function sseChunk(id: string, model: string, delta: { role?: string; content?: string }, finishReason: string | null) {
+const sseChunk = (id: string, model: string, delta: { role?: string; content?: string }, finishReason: string | null) => {
   const payload = {
     id,
     object: 'chat.completion.chunk',
@@ -453,14 +484,14 @@ function sseChunk(id: string, model: string, delta: { role?: string; content?: s
     choices: [{ index: 0, delta, finish_reason: finishReason }],
   };
   return `data: ${JSON.stringify(payload)}\n\n`;
-}
+};
 
-async function resolveReplyBuffered(
+const resolveReplyBuffered = async (
   userId: string | null,
   userText: string,
   timezone: string | null,
   isFirstTurnOfCall: boolean,
-): Promise<string> {
+): Promise<string> => {
   if (!userId || userText.trim() === '') return NO_IDENTITY_REPLY;
 
   // TEMPORARY — voice-timing instrumentation. Remove once the slow phase is identified.
@@ -484,7 +515,7 @@ async function resolveReplyBuffered(
     console.error('[brain-voice] error:', err);
     return VOICE_ERROR_REPLY;
   }
-}
+};
 
 Deno.serve(async (req) => {
   if (req.headers.get('x-mustle-secret') !== SHARED_SECRET) {

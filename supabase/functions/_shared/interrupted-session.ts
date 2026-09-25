@@ -1,17 +1,27 @@
-// A workout that never got a formal end (app closed, killed, or just abandoned mid-session)
-// leaves its live_session_state row sitting there indefinitely — nothing else ever closes it.
-// Called once near the start of every brain/brain-voice request: if that row has gone stale
-// (LIVE_STATE_MAX_AGE_MS, see live-session-format.ts), whatever sets were actually logged get
-// preserved as a real workout_log row (status 'interrupted') and the live row is cleared, so the
-// coach can ask what happened on the user's next turn rather than the session sitting "active"
-// for hours. A session with zero logged sets (and, for cardio, zero elapsed time) is discarded
-// silently — there's nothing to ask about, matching the same "don't save a workout nobody did"
-// rule the manual Workout Done path already follows.
-export async function finalizeStaleLiveSession(
+const LEGACY_ROW_LOOKBACK_MS = 18 * 60 * 60 * 1000;
+
+const findExistingRowId = async (supabase: any, userId: string, state: any, startedAt: string): Promise<string | null> => {
+  if (typeof state.workoutLogId === 'string' && state.workoutLogId) return state.workoutLogId;
+  const planSessionId = state.target?.type === 'strength' ? state.target.planSessionId : null;
+  if (!planSessionId) return null;
+  const { data } = await supabase
+    .from('workout_log')
+    .select('id')
+    .eq('user_id', userId)
+    .eq('plan_session_id', planSessionId)
+    .in('status', ['partial', 'interrupted'])
+    .gte('at', new Date(new Date(startedAt).getTime() - LEGACY_ROW_LOOKBACK_MS).toISOString())
+    .order('at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  return data?.id ?? null;
+};
+
+export const finalizeStaleLiveSession = async (
   supabase: any,
   userId: string,
   maxAgeMs: number,
-): Promise<{ finalized: boolean; workoutLogId: string | null }> {
+): Promise<{ finalized: boolean; workoutLogId: string | null }> => {
   const { data: liveRow } = await supabase
     .from('live_session_state')
     .select('state, updated_at')
@@ -47,19 +57,23 @@ export async function finalizeStaleLiveSession(
     if (exercisesDone.length === 0) return { finalized: false, workoutLogId: null };
   }
 
-  // Stamped with when the workout actually happened, not when this cleanup happened to run.
-  // `at` was previously left to default to now(), so a Friday-night session abandoned without a
-  // formal end was logged on whatever later day the next brain request finalized it — confirmed
-  // live: a Friday workout showed as "Last time (Today)" on Sunday. That timestamp is not just a
-  // label: Calendar buckets by it, the streak counts off it, and a flexible rotation advances
-  // from the last logged session, so a misdated row moves the whole schedule. `startedAt` is
-  // written into live_session_state by ActiveSessionScreen for exactly this reason. Falling back
-  // to updated_at (the last time the session was genuinely touched) is still far closer to the
-  // truth than now(); only a row predating this field has neither.
   const startedAt =
     typeof state.startedAt === 'string' && !Number.isNaN(Date.parse(state.startedAt))
       ? state.startedAt
       : liveRow.updated_at;
+
+  const existingId = await findExistingRowId(supabase, userId, state, startedAt);
+  if (existingId) {
+    const { data: updated, error: updateError } = await supabase
+      .from('workout_log')
+      .update({ status: 'interrupted', duration_sec: state.elapsedSec ?? 0, exercises_done: exercisesDone })
+      .eq('id', existingId)
+      .eq('user_id', userId)
+      .select('id')
+      .maybeSingle();
+    if (updateError) console.error('[interrupted-session] failed to mark session interrupted:', updateError.message);
+    if (updated?.id) return { finalized: true, workoutLogId: updated.id };
+  }
 
   const { data, error } = await supabase
     .from('workout_log')
@@ -84,4 +98,4 @@ export async function finalizeStaleLiveSession(
     return { finalized: false, workoutLogId: null };
   }
   return { finalized: true, workoutLogId: data?.id ?? null };
-}
+};

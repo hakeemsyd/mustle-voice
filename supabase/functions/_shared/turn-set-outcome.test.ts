@@ -5,7 +5,6 @@ import {
   describeCueFacts,
   describeResumedStart,
   describeTypedTurnSetOutcome,
-  resolveToolSetWeight,
   resolveTurnSetOutcome,
 } from './turn-set-outcome.ts';
 import { guardClaims, isSuccessfulToolResult, isUnbackedClaim, type ClaimGuardState } from './claim-guard.ts';
@@ -59,7 +58,7 @@ test("Damion's push-up turn: the app logs it and the coach is told so", () => {
   assert.deepEqual(result?.set, { weight: null, reps: 10 });
   assert.match(result!.note, /LOGGED this message as set 1 of 4 on Push-up: 10 reps/);
   assert.match(result!.note, /rest has started/);
-  assert.match(result!.note, /Do not call log_live_set/);
+  assert.match(result!.note, /Do not ask them to confirm it/);
 });
 
 test("Damion's follow-up 'I just did ten' also logs", () => {
@@ -99,7 +98,7 @@ test('counting out loud is never a set', () => {
 test('a completion without numbers asks for the reps', () => {
   const result = outcome('Done.');
   assert.equal(result?.kind, 'needs_details');
-  assert.match(result!.note, /how many reps/);
+  assert.match(result!.note, /How many reps did you get\?/);
 });
 
 test('the last set of an exercise names the next one, not rest', () => {
@@ -326,19 +325,4 @@ test('a bare "at 60" is read as the weight in their units', () => {
   const result = outcome('I just did 10 reps at 60.', backSquat(), holds);
   assert.equal(result?.kind, 'logged');
   assert.deepEqual(result?.set, { weight: 27.2, reps: 10 });
-});
-
-test("the coach's own logging tool carries the last weight instead of saving bodyweight", () => {
-  assert.deepEqual(resolveToolSetWeight(backSquat([{ weight: 29.5, reps: 8 }]), null, false), { weight: 29.5 });
-  assert.deepEqual(
-    resolveToolSetWeight(backSquat([], { statedWeight: { exerciseIndex: 0, weight: 29.5 } }), null, false),
-    { weight: 29.5 },
-  );
-  assert.deepEqual(resolveToolSetWeight(backSquat([{ weight: 29.5, reps: 8 }]), 34, false), { weight: 34 });
-});
-
-test("the coach's logging tool refuses a loaded lift with no known weight, never bodyweight work", () => {
-  assert.deepEqual(resolveToolSetWeight(backSquat(), null, false), { needsWeightFor: 'Back Squat' });
-  assert.deepEqual(resolveToolSetWeight(pushUps(), null, false), { weight: null });
-  assert.deepEqual(resolveToolSetWeight(backSquat(), null, true), { weight: null });
 });

@@ -2,6 +2,8 @@ import { humanizeFocus } from './humanize.ts';
 import { convertLoadScheme } from './load-scheme.ts';
 import { isTimedExercise } from './exercise-catalog.ts';
 import { normalizeLoadScheme } from './load-intent.ts';
+import { kgToLb } from './weight-units.ts';
+import { describeSetProvenance, type ProvenancedSet } from './set-dispute.ts';
 // Server-side port of src/session/liveSessionState.ts's buildLiveSessionSnapshot/
 // describeLiveSessionSnapshot — kept in sync manually since Supabase Edge Functions only bundle
 // supabase/functions/, the same reason resolveTodaySession/estimateRestSeconds are duplicated
@@ -14,11 +16,7 @@ import { normalizeLoadScheme } from './load-intent.ts';
 // threshold, not just a "stop treating it as live" cutoff.
 export const LIVE_STATE_MAX_AGE_MS = 60 * 60 * 1000;
 
-interface LoggedSet {
-  weight: number | null;
-  reps: number;
-  unit?: 'seconds';
-}
+type LoggedSet = ProvenancedSet;
 
 interface SessionExercise {
   id: string;
@@ -50,6 +48,9 @@ export interface LiveSessionSnapshot {
   upcomingExercises: string[];
   restTargetSec: number | null;
   restRemainingSec: number | null;
+  restOverrideSec?: number | null;
+  lastSetLoggedAt?: number | null;
+  restFinishedAt?: number | null;
 }
 
 export interface SnapshotInput {
@@ -66,9 +67,16 @@ export interface SnapshotInput {
   paused: boolean;
   elapsedSec: number;
   statedWeight?: { exerciseIndex: number; weight: number } | null;
+  restOverrideSec?: number | null;
+  restFinishedAt?: number | null;
 }
 
-export function buildLiveSessionSnapshot(input: SnapshotInput): LiveSessionSnapshot | null {
+const latestSetTime = (loggedSets: LoggedSet[][]): number | null => {
+  const times = (loggedSets ?? []).flat().map((set) => set?.at).filter((at): at is number => typeof at === 'number');
+  return times.length > 0 ? Math.max(...times) : null;
+};
+
+export const buildLiveSessionSnapshot = (input: SnapshotInput): LiveSessionSnapshot | null => {
   if (!input.target) return null;
 
   const current = input.exercises[input.currentExerciseIndex] ?? null;
@@ -101,19 +109,22 @@ export function buildLiveSessionSnapshot(input: SnapshotInput): LiveSessionSnaps
       .map((e) => `${e.name} (${e.sets} sets of ${e.repScheme}${e.loadScheme ? `, ${normalizeLoadScheme(e.loadScheme)}` : ''})`),
     restTargetSec: input.resting ? input.restTargetSec : null,
     restRemainingSec,
+    restOverrideSec: typeof input.restOverrideSec === 'number' ? input.restOverrideSec : null,
+    lastSetLoggedAt: latestSetTime(input.loggedSets),
+    restFinishedAt: typeof input.restFinishedAt === 'number' ? input.restFinishedAt : null,
   };
-}
+};
 
 const formatWeight = (kg: number, units: 'metric' | 'imperial'): string =>
-  units === 'imperial' ? `${Math.round(kg * 2.20462 * 10) / 10} lb` : `${kg} kg`;
+  units === 'imperial' ? `${kgToLb(kg)} lb` : `${kg} kg`;
 
 const formatDuration = (seconds: number): string =>
   seconds >= 60 && seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds}s held`;
 
-export function describeLiveSessionSnapshot(
+export const describeLiveSessionSnapshot = (
   snapshot: LiveSessionSnapshot,
   units: 'metric' | 'imperial' = 'metric',
-): string {
+): string => {
   if (snapshot.target.type === 'cardio') {
     return (
       `Live session state: cardio (${snapshot.target.activity}), ${snapshot.status}, ` +
@@ -128,16 +139,12 @@ export function describeLiveSessionSnapshot(
 
   if (snapshot.currentExercise) {
     const c = snapshot.currentExercise;
-    const loggedDesc =
-      c.loggedSets.length > 0
-        ? c.loggedSets
-            .map((s) =>
-              s.unit === 'seconds'
-                ? formatDuration(s.reps)
-                : `${s.weight != null ? formatWeight(s.weight, units) : 'bodyweight'}×${s.reps}`,
-            )
-            .join(', ')
-        : 'none yet';
+    const provenance = describeSetProvenance(c.loggedSets, (s) =>
+      s.unit === 'seconds'
+        ? formatDuration(s.reps)
+        : `${s.weight != null ? formatWeight(s.weight, units) : 'bodyweight'}×${s.reps}`,
+    );
+    const loggedDesc = c.loggedSets.length > 0 ? provenance.list : 'none yet';
     const done = c.loggedSets.length;
     const remaining = Math.max(0, c.totalSets - done);
     // Spelled out as completed-vs-remaining rather than a bare "set N of M" ordinal. Confirmed
@@ -187,8 +194,13 @@ export function describeLiveSessionSnapshot(
         `immediately on the first correction — don't defend a claim this block already disproves.`,
     );
     lines.push(`- Loads logged so far on this exercise: ${loggedDesc}.`);
+    if (provenance.warning) lines.push(provenance.warning);
   } else {
     lines.push('- No current exercise (session not yet loaded or already finished).');
+  }
+
+  if (snapshot.restOverrideSec) {
+    lines.push(`- They asked for ${snapshot.restOverrideSec}s rests: every rest from here on is ${snapshot.restOverrideSec}s.`);
   }
 
   if (snapshot.status === 'resting' && snapshot.restRemainingSec !== null) {
@@ -214,7 +226,8 @@ export function describeLiveSessionSnapshot(
     'Count sets ONLY from this block. Announcing a set is not the same as the user performing it, ' +
     'and neither is acknowledging one you misheard — your own earlier turns are not a record of ' +
     'what happened, this block is. If it disagrees with something you said a minute ago, this ' +
-    'block is right and you were wrong.',
+    'block is right and you were wrong. The one exception: if the user says the app counted a set ' +
+    'they did not do, believe them over this block and call undo_last_set.',
   );
 
   lines.push(
@@ -229,4 +242,4 @@ export function describeLiveSessionSnapshot(
   );
 
   return lines.join('\n');
-}
+};

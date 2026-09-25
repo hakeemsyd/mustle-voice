@@ -12,7 +12,8 @@ import { validatePlan, explainViolations, forbiddenTags, type Injury } from './i
 import { injuryDirective } from './injury-context.ts';
 import { validateSplit, explainSplitProblems } from './split-validator.ts';
 import { APP_LINE_MODALITY } from './replay-history.ts';
-import { resolveToolSetWeight } from './turn-set-outcome.ts';
+import { kgToLb } from './weight-units.ts';
+import type { DisputeResolution, SetCountDispute } from './set-dispute.ts';
 import { matchSessionExercise } from './session-navigation.ts';
 import { findInventedRepTargets } from './rep-target.ts';
 import { computeNutritionTargets, computeBodyFatGoal, type GoalObjective } from './nutrition.ts';
@@ -25,7 +26,6 @@ import {
   fetchDayOverrideSession,
 } from './brain-context.ts';
 import { buildLiveSessionSnapshot, LIVE_STATE_MAX_AGE_MS, type LiveSessionSnapshot } from './live-session-format.ts';
-import { userClaimedSetFinished } from './set-completion.ts';
 import { buildLoadHistory } from './load-history.ts';
 import {
   CONSULTATION_TOPICS,
@@ -56,36 +56,36 @@ const STOP_WORDS = new Set(['and', 'with', 'a', 'an', 'the', 'some', 'of', 'for'
 // the edge function runs in a separate Deno runtime from the RN app. Rest duration isn't stored
 // per plan_exercise (no such column), so show_daily_workout estimates it the same way Active
 // Session does before any set has actually been logged.
-function targetRepsFrom(repScheme: string): number | null {
+const targetRepsFrom = (repScheme: string): number | null => {
   const numbers = repScheme.match(/\d+/g);
   if (!numbers || numbers.length === 0) return null;
   return Math.max(...numbers.map(Number));
-}
-function estimateRestSeconds(repScheme: string | null): number {
+};
+const estimateRestSeconds = (repScheme: string | null): number => {
   const target = repScheme ? targetRepsFrom(repScheme) : null;
   if (target === null) return 90;
   if (target <= 6) return 150;
   if (target <= 12) return 90;
   return 60;
-}
+};
 
 // ── Stats snapshot — mirrors src/hooks/useStatsData.ts's formulas exactly (performance score,
 // readiness, top lifts, volume) so these chat cards never disagree with what the Stats tab
 // itself shows. Duplicated here for the same cross-runtime reason as estimateRestSeconds above.
-function parseCsvNumbers(value: string): number[] {
+const parseCsvNumbers = (value: string): number[] => {
   return value
     .split(',')
     .map((v) => parseFloat(v))
     .filter((v) => Number.isFinite(v));
-}
-function dayKey(d: Date): string {
+};
+const dayKey = (d: Date): string => {
   return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
-}
+};
 
-function topSetLabelFor(
+const topSetLabelFor = (
   exercisesDone: { name: string; sets?: number; reps: string; load: string }[],
   units: 'metric' | 'imperial' = 'metric',
-): string {
+): string => {
   let bestLoaded: { name: string; weight: number; reps: number } | null = null;
   let bestBodyweight: { name: string; reps: number } | null = null;
   for (const ex of exercisesDone) {
@@ -106,13 +106,13 @@ function topSetLabelFor(
   if (bestLoaded) {
     const weight =
       units === 'imperial'
-        ? `${Math.round(bestLoaded.weight * 2.20462 * 10) / 10} lb`
+        ? `${kgToLb(bestLoaded.weight)} lb`
         : `${bestLoaded.weight} kg`;
     return `${bestLoaded.name} · ${weight} × ${bestLoaded.reps}`;
   }
   if (bestBodyweight) return `${bestBodyweight.name} · ${bestBodyweight.reps} reps`;
   return '';
-}
+};
 
 interface WorkoutLogRow {
   at: string;
@@ -120,7 +120,7 @@ interface WorkoutLogRow {
   exercises_done: { name: string; reps: string; load: string }[];
 }
 
-async function computeStatsSnapshot(supabase: any, userId: string, timezone: string | null) {
+const computeStatsSnapshot = async (supabase: any, userId: string, timezone: string | null) => {
   const ninetyDaysAgo = new Date(Date.now() - 90 * 86_400_000);
   const [{ data: plan }, { data: workoutRows }, { data: foodRows }, { data: nutrition }] = await Promise.all([
     supabase
@@ -313,22 +313,22 @@ async function computeStatsSnapshot(supabase: any, userId: string, timezone: str
       { label: 'Fat', target: nutrition?.fat_g ?? 0, current: Math.round(fatToday), unit: 'g' },
     ],
   };
-}
+};
 
-export function significantWords(text: string): Set<string> {
+export const significantWords = (text: string): Set<string> => {
   return new Set(
     String(text ?? '')
       .toLowerCase()
       .split(/[^a-z0-9]+/)
       .filter((w) => w.length > 1 && !STOP_WORDS.has(w)),
   );
-}
+};
 
 // Confirmed live: a correction ("actually make that 4 egg whites") reaches log_food with
 // different numbers than the original, so an exact-match check lets it straight through and
 // creates a second row for the same meal. This catches "same meal, re-described" by word
 // overlap instead of requiring byte-identical values.
-export function looksLikeSameMeal(a: string, b: string): boolean {
+export const looksLikeSameMeal = (a: string, b: string): boolean => {
   const wa = significantWords(a);
   const wb = significantWords(b);
   if (wa.size === 0 || wb.size === 0) return false;
@@ -336,12 +336,12 @@ export function looksLikeSameMeal(a: string, b: string): boolean {
   for (const w of wa) if (wb.has(w)) shared += 1;
   const union = new Set([...wa, ...wb]).size;
   return shared / union >= 0.4;
-}
+};
 
-async function writeAppAction(supabase: any, userId: string, type: string, payload: Record<string, unknown>) {
+const writeAppAction = async (supabase: any, userId: string, type: string, payload: Record<string, unknown>) => {
   const { error } = await supabase.from('app_action').insert({ user_id: userId, type, payload });
   if (error) throw new Error(`app_action insert: ${error.message}`);
-}
+};
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -349,7 +349,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 // client hadn't necessarily picked it up, run session.start(), and published live_session_state
 // yet, so the reply could claim the workout was live before it actually was. Polls briefly for
 // the client's own confirmation instead of trusting the queue write.
-async function waitForLiveSessionStart(supabase: any, userId: string, after: string): Promise<boolean> {
+const waitForLiveSessionStart = async (supabase: any, userId: string, after: string): Promise<boolean> => {
   for (let i = 0; i < 6; i++) {
     await sleep(250);
     const { data } = await supabase
@@ -360,7 +360,7 @@ async function waitForLiveSessionStart(supabase: any, userId: string, after: str
     if (data && new Date(data.updated_at).getTime() >= new Date(after).getTime()) return true;
   }
   return false;
-}
+};
 
 interface LiveSessionRead {
   state: any;
@@ -368,7 +368,7 @@ interface LiveSessionRead {
   running: boolean;
 }
 
-async function readLiveSession(supabase: any, userId: string): Promise<LiveSessionRead> {
+const readLiveSession = async (supabase: any, userId: string): Promise<LiveSessionRead> => {
   const { data } = await supabase
     .from('live_session_state')
     .select('updated_at, state')
@@ -381,12 +381,12 @@ async function readLiveSession(supabase: any, userId: string): Promise<LiveSessi
     snapshot,
     running: !!snapshot && snapshot.status !== 'finished',
   };
-}
+};
 
 const totalLoggedSets = (state: any): number =>
   ((state?.loggedSets ?? []) as unknown[][]).reduce((n, sets) => n + (Array.isArray(sets) ? sets.length : 0), 0);
 
-async function waitForLoggedSetTotal(supabase: any, userId: string, atLeast: number): Promise<boolean> {
+const waitForLoggedSetTotal = async (supabase: any, userId: string, atLeast: number): Promise<boolean> => {
   for (let i = 0; i < 8; i++) {
     await sleep(250);
     const { data } = await supabase.from('live_session_state').select('state').eq('user_id', userId).maybeSingle();
@@ -394,18 +394,62 @@ async function waitForLoggedSetTotal(supabase: any, userId: string, atLeast: num
     if (data.state?.ended || totalLoggedSets(data.state) >= atLeast) return true;
   }
   return false;
-}
+};
 
-async function waitForLoggedSetTotalBelow(supabase: any, userId: string, before: number): Promise<boolean> {
+const waitForLiveState = async (supabase: any, userId: string, landed: (state: any) => boolean): Promise<boolean> => {
   for (let i = 0; i < 8; i++) {
     await sleep(250);
     const { data } = await supabase.from('live_session_state').select('state').eq('user_id', userId).maybeSingle();
-    if (data && totalLoggedSets(data.state) < before) return true;
+    if (data && landed(data.state)) return true;
   }
   return false;
-}
+};
 
-async function waitForExerciseAt(supabase: any, userId: string, name: string): Promise<boolean> {
+export const logSetFromServer = async (
+  supabase: any,
+  userId: string,
+  set: { weight: number | null; reps: number; unit?: 'seconds' },
+  sourceText: string,
+): Promise<boolean> => {
+  const live = await readLiveSession(supabase, userId);
+  if (!live.running) return false;
+  const before = totalLoggedSets(live.state);
+  await writeAppAction(supabase, userId, 'log_set', {
+    reps: set.reps,
+    weight_kg: set.weight,
+    unit: set.unit ?? null,
+    source_text: sourceText,
+  });
+  return waitForLoggedSetTotal(supabase, userId, before + 1);
+};
+
+export type UndoLastSetResult = 'undone' | 'not_confirmed' | 'no_session' | 'no_set_to_undo';
+
+export const undoLastLiveSet = async (
+  supabase: any,
+  userId: string,
+): Promise<{ status: UndoLastSetResult; setsLoggedNow: number | null }> => {
+  const live = await readLiveSession(supabase, userId);
+  if (!live.running) return { status: 'no_session', setsLoggedNow: null };
+  const before = totalLoggedSets(live.state);
+  if (before === 0) return { status: 'no_set_to_undo', setsLoggedNow: 0 };
+  await writeAppAction(supabase, userId, 'undo_last_set', {});
+  const landed = await waitForLiveState(supabase, userId, (state) => totalLoggedSets(state) < before);
+  return landed ? { status: 'undone', setsLoggedNow: before - 1 } : { status: 'not_confirmed', setsLoggedNow: before };
+};
+
+export const resolveDispute = async (
+  supabase: any,
+  userId: string,
+  dispute: SetCountDispute,
+): Promise<DisputeResolution> => {
+  if (dispute.matches) return 'confirmed';
+  if (!dispute.autoUndo) return 'manual';
+  const { status } = await undoLastLiveSet(supabase, userId);
+  return status === 'undone' ? 'undone' : status === 'not_confirmed' ? 'not_confirmed' : 'manual';
+};
+
+const waitForExerciseAt = async (supabase: any, userId: string, name: string): Promise<boolean> => {
   const wanted = name.trim().toLowerCase();
   for (let i = 0; i < 8; i++) {
     await sleep(250);
@@ -415,9 +459,9 @@ async function waitForExerciseAt(supabase: any, userId: string, name: string): P
     if (String(current?.name ?? '').toLowerCase() === wanted || names.includes(wanted)) return true;
   }
   return false;
-}
+};
 
-async function waitForExerciseIndex(supabase: any, userId: string, index: number): Promise<boolean> {
+const waitForExerciseIndex = async (supabase: any, userId: string, index: number): Promise<boolean> => {
   for (let i = 0; i < 6; i++) {
     await sleep(250);
     const { data } = await supabase
@@ -428,9 +472,9 @@ async function waitForExerciseIndex(supabase: any, userId: string, index: number
     if (data?.state?.currentExerciseIndex === index) return true;
   }
   return false;
-}
+};
 
-async function fetchActiveInjuries(supabase: any, userId: string): Promise<Injury[]> {
+const fetchActiveInjuries = async (supabase: any, userId: string): Promise<Injury[]> => {
   const { data, error } = await supabase
     .from('injury')
     .select('area,status')
@@ -438,22 +482,22 @@ async function fetchActiveInjuries(supabase: any, userId: string): Promise<Injur
     .eq('status', 'active');
   if (error) throw new Error(`fetch injuries: ${error.message}`);
   return data ?? [];
-}
+};
 
-async function resolveExercises(supabase: any, names: string[]) {
+const resolveExercises = async (supabase: any, names: string[]) => {
   const { data, error } = await supabase.from('exercise').select('id,name,contraindicated_for').in('name', names);
   if (error) throw new Error(`resolve exercises: ${error.message}`);
   const byName = new Map<string, { id: string; contraindicated_for: string[] }>();
   for (const row of data ?? []) byName.set(row.name, row);
   return byName;
-}
+};
 
-async function writePlan(
+const writePlan = async (
   supabase: any,
   userId: string,
   plan: any,
   options: { confirmSecret?: string; requireConfirm?: boolean } = {},
-) {
+) => {
   const names = plan.sessions.flatMap((s: any) => s.exercises.map((e: any) => e.name));
   const [injuries, exerciseByName, { data: recentLogs }] = await Promise.all([
     fetchActiveInjuries(supabase, userId),
@@ -628,9 +672,9 @@ async function writePlan(
     days_per_week: daysPerWeek,
     training_days: trainingDays || options.requireConfirm ? previewDays.map(weekdayLabel) : 'unchanged',
   };
-}
+};
 
-async function writeNutritionTargets(supabase: any, userId: string, goal: GoalObjective) {
+const writeNutritionTargets = async (supabase: any, userId: string, goal: GoalObjective) => {
   const { data: weightRow, error: weightError } = await supabase
     .from('weight_log')
     .select('weight_kg')
@@ -682,9 +726,9 @@ async function writeNutritionTargets(supabase: any, userId: string, goal: GoalOb
   }
 
   return { status: 'persisted', ...targets };
-}
+};
 
-async function resolveTimezone(supabase: any, userId: string, requestTimezone?: string | null): Promise<string | null> {
+const resolveTimezone = async (supabase: any, userId: string, requestTimezone?: string | null): Promise<string | null> => {
   const { data } = await supabase.from('profile').select('timezone').eq('user_id', userId).maybeSingle();
   const timezone = requestTimezone || data?.timezone || null;
   // Mirrors buildContextBlock's self-healing — profile.timezone is only ever written once at
@@ -695,7 +739,7 @@ async function resolveTimezone(supabase: any, userId: string, requestTimezone?: 
     if (error) console.error('[brain] failed to refresh profile.timezone:', error.message);
   }
   return timezone;
-}
+};
 
 
 interface TodaysExercise {
@@ -763,12 +807,26 @@ const resolveTodaysExercises = async (
   return exercises.length > 0 ? { focus: humanizeFocus(full.focus), exercises } : null;
 };
 
-export function createHandlers(
+export type UndoLock = 'already_removed' | 'count_correct';
+
+export interface HandlerOptions {
+  currentUserText?: string | null;
+  undoLock?: UndoLock | null;
+}
+
+export const undoLockFor = (resolution: DisputeResolution | null): UndoLock | null =>
+  resolution === 'undone' || resolution === 'not_confirmed'
+    ? 'already_removed'
+    : resolution === 'confirmed'
+      ? 'count_correct'
+      : null;
+
+export const createHandlers = (
   supabase: any,
   userId: string,
   requestTimezone?: string | null,
-  options: { currentUserText?: string | null; appLoggedThisTurn?: boolean } = {},
-): ToolHandlers {
+  options: HandlerOptions = {},
+): ToolHandlers => {
   // Secret for confirm-token signing (see confirm-token.ts) — reused rather than a new env
   // var since it's already injected into every edge function and never leaves this process.
   const confirmSecret = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -1576,22 +1634,36 @@ export function createHandlers(
     },
 
     undo_last_set: async () => {
-      const live = await readLiveSession(supabase, userId);
-      if (!live.running) {
+      if (options.undoLock === 'already_removed') {
+        return {
+          status: 'already_undone',
+          instruction:
+            'Nothing more was removed: the app already took the extra set off for this message, and the live ' +
+            'session state block shows the corrected count. Do not remove another; confirm the fix in one short line.',
+        };
+      }
+      if (options.undoLock === 'count_correct') {
+        return {
+          status: 'not_needed',
+          instruction:
+            'Nothing was removed: the count already matches what they said, so every logged set is one they really ' +
+            'did. Tell them they are right and name the next set.',
+        };
+      }
+      const result = await undoLastLiveSet(supabase, userId);
+      if (result.status === 'no_session') {
         return {
           status: 'no_session',
           instruction: 'Nothing was removed. There is no workout running in the app right now.',
         };
       }
-      const before = totalLoggedSets(live.state);
-      if (before === 0) {
+      if (result.status === 'no_set_to_undo') {
         return {
           status: 'no_set_to_undo',
           instruction: 'Nothing was removed: no set is logged in this workout yet. Say so plainly.',
         };
       }
-      await writeAppAction(supabase, userId, 'undo_last_set', {});
-      if (!(await waitForLoggedSetTotalBelow(supabase, userId, before))) {
+      if (result.status === 'not_confirmed') {
         return {
           status: 'not_confirmed',
           instruction:
@@ -1601,10 +1673,11 @@ export function createHandlers(
       }
       return {
         status: 'undone',
-        sets_logged_now: before - 1,
+        sets_logged_now: result.setsLoggedNow,
         instruction:
           'The most recent logged set is removed from the card and from the saved workout. Confirm ' +
-          'that in one short line and ask for the correct reps (and weight if it was wrong).',
+          'that in one short line and name the set that is next. Ask for corrected reps or weight only if ' +
+          'they said those numbers were wrong.',
       };
     },
 
@@ -2214,7 +2287,7 @@ export function createHandlers(
         name: lift.name,
         top_weight_label:
           units === 'imperial'
-            ? `${Math.round(lift.top_weight_kg * 2.20462 * 10) / 10} lb`
+            ? `${kgToLb(lift.top_weight_kg)} lb`
             : `${lift.top_weight_kg} kg`,
       }));
       const insight =
@@ -2542,73 +2615,6 @@ export function createHandlers(
       return { status: 'requested' };
     },
 
-    log_live_set: async (input) => {
-      if (options.appLoggedThisTurn) {
-        return {
-          status: 'already_logged',
-          instruction:
-            'Nothing new was logged: the app already logged this set from what they just said, and it ' +
-            'is recorded. Confirm that one set; never log it a second time.',
-        };
-      }
-
-      const live = await readLiveSession(supabase, userId);
-      if (!live.running) {
-        return {
-          status: 'no_session',
-          instruction: 'Nothing was logged. There is no workout running in the app right now.',
-        };
-      }
-
-      if (!(await userClaimedSetFinished(supabase, userId, options.currentUserText ?? null))) {
-        return {
-          status: 'not_finished',
-          instruction:
-            'Nothing was logged. The user has not said they finished a set, so this would record one ' +
-            'they are still doing — counting reps out loud is not a report. Ask them to tell you when ' +
-            'the set is done and how many reps they got, then log it.',
-        };
-      }
-
-      const reps = Math.round(Number(input.reps));
-      if (!Number.isFinite(reps) || reps <= 0) return { status: 'invalid_reps' };
-
-      const rawWeight = typeof input.weight === 'number' ? input.weight : null;
-      const weightKg =
-        rawWeight === null || rawWeight <= 0
-          ? null
-          : input.weight_unit === 'lb'
-            ? Math.round(rawWeight * 0.453592 * 10) / 10
-            : rawWeight;
-
-      const resolved = resolveToolSetWeight(live.snapshot, weightKg, !!input.timed);
-      if ('needsWeightFor' in resolved) {
-        return {
-          status: 'needs_weight',
-          instruction:
-            `Nothing was logged. No weight is known yet for ${resolved.needsWeightFor}, so ask them what ` +
-            `weight they used for those ${reps} reps, then call log_live_set with the reps and the weight. ` +
-            'Never log a loaded lift without a weight.',
-        };
-      }
-
-      const before = totalLoggedSets(live.state);
-      await writeAppAction(supabase, userId, 'log_set', {
-        reps,
-        weight_kg: resolved.weight,
-        unit: input.timed ? 'seconds' : null,
-      });
-      if (!(await waitForLoggedSetTotal(supabase, userId, before + 1))) {
-        return {
-          status: 'not_confirmed',
-          instruction:
-            'The set was sent but the app has NOT confirmed it landed. Do not say it is logged or that ' +
-            'rest has started. Ask them to check the card; the live session state block is the truth.',
-        };
-      }
-      return { status: 'logged', reps, weight_kg: resolved.weight };
-    },
-
     end_workout: async (input) => {
       // Damion's explicit ask: ending or discarding an incomplete workout needs confirmation —
       // unlike the moment-to-moment commands (report a set, adjust rest, pause/resume), this one
@@ -2693,6 +2699,7 @@ export function createHandlers(
     },
 
     adjust_rest_timer: async (input) => {
+      if (input.action === 'set') return setRestLength(supabase, userId, input.seconds, input.scope);
       const seconds =
         typeof input.seconds === 'number' ? Math.min(120, Math.max(1, Math.round(input.seconds))) : null;
       await writeAppAction(supabase, userId, 'adjust_rest_timer', { action: input.action, seconds });
@@ -2715,4 +2722,68 @@ export function createHandlers(
       async (input: any) => localizeWeights(await run(input), await resolveUnits()),
     ]),
   );
-}
+};
+
+export const REST_LENGTH_MIN_SEC = 15;
+export const REST_LENGTH_MAX_SEC = 600;
+
+type RestScope = 'current' | 'upcoming' | 'both';
+
+const setRestLength = async (supabase: any, userId: string, rawSeconds: unknown, rawScope: unknown) => {
+  const seconds = typeof rawSeconds === 'number' ? Math.round(rawSeconds) : NaN;
+  if (!Number.isFinite(seconds) || seconds < REST_LENGTH_MIN_SEC || seconds > REST_LENGTH_MAX_SEC) {
+    return {
+      status: 'invalid_seconds',
+      instruction: `Nothing changed. A rest length has to be between ${REST_LENGTH_MIN_SEC} and ${REST_LENGTH_MAX_SEC} seconds.`,
+    };
+  }
+  const scope: RestScope | null =
+    rawScope === 'current' || rawScope === 'upcoming' || rawScope === 'both' ? rawScope : null;
+  if (!scope) {
+    return {
+      status: 'invalid_scope',
+      instruction:
+        'Nothing changed. Call again with scope "current" (only the rest running now), "upcoming" (every rest ' +
+        'after this one) or "both".',
+    };
+  }
+  const live = await readLiveSession(supabase, userId);
+  if (!live.running) {
+    return { status: 'no_session', instruction: 'Nothing changed. There is no workout running in the app right now.' };
+  }
+  const resting = live.snapshot?.status === 'resting';
+  if (scope === 'current' && !resting) {
+    return {
+      status: 'not_resting',
+      instruction:
+        'Nothing changed: no rest is running right now. If they want their next rests at that length, call again ' +
+        'with scope "upcoming".',
+    };
+  }
+  const applied: RestScope = scope === 'both' && !resting ? 'upcoming' : scope;
+  await writeAppAction(supabase, userId, 'adjust_rest_timer', { action: 'set', seconds, scope: applied });
+  const landed = await waitForLiveState(supabase, userId, (state) => {
+    const currentOk = applied === 'upcoming' || (state?.resting && state?.restTargetSec === seconds);
+    const upcomingOk = applied === 'current' || state?.restOverrideSec === seconds;
+    return !!currentOk && !!upcomingOk;
+  });
+  if (!landed) {
+    return {
+      status: 'not_confirmed',
+      instruction:
+        `The change was sent but the app has NOT confirmed it. Do not say rest is now ${seconds} seconds; say you ` +
+        'asked for it and that the timer on screen is what counts.',
+    };
+  }
+  return {
+    status: 'set',
+    seconds,
+    scope: applied,
+    instruction:
+      applied === 'current'
+        ? `The rest running now is ${seconds} seconds in total. Later rests are unchanged.`
+        : applied === 'upcoming'
+          ? `Every rest after this one will be ${seconds} seconds for the rest of this workout.${resting ? ' The rest running now is unchanged.' : ''}`
+          : `The rest running now and every rest after it are ${seconds} seconds for the rest of this workout.`,
+  };
+};

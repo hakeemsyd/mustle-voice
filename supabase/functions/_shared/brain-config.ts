@@ -119,14 +119,14 @@ Rules:
   one ends. Never say how many seconds are left, never count down, never claim to be timing
   anything, and never ask the user to read a timer back to you — by the time your reply is spoken,
   any figure you named is already wrong.
-- Never state that an action happened (logged a set, removed a set, moved to another exercise,
-  swapped an exercise, added rest time, ended the workout, added a set, resolved an interrupted
-  workout) unless the matching tool
+- Never state that an action happened (removed a set, moved to another exercise, swapped an
+  exercise, changed rest time, ended the workout, added a set, resolved an interrupted workout)
+  unless the matching tool
   call actually returned success this turn — you have no visibility into the app beyond what a
   tool result or the live session state block tells you, so never narrate an action you didn't
   just call and didn't just see succeed. swap_exercise returns "swapped" only once the workout card
-  actually shows the new exercise, log_live_set returns "logged" only once the set is on the card,
-  and undo_last_set returns "undone" only once the set is gone from it; anything else
+  actually shows the new exercise, and undo_last_set returns "undone" only once the set is gone
+  from it; anything else
   ("not_confirmed", "no_session", "not_in_session") means nothing changed.
   skip_exercise, end_workout, add_set, and adjust_rest_timer return "requested" —
   the app applies it a moment later — so phrase those as what you just asked for ("adding 20
@@ -136,17 +136,16 @@ Rules:
   screen says. Never state a different exercise, set number, timer value, rep count, or weight than
   what it (or a tool result) actually shows, and never claim you changed one of those without a
   tool result confirming it. If a load scheme isn't set, say so or ask — never invent a weight.
-  WHETHER A SET WAS LOGGED IS NEVER YOURS TO GUESS. During a workout every turn carries a note,
-  "What the app did with THIS message", written by the app itself. If it says the app LOGGED the
-  message, the set is recorded: confirm it in one line even though the COMPLETED count above was
-  written a moment before it. If it says NOTHING was logged, the COMPLETED count is exact: never
-  say a set is done, never praise a set as finished, never say rest is starting, and never say
-  the app "should" or "will" log it. Call log_live_set if they reported a finished set with a rep
-  count, or ask for the count in one short question. Confirmed live (2026-09-24): the coach
-  assumed "I just did 10 push-ups" had been logged, said "Solid first set. Rest is starting."
-  while the card stayed on set 1 with no timer, then asked the user to read their screen back.
-  If the user says a set you just confirmed was wrong or misheard, call undo_last_set instead of
-  just apologizing in text.
+  ONLY THE APP LOGS SETS; YOU NEVER DO, AND YOU NEVER GUESS WHETHER IT DID. During a workout every
+  turn carries a note, "What the app did with THIS message", written by the app itself. If it says
+  the app LOGGED the message, the set is recorded: confirm it in one line even though the COMPLETED
+  count above was written a moment before it. If it says NOTHING was logged, the COMPLETED count is
+  exact: never say a set is done, never praise a set as finished, never say rest is starting, and
+  never say the app "should" or "will" log it. If they reported a finished set the app could not
+  read, ask "How many reps did you get?" and the app logs their answer. If the user says a set was
+  wrong, misheard, counted twice, or counted when they had not done it, believe them over the count
+  and call undo_last_set, unless the note says the app already removed it or that the count already
+  matches what they said.
 - Your conversation history and a tool's persisted-state result are two different sources, and a
   gap between them is information, not noise — never treat "read_state/log lookup found nothing"
   as proof something was never discussed, when your own conversation history shows the user
@@ -504,7 +503,7 @@ const VOICE_PHRASING_NOTE =
   'abbreviations. Sets and reps always read as "N sets of M reps" (e.g. "two sets of eight reps") ' +
   '— never "M reps at N" or any other order, which reads as a different, wrong number entirely.';
 
-export function buildSystemPrompt(
+export const buildSystemPrompt = (
   hasHistory: boolean,
   contextBlock: string,
   modality: 'text' | 'voice' = 'text',
@@ -517,26 +516,26 @@ export function buildSystemPrompt(
   // note applies to this synthetic, one-off turn — buildGreetingPrompt's own wording is already a
   // complete, self-contained instruction — so both are skipped rather than picking one.
   isDailyGreeting: boolean = false,
-): string {
+): string => {
   return buildStaticSystemPrompt(hasHistory, modality, isDailyGreeting) + '\n\n' + contextBlock;
-}
+};
 
 // Split out from buildSystemPrompt so callers that want Anthropic prompt caching (see
 // createCallModel) can send this fixed half separately from the per-turn context block — see
 // SystemPromptInput's comment in brain-orchestrator.ts for why the split matters.
-export function buildStaticSystemPrompt(
+export const buildStaticSystemPrompt = (
   hasHistory: boolean,
   modality: 'text' | 'voice' = 'text',
   isDailyGreeting: boolean = false,
-): string {
+): string => {
   return (
     SYSTEM_PROMPT +
     (isDailyGreeting ? '' : hasHistory ? ONGOING_CONVERSATION_NOTE : NEW_CONVERSATION_NOTE) +
     (modality === 'voice' ? VOICE_PHRASING_NOTE : '')
   );
-}
+};
 
-export function createCallModel(tools: readonly unknown[]): CallModel {
+export const createCallModel = (tools: readonly unknown[]): CallModel => {
   // Tool schemas never change during a session (same catalog for every user, every turn) — this
   // is computed once here rather than per-call since `tools` is fixed at construction time.
   // Anthropic caches everything up to and including a cache_control breakpoint, so marking only
@@ -647,6 +646,6 @@ export function createCallModel(tools: readonly unknown[]): CallModel {
     console.log(`[voice-timing:server] callModel: stream fully drained, +${Date.now() - tCall0}ms total, stop_reason=${stopReason}`);
     return { stop_reason: stopReason, content: contentBlocks };
   };
-}
+};
 
 export const callModel: CallModel = createCallModel(BRAIN_TOOLS);

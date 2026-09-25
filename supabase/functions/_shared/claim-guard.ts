@@ -48,11 +48,28 @@ const CLEARANCE_CLAIMS: RegExp[] = [
   /\byou(?:'ve|\s+have)?\s+(?:already|just)\s+(?:did|done|finished|completed)\b/i,
 ];
 
+const SCREEN_NOUN = '(?:screen|card|counter|display|timer)';
+
+const SCREEN_QUESTIONS: RegExp[] = [
+  new RegExp(
+    `\\bwhat(?:'s|\\s+is|\\s+does|\\s+do)?\\s+(?:it\\s+|that\\s+)?(?:actually\\s+)?(?:showing\\s+)?(?:on\\s+)?(?:your|the)\\s+(?:\\w+\\s+){0,3}${SCREEN_NOUN}\\b[^.!?]*\\?`,
+    'i',
+  ),
+  new RegExp(`\\b(?:tell|read|show)\\s+me\\s+(?:exactly\\s+)?what\\s+(?:your|the)\\s+(?:\\w+\\s+){0,3}${SCREEN_NOUN}\\b`, 'i'),
+  new RegExp(
+    `\\bwhat\\s+(?:your|the)\\s+(?:\\w+\\s+){0,3}${SCREEN_NOUN}\\s+(?:\\w+\\s+){0,2}(?:shows|says|reads|is\\s+showing|is\\s+saying)\\b`,
+    'i',
+  ),
+  /\bi\s+need\s+to\s+(?:see|know)\s+what(?:'s|\s+is)\s+(?:actually\s+)?(?:on|showing\s+on)\s+your\s+screen\b/i,
+  new RegExp(`\\b(?:check|look\\s+at)\\s+(?:your|the)\\s+(?:\\w+\\s+){0,2}${SCREEN_NOUN}\\s+and\\s+(?:tell|let)\\s+me\\b`, 'i'),
+];
+
 const matchesAny = (patterns: RegExp[], text: string): boolean => patterns.some((p) => p.test(text));
 
-export function isUnbackedClaim(clause: string, state: ClaimGuardState): boolean {
+export const isUnbackedClaim = (clause: string, state: ClaimGuardState): boolean => {
   const text = clause.replace(/[\u2018\u2019\u201B\u02BC]/g, "'").trim();
   if (!text) return false;
+  if (state.liveSession && matchesAny(SCREEN_QUESTIONS, text)) return true;
   if (state.liveSession && !state.setLoggedThisTurn) {
     if (matchesAny(SET_CLAIMS, text)) return true;
     if (!state.restActive && matchesAny(REST_CLAIMS, text)) return true;
@@ -60,9 +77,9 @@ export function isUnbackedClaim(clause: string, state: ClaimGuardState): boolean
   if (!state.actionSucceededThisTurn && matchesAny(ACTION_CLAIMS, text)) return true;
   if (state.injuryOnFile && matchesAny(CLEARANCE_CLAIMS, text)) return true;
   return false;
-}
+};
 
-export function guardClaims(text: string, state: ClaimGuardState): { text: string; dropped: string[] } {
+export const guardClaims = (text: string, state: ClaimGuardState): { text: string; dropped: string[] } => {
   const sentences = text.split(/(?<=[.!?])\s+/);
   const kept: string[] = [];
   const dropped: string[] = [];
@@ -71,17 +88,17 @@ export function guardClaims(text: string, state: ClaimGuardState): { text: strin
     else kept.push(sentence);
   }
   return { text: kept.join(' ').trim(), dropped };
-}
+};
 
 const FAILED_STATUS =
   /^(?:not_|no_|invalid|unsafe|ambiguous|preview|already|replacement_|likely_correction|unavailable|error|failed|needs_)/;
 
-export function isSuccessfulToolResult(result: unknown): boolean {
+export const isSuccessfulToolResult = (result: unknown): boolean => {
   if (result == null) return false;
   const status = (result as { status?: unknown }).status;
   if (typeof status !== 'string') return true;
   return !FAILED_STATUS.test(status);
-}
+};
 
 const READ_ONLY_TOOLS = new Set([
   'read_state',
@@ -97,29 +114,27 @@ const READ_ONLY_TOOLS = new Set([
 ]);
 
 export interface ToolOutcomes {
-  setLogged: boolean;
   actionSucceeded: boolean;
 }
 
 type Handler = (input: any) => Promise<any>;
 
-export function trackToolOutcomes<T extends Record<string, Handler>>(handlers: T): { handlers: T; outcomes: ToolOutcomes } {
-  const outcomes: ToolOutcomes = { setLogged: false, actionSucceeded: false };
+export const trackToolOutcomes = <T extends Record<string, Handler>>(handlers: T): { handlers: T; outcomes: ToolOutcomes } => {
+  const outcomes: ToolOutcomes = { actionSucceeded: false };
   const wrapped = Object.fromEntries(
     Object.entries(handlers).map(([name, run]) => [
       name,
       async (input: any) => {
         const result = await run(input);
-        if (name === 'log_live_set' && result?.status === 'logged') outcomes.setLogged = true;
         if (!READ_ONLY_TOOLS.has(name) && isSuccessfulToolResult(result)) outcomes.actionSucceeded = true;
         return result;
       },
     ]),
   ) as T;
   return { handlers: wrapped, outcomes };
-}
+};
 
-export function withGuardedFinalText(blocks: any[], reply: string): any[] {
+export const withGuardedFinalText = (blocks: any[], reply: string): any[] => {
   let last = -1;
   for (let i = blocks.length - 1; i >= 0; i--) {
     if (blocks[i]?.role === 'assistant') {
@@ -134,13 +149,13 @@ export function withGuardedFinalText(blocks: any[], reply: string): any[] {
   const out = blocks.slice();
   out[last] = { ...blocks[last], content: next.length > 0 ? next : [{ type: 'text', text: ' ' }] };
   return out;
-}
+};
 
-export function claimFallback(liveSession: boolean, userReportedSet: boolean, injuryOnFile = false): string {
+export const claimFallback = (liveSession: boolean, userReportedSet: boolean, injuryOnFile = false): string => {
   if (userReportedSet) return SET_DETAILS_FALLBACK;
   if (liveSession) return LIVE_SESSION_FALLBACK;
   return injuryOnFile ? INJURY_FALLBACK : ACTION_FALLBACK;
-}
+};
 
 export const SET_DETAILS_FALLBACK = 'How many reps did you get on that set?';
 export const LIVE_SESSION_FALLBACK = "Tell me when the set's done and how many reps you got.";

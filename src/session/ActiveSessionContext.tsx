@@ -15,9 +15,10 @@ import { callBrain, COACH_UNREACHABLE_MESSAGE } from "../lib/brain";
 import { DEFAULT_REST_SEC, suggestRestSeconds, type RestSuggestionReason } from "../lib/restSuggestion";
 import { useProfileName } from "../hooks/useProfileName";
 import { buildLiveSessionSnapshot, describeLiveSessionSnapshot } from "./liveSessionState";
-import { SET_PARSER_VERSION } from "../../supabase/functions/_shared/set-report";
+import { isRestatement, SET_PARSER_VERSION } from "../../supabase/functions/_shared/set-report";
 import { normalizeLoadScheme } from "../../supabase/functions/_shared/load-intent";
 import { rebuildResumedSession, type ResumePlanEntry } from "./resumeSession";
+import type { SetSource } from "../../supabase/functions/_shared/set-dispute";
 import { useUnitPrefs } from "../hooks/useUnitPrefs";
 
 // Previously a module-level counter combined with Date.now() — confirmed live: two messages
@@ -61,7 +62,15 @@ export interface LoggedSet {
    *  backlog item exists to close — this fix is scoped to what the user sees WHILE the session is
    *  active (the card, the thread, the spoken confirmation), not the persisted record. */
   unit?: 'seconds';
+  at?: number;
+  source?: SetSource;
 }
+
+export interface SetOrigin {
+  source: SetSource;
+}
+
+export type RestLengthScope = "current" | "upcoming" | "both";
 
 /** Same shape workout_log.exercises_done is written in (see writeWorkoutLog below) — passed
  *  back in to resume a partial session at its actual saved position instead of restarting at
@@ -94,7 +103,7 @@ interface LastSetSnapshot {
   createdWorkoutLogId: string | null;
 }
 
-function restReasonCopy(reason: RestSuggestionReason): string | null {
+const restReasonCopy = (reason: RestSuggestionReason): string | null => {
   switch (reason) {
     case "missed_reps":
       return "Auto-extended — short of target reps";
@@ -105,7 +114,7 @@ function restReasonCopy(reason: RestSuggestionReason): string | null {
     default:
       return null;
   }
-}
+};
 
 export interface SessionThreadMessage {
   id: string;
@@ -113,7 +122,7 @@ export interface SessionThreadMessage {
   text: string;
 }
 
-function parseResumeSets(entry: ResumeExerciseEntry | undefined): LoggedSet[] {
+const parseResumeSets = (entry: ResumeExerciseEntry | undefined): LoggedSet[] => {
   if (!entry) return [];
   const isBodyweight = entry.load === "bodyweight";
   const loads = isBodyweight ? [] : entry.load.split(",").map((l) => {
@@ -125,7 +134,7 @@ function parseResumeSets(entry: ResumeExerciseEntry | undefined): LoggedSet[] {
     .map((r) => parseInt(r.trim(), 10))
     .filter((n) => Number.isFinite(n))
     .map((reps, i) => ({ weight: isBodyweight ? null : loads[i] ?? null, reps }));
-}
+};
 
 export type SessionStatus = "completed" | "partial";
 
@@ -145,10 +154,10 @@ interface PlanExerciseRow {
   exercise: { name: string } | { name: string }[] | null;
 }
 
-function exerciseName(row: PlanExerciseRow): string {
+const exerciseName = (row: PlanExerciseRow): string => {
   const exercise = Array.isArray(row.exercise) ? row.exercise[0] : row.exercise;
   return exercise?.name ?? "Exercise";
-}
+};
 
 interface ActiveSessionValue {
   userId: string | null;
@@ -179,6 +188,8 @@ interface ActiveSessionValue {
    *  etc.) — null when it's just the plain default, never auto-adjusted. */
   restReasonLabel: string | null;
   extendRest: (seconds?: number, source?: "manual" | "coach") => void;
+  restOverrideSec: number | null;
+  setRestLength: (seconds: number, scope: RestLengthScope, source?: "manual" | "coach") => void;
   toggleRestPause: () => void;
   pauseRest: () => void;
   resumeRest: () => void;
@@ -209,7 +220,10 @@ interface ActiveSessionValue {
   ) => void;
   minimize: () => void;
   restore: () => void;
-  logSet: (weight: number | null, reps: number, unit?: 'seconds') => void;
+  logSet: (weight: number | null, reps: number, unit?: 'seconds', origin?: SetOrigin) => boolean;
+  isRestatementNow: () => boolean;
+  setParsing: (parsing: boolean) => void;
+  claimGreeting: () => boolean;
   lastSetLoggedAt: number | null;
   skipExercise: () => void;
   goToExercise: (name: string) => boolean;
@@ -240,20 +254,20 @@ type StatedWeight = { exerciseIndex: number; weight: number };
 
 const ActiveSessionCtx = createContext<ActiveSessionValue | null>(null);
 
-export function useActiveSessionContext(): ActiveSessionValue {
+export const useActiveSessionContext = (): ActiveSessionValue => {
   const ctx = useContext(ActiveSessionCtx);
   if (!ctx)
     throw new Error(
       "useActiveSessionContext must be used inside ActiveSessionProvider",
     );
   return ctx;
-}
+};
 
-export function ActiveSessionProvider({
+export const ActiveSessionProvider = ({
   children,
 }: {
   children: React.ReactNode;
-}) {
+}) => {
   const [target, setTarget] = useState<SessionTarget | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -271,6 +285,8 @@ export function ActiveSessionProvider({
     number | null
   >(null);
   const [restReasonLabel, setRestReasonLabel] = useState<string | null>(null);
+  const [restOverrideSec, setRestOverrideSec] = useState<number | null>(null);
+  const [restFinishedAt, setRestFinishedAt] = useState<number | null>(null);
   const [ended, setEnded] = useState(false);
   const [endedStatus, setEndedStatus] = useState<SessionStatus | null>(null);
   const [workoutLogId, setWorkoutLogId] = useState<string | null>(null);
@@ -319,6 +335,7 @@ export function ActiveSessionProvider({
   // fast, because logging one starts a rest period.
   const recentSetRef = useRef<{ key: string; at: number } | null>(null);
   const lastSetSnapshotRef = useRef<LastSetSnapshot | null>(null);
+  const greetedStartedAtRef = useRef<string | null>(null);
 
   const start = useCallback(
     (
@@ -358,6 +375,8 @@ export function ActiveSessionProvider({
       setRestEndAt(null);
       setRestPausedRemainingSec(null);
       setRestReasonLabel(null);
+      setRestOverrideSec(null);
+      setRestFinishedAt(null);
       setEnded(false);
       setEndedStatus(null);
       setCoachMessage("Ready when you are.");
@@ -430,6 +449,8 @@ export function ActiveSessionProvider({
     setRestEndAt(null);
     setRestPausedRemainingSec(null);
     setRestReasonLabel(null);
+    setRestOverrideSec(null);
+    setRestFinishedAt(null);
     setMessages([]);
     workoutLogWrittenRef.current = false;
     loggingRef.current = false;
@@ -653,10 +674,34 @@ export function ActiveSessionProvider({
     await writeWorkoutLogRef.current?.(loggedSets, "partial");
   }, [target, ended, loggedSets]);
 
+  const latestSetTime = (): number | null => {
+    const times = loggedSets.flat().map((set) => set.at).filter((at): at is number => typeof at === "number");
+    return times.length > 0 ? Math.max(...times) : null;
+  };
+
+  const isRestatementNow = useCallback(
+    () => isRestatement(latestSetTime(), Date.now(), restFinishedAt),
+    [loggedSets, restFinishedAt],
+  );
+
+  const [parsing, setParsing] = useState(false);
+
+  const claimGreeting = useCallback(() => {
+    if (!startedAt || greetedStartedAtRef.current === startedAt) return false;
+    greetedStartedAtRef.current = startedAt;
+    return true;
+  }, [startedAt]);
+
   const logSet = useCallback(
-    (weight: number | null, reps: number, unit?: 'seconds') => {
+    (weight: number | null, reps: number, unit?: 'seconds', origin?: SetOrigin): boolean => {
       const exercise = exercises[currentExerciseIndex];
-      if (!exercise || loggingRef.current) return;
+      if (!exercise || loggingRef.current) return false;
+
+      const spokenOrChat = origin?.source === "voice" || origin?.source === "coach";
+      if (spokenOrChat && isRestatement(latestSetTime(), Date.now(), restFinishedAt)) {
+        console.warn("[session] ignored a set reported seconds after the last one:", weight, reps);
+        return false;
+      }
 
       // Set-indexed so a genuine repeat of the same weight/reps (routine in straight-set
       // training, e.g. three sets of "135 for 8") isn't mistaken for the SDK re-emitting the
@@ -668,7 +713,7 @@ export function ActiveSessionProvider({
       const recent = recentSetRef.current;
       if (recent && recent.key === dedupeKey && now - recent.at < DUPLICATE_SET_WINDOW_MS) {
         console.warn('[session] ignored a duplicate set report:', dedupeKey);
-        return;
+        return false;
       }
       recentSetRef.current = { key: dedupeKey, at: now };
       setLastSetLoggedAt(now);
@@ -689,7 +734,7 @@ export function ActiveSessionProvider({
       const next = loggedSets.map((sets) => sets.slice());
       next[currentExerciseIndex] = [
         ...(next[currentExerciseIndex] ?? []),
-        { weight, reps, unit },
+        { weight, reps, unit, at: now, source: origin?.source },
       ];
       setLoggedSets(next);
 
@@ -701,12 +746,13 @@ export function ActiveSessionProvider({
           setsSoFar,
           exercise.sets,
         );
-        setRestTargetSec(suggestion.seconds);
-        setRestEndAt(Date.now() + suggestion.seconds * 1000);
+        const restSeconds = restOverrideSec ?? suggestion.seconds;
+        setRestTargetSec(restSeconds);
+        setRestEndAt(Date.now() + restSeconds * 1000);
         setRestPausedRemainingSec(null);
         setResting(true);
         setRestKey((k) => k + 1);
-        setRestReasonLabel(restReasonCopy(suggestion.reason));
+        setRestReasonLabel(restOverrideSec ? "Your rest length" : restReasonCopy(suggestion.reason));
         void writeWorkoutLogRef.current?.(next, "partial");
       } else if (currentExerciseIndex === exercises.length - 1) {
         setEnded(true);
@@ -723,8 +769,11 @@ export function ActiveSessionProvider({
       queueMicrotask(() => {
         loggingRef.current = false;
       });
+      return true;
     },
     [
+      restOverrideSec,
+      restFinishedAt,
       currentExerciseIndex,
       exercises,
       loggedSets,
@@ -745,14 +794,16 @@ export function ActiveSessionProvider({
     let restored: LoggedSet[][];
     let restoredIndex: number;
     if (snap) {
+      const restStillRunning =
+        snap.resting && (snap.restPausedRemainingSec !== null || (snap.restEndAt ?? 0) > Date.now());
       restored = snap.loggedSets;
       restoredIndex = snap.currentExerciseIndex;
       setCurrentExerciseIndex(snap.currentExerciseIndex);
-      setResting(snap.resting);
+      setResting(restStillRunning);
       setRestKey(snap.restKey);
       setRestTargetSec(snap.restTargetSec);
-      setRestEndAt(snap.restEndAt);
-      setRestPausedRemainingSec(snap.restPausedRemainingSec);
+      setRestEndAt(restStillRunning ? snap.restEndAt : null);
+      setRestPausedRemainingSec(restStillRunning ? snap.restPausedRemainingSec : null);
     } else {
       let index = -1;
       for (let i = Math.min(currentExerciseIndex, loggedSets.length - 1); i >= 0; i--) {
@@ -770,6 +821,7 @@ export function ActiveSessionProvider({
       setRestEndAt(null);
       setRestPausedRemainingSec(null);
     }
+
 
     // The row is no longer created by the finishing set — it exists from the first one — so
     // deleting it here would throw away the whole run rather than the set being undone. It is
@@ -896,6 +948,7 @@ export function ActiveSessionProvider({
 
   const finishRest = useCallback(() => {
     lastSetSnapshotRef.current = null;
+    setRestFinishedAt(Date.now());
     setResting(false);
     setRestEndAt(null);
     setRestPausedRemainingSec(null);
@@ -914,6 +967,19 @@ export function ActiveSessionProvider({
       if (source === "coach") setRestReasonLabel("Coach extended your rest");
     },
     [resting],
+  );
+
+  const setRestLength = useCallback(
+    (seconds: number, scope: RestLengthScope, source: "manual" | "coach" = "manual") => {
+      if (scope !== "current") setRestOverrideSec(seconds);
+      if (scope === "upcoming" || !resting) return;
+      const delta = seconds - restTargetSec;
+      setRestTargetSec(seconds);
+      setRestEndAt((endAt) => (endAt === null ? endAt : endAt + delta * 1000));
+      setRestPausedRemainingSec((remaining) => (remaining === null ? remaining : Math.max(0, remaining + delta)));
+      setRestReasonLabel(source === "coach" ? "Coach set your rest" : null);
+    },
+    [resting, restTargetSec],
   );
 
   // Split into explicit pause/resume (not just a toggle) so a voice command like "pause the
@@ -1024,9 +1090,11 @@ export function ActiveSessionProvider({
       paused,
       elapsedSec,
       statedWeight,
+      restOverrideSec,
     });
     return snapshot ? describeLiveSessionSnapshot(snapshot, units) : undefined;
   }, [
+    restOverrideSec,
     target,
     focus,
     exercises,
@@ -1065,6 +1133,10 @@ export function ActiveSessionProvider({
             paused,
             elapsedSec,
             statedWeight,
+            restOverrideSec,
+            restFinishedAt,
+            workoutLogId,
+            parsing,
           },
         }
       : null;
@@ -1099,6 +1171,10 @@ export function ActiveSessionProvider({
     paused,
     ended,
     statedWeight,
+    restOverrideSec,
+    workoutLogId,
+    parsing,
+    restFinishedAt,
     publishLiveState,
   ]);
 
@@ -1132,6 +1208,7 @@ export function ActiveSessionProvider({
           paused,
           elapsedSec,
           statedWeight,
+          restOverrideSec,
         });
         liveSessionState = snapshot ? describeLiveSessionSnapshot(snapshot, units) : undefined;
       } catch (err) {
@@ -1167,6 +1244,7 @@ export function ActiveSessionProvider({
       }
     },
     [
+      restOverrideSec,
       currentExerciseIndex,
       exercises,
       target,
@@ -1240,6 +1318,9 @@ export function ActiveSessionProvider({
       minimize,
       restore,
       logSet,
+      isRestatementNow,
+      setParsing,
+      claimGreeting,
       lastSetLoggedAt,
       skipExercise,
       goToExercise,
@@ -1261,6 +1342,8 @@ export function ActiveSessionProvider({
       clear,
       toggleRestPause,
       extendRest,
+      restOverrideSec,
+      setRestLength,
       pauseRest,
       resumeRest,
     }),
@@ -1299,6 +1382,9 @@ export function ActiveSessionProvider({
       minimize,
       restore,
       logSet,
+      isRestatementNow,
+      setParsing,
+      claimGreeting,
       lastSetLoggedAt,
       skipExercise,
       goToExercise,
@@ -1319,6 +1405,8 @@ export function ActiveSessionProvider({
       clear,
       toggleRestPause,
       extendRest,
+      restOverrideSec,
+      setRestLength,
       pauseRest,
       resumeRest,
     ],
@@ -1329,4 +1417,4 @@ export function ActiveSessionProvider({
       {children}
     </ActiveSessionCtx.Provider>
   );
-}
+};

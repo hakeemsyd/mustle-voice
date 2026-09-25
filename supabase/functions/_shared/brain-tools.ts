@@ -797,40 +797,17 @@ export const BRAIN_TOOLS = [
     input_schema: { type: 'object', properties: {} },
   },
   {
-    name: 'log_live_set',
-    description:
-      "Record one COMPLETED set into the user's active in-app workout when the app has not already " +
-      'recorded it itself. Never guess whether the app logged something: every turn during a workout ' +
-      'carries a "What the app did with THIS message" note that says exactly that. If the note says ' +
-      'the app LOGGED the message, never call this. If it says NOTHING was logged and the user told you ' +
-      'they finished a set with a rep count, call this; if they gave no rep count, ask for it first. ' +
-      'Only tell them the set is logged or that rest has started once this returns "logged". ' +
-      'NEVER call it for a user counting their reps out loud mid-set ("one, two, three... four, five" ' +
-      'is counting, not a report, and logging it ends their set early — confirmed live), for a weight ' +
-      'they are about to use, for a set you merely announced, or for a set already in the live state ' +
-      'block. If you are unsure whether they finished, ask instead of calling this.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        reps: { type: 'number', description: 'Reps completed, or seconds held for a timed exercise.' },
-        weight: {
-          type: 'number',
-          description: 'Weight lifted, in the unit given by weight_unit. Omit for a bodyweight movement.',
-        },
-        weight_unit: { type: 'string', enum: ['kg', 'lb'], description: 'Unit of `weight`.' },
-        timed: { type: 'boolean', description: 'True when `reps` is a hold in seconds, not a rep count.' },
-      },
-      required: ['reps'],
-    },
-  },
-  {
     name: 'undo_last_set',
     description:
       "Remove the most recently logged set in the user's active in-app workout session — use when " +
       'they say the last one was wrong, misheard, or shouldn\'t have been logged (e.g. "that\'s ' +
-      'wrong, undo that" or "I didn\'t say that"). Removes only the single most recent set, and ' +
+      'wrong, undo that" or "I didn\'t say that"), or that the set count is ahead of what they did ' +
+      '(e.g. "I haven\'t done set two yet", "it counted that twice"). Believe them over the count, ' +
+      'unless this turn\'s note says the app already removed it or that the count already matches what ' +
+      'they said; never ask them to read their screen to you. Removes only the single most recent set, and ' +
       'works whether or not rest is still running. Only say it was removed once this returns ' +
-      '"undone"; then ask for the correct numbers.',
+      '"undone"; then name the set that is next. Ask for corrected numbers only if they said the ' +
+      'numbers themselves were wrong, never when the set simply should not have been counted.',
     input_schema: { type: 'object', properties: {} },
   },
   {
@@ -899,12 +876,26 @@ export const BRAIN_TOOLS = [
       "session state block tells you the current remaining/target seconds); if it doesn't show one, ask " +
       "before calling this. This only requests the change — the app applies it, so don't say a new time " +
       'or that rest was skipped/paused/resumed as settled fact until the next live session state block ' +
-      'confirms it; say what you just asked for, not that it already happened.',
+      'confirms it; say what you just asked for, not that it already happened. To make a rest a ' +
+      'specific length ("make my rest 90 seconds", "give me two minutes between sets"), use action ' +
+      '"set" with the total length in seconds, never "extend". "set" also works between rests, for ' +
+      'the rests still to come, and only then may you say the new length once it returns "set".',
     input_schema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['extend', 'skip', 'pause', 'resume'] },
-        seconds: { type: 'integer', description: 'How many seconds to add — only used when action is "extend".' },
+        action: { type: 'string', enum: ['extend', 'set', 'skip', 'pause', 'resume'] },
+        seconds: {
+          type: 'integer',
+          description: '"extend": seconds to add to the rest running now. "set": the total rest length in seconds.',
+        },
+        scope: {
+          type: 'string',
+          enum: ['current', 'upcoming', 'both'],
+          description:
+            'Only for "set". "current": just the rest running now. "upcoming": every rest after this one, for ' +
+            'the rest of the workout ("make my next rest 90 seconds"). "both": the one running now and every ' +
+            'later one ("make my rests 90 seconds").',
+        },
       },
       required: ['action'],
     },

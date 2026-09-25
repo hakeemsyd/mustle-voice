@@ -1,4 +1,5 @@
 import { normalizeLoadScheme } from './load-intent.ts';
+import { kgToLb } from './weight-units.ts';
 
 export type Units = 'metric' | 'imperial';
 
@@ -29,7 +30,7 @@ const localizeLoadCsv = (load: string, units: Units): string => {
   const numbers = parts.map((v) => Number(v));
   if (numbers.some((n) => !Number.isFinite(n))) return load;
   return units === 'imperial'
-    ? `${numbers.map(toLb).join(', ')} lb`
+    ? `${numbers.map(kgToLb).join(', ')} lb`
     : `${numbers.map(round1).join(', ')} kg`;
 };
 
@@ -44,7 +45,7 @@ export const localizeWeights = (value: unknown, units: Units): unknown => {
     } else if (key === 'load' && typeof raw === 'string' && raw !== 'bodyweight') {
       out[key] = localizeLoadCsv(raw, units);
     } else if (WEIGHT_KEYS.has(key) && typeof raw === 'number') {
-      if (units === 'imperial') out[key.replace(/_kg$/, '_lb')] = toLb(raw);
+      if (units === 'imperial') out[key.replace(/_kg$/, '_lb')] = key === 'weight_kg' ? kgToLb(raw) : toLb(raw);
       else out[key] = round1(raw);
     } else {
       out[key] = localizeWeights(raw, units);

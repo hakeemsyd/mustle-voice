@@ -16,6 +16,7 @@ export type SpokenSetIntent =
   | { kind: 'ignore' }
   | { kind: 'stated_weight'; weight: number }
   | { kind: 'needs_details' }
+  | { kind: 'unconfirmed'; set: ParsedSet }
   | { kind: 'log'; set: ParsedSet };
 
 export interface SpokenSetContext {
@@ -23,13 +24,31 @@ export interface SpokenSetContext {
   timedExercise?: boolean;
   typed?: boolean;
   legacy?: boolean;
+  confirmsBareReps?: boolean;
+  resting?: boolean;
 }
 
-export const SET_PARSER_VERSION = 3;
+export const SET_PARSER_VERSION = 5;
+
+export const CONFIRMS_BARE_REPS_FROM_VERSION = 5;
 
 export const SHARED_PARSER_FROM_VERSION = 2;
 
 export const HOLDS_MISSING_WEIGHT_FROM_VERSION = 3;
+
+export const RESTATEMENT_RULE_FROM_VERSION = 4;
+
+export const RESTATEMENT_WINDOW_MS = 20_000;
+
+export const isRestatement = (
+  lastSetLoggedAt: number | null | undefined,
+  now: number = Date.now(),
+  restFinishedAt?: number | null,
+): boolean =>
+  typeof lastSetLoggedAt === 'number' &&
+  now - lastSetLoggedAt >= 0 &&
+  now - lastSetLoggedAt < RESTATEMENT_WINDOW_MS &&
+  !(typeof restFinishedAt === 'number' && restFinishedAt >= lastSetLoggedAt);
 
 export const straightenQuotes = (text: string): string =>
   (text ?? '').replace(/[\u2018\u2019\u201A\u201B\u2032\u02BC\u0060\u00B4]/g, "'");
@@ -152,11 +171,11 @@ const toKg = (value: number, statedUnit: string | null, units: SetReportUnits): 
   return isPounds ? Math.round(value * 0.453592 * 10) / 10 : value;
 };
 
-export function parseSetReport(
+export const parseSetReport = (
   raw: string,
   units: SetReportUnits = 'metric',
   options: ParseSetOptions = {},
-): ParsedSet | null {
+): ParsedSet | null => {
   const normalized = normalizeSpokenNumbers(straightenQuotes(raw));
 
   if (options.timedExercise) {
@@ -209,18 +228,18 @@ export function parseSetReport(
   const weight = toKg(Number(positional[1]), null, units);
   const reps = Math.round(Number(positional[2]));
   return reps > 0 ? { weight, reps } : null;
-}
+};
 
 const STATED_WEIGHT_PATTERN =
   /^(?:(?:it'?s|its|i'?m\s+using|im\s+using|using|with|at|about|around|roughly|maybe|let'?s\s+do|lets\s+do|do|go\s+with|going\s+with|make\s+it|put\s+on)\s+)?(\d+(?:\.\d+)?)\s*(kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?)\s*\.?$/i;
 
-export function parseStatedWeight(raw: string, units: SetReportUnits = 'metric'): number | null {
+export const parseStatedWeight = (raw: string, units: SetReportUnits = 'metric'): number | null => {
   if (parseSetReport(raw, units) !== null) return null;
   const match = normalizeSpokenNumbers(straightenQuotes(raw)).trim().match(STATED_WEIGHT_PATTERN);
   if (!match) return null;
   const weight = toKg(Number(match[1]), match[2] ?? null, units);
   return weight > 0 ? weight : null;
-}
+};
 
 const BODYWEIGHT_REPLY =
   /^(?:just\s+|only\s+|it\s+was\s+|that\s+was\s+)?(?:my\s+)?(?:bodyweight|body\s+weight|no\s+weight|none|no\s+load|unweighted|nothing)$/i;
@@ -228,7 +247,7 @@ const BODYWEIGHT_REPLY =
 const WEIGHT_REPLY =
   /^(?:(?:it\s+was|it'?s|its|that\s+was|was|i\s+used|i\s+did|at|with|about|around|roughly|like)\s+)?(\d+(?:\.\d+)?)\s*(kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?)?(?:\s+each(?:\s+(?:side|hand|arm))?)?$/i;
 
-export function parseWeightReply(raw: string, units: SetReportUnits = 'metric'): { weight: number | null } | null {
+export const parseWeightReply = (raw: string, units: SetReportUnits = 'metric'): { weight: number | null } | null => {
   const text = normalizeSpokenNumbers(straightenQuotes(raw)).trim().replace(/[.!?]+$/g, '').trim();
   if (!text) return null;
   if (BODYWEIGHT_REPLY.test(text)) return { weight: null };
@@ -236,7 +255,7 @@ export function parseWeightReply(raw: string, units: SetReportUnits = 'metric'):
   if (!match) return null;
   const weight = toKg(Number(match[1]), match[2] ?? null, units);
   return weight > 0 ? { weight } : null;
-}
+};
 
 export const needsWeightBeforeLogging = (
   set: ParsedSet,
@@ -246,6 +265,11 @@ export const needsWeightBeforeLogging = (
 
 const COMPLETION =
   /\b(done|completed|finished|that'?s\s+it|that\s+was\s+it|racked|logged\s+it|in\s+the\s+bank)\b|(?<!\b(?:to|let'?s)\s)\bcomplete\b/i;
+
+const NEGATED_COMPLETION =
+  /\b(?:haven'?t|have\s+not|hasn'?t|has\s+not|hadn'?t|didn'?t|did\s+not|not|never|isn'?t|is\s+not|wasn'?t|was\s+not|aren'?t|yet\s+to)\s+(?:(?:even|actually|really|yet|been|quite|fully|my|the|that|this)\s+){0,3}(?:done|completed|finished|complete)\b/gi;
+
+const withoutNegatedCompletion = (text: string): string => text.replace(NEGATED_COMPLETION, ' ');
 
 const PAST_REPORT = /\b(did|got|hit|managed|knocked\s+out|banged\s+out|pushed\s+out|squeezed\s+out|ended\s+up|only\s+got)\b/i;
 
@@ -289,7 +313,7 @@ const isReportFramed = (sentence: string): boolean =>
 const PRONOUN_ONE =
   /\b(?:that|this|the|last|next|each|every|another|which|no|any|some|a\s+good|a\s+hard|an\s+easy)\s+one\b|\bone\s+(?:more|of\s+(?:them|those|these))\b/gi;
 
-function extractReportedSet(raw: string, units: SetReportUnits): ParsedSet | null {
+const extractReportedSet = (raw: string, units: SetReportUnits): ParsedSet | null => {
   const candidates = splitSentences(normalizeSpokenNumbers(raw.replace(PRONOUN_ONE, ' '))).filter(
     (sentence) =>
       !sentence.endsWith('?') &&
@@ -324,19 +348,24 @@ function extractReportedSet(raw: string, units: SetReportUnits): ParsedSet | nul
     return { weight, reps };
   }
   return null;
-}
+};
 
-export function classifySpokenSet(
+export const classifySpokenSet = (
   raw: string,
   units: SetReportUnits = 'metric',
   context: SpokenSetContext = { awaitingDetails: false },
-): SpokenSetIntent {
+): SpokenSetIntent => {
   const text = straightenQuotes(raw).trim();
   if (!text) return { kind: 'ignore' };
+  if (context.awaitingDetails && context.confirmsBareReps) {
+    const answer = normalizeSpokenNumbers(text).trim().replace(/[.!?]+$/, '').trim().match(/^(\d{1,3})(?:\s*reps?)?$/i);
+    const reps = answer ? Number(answer[1]) : NaN;
+    if (reps >= 1 && reps <= 100) return { kind: 'log', set: { weight: null, reps } };
+  }
   if (!context.typed && isCounting(text)) return { kind: 'ignore' };
 
   const legacy = !!context.legacy;
-  const completed = (legacy ? LEGACY_COMPLETION : COMPLETION).test(text);
+  const completed = legacy ? LEGACY_COMPLETION.test(text) : COMPLETION.test(withoutNegatedCompletion(text));
   const reported = completed || PAST_REPORT.test(text) || SET_ORDINAL.test(text);
   const intended = !completed && (legacy ? LEGACY_FUTURE_INTENT : FUTURE_INTENT).test(text);
   const asked = !legacy && text.endsWith('?');
@@ -347,6 +376,10 @@ export function classifySpokenSet(
     bareWeight: !legacy,
   });
 
+  const holdsDuringRest = !!context.confirmsBareReps && !!context.resting && !context.typed && !context.awaitingDetails;
+  const logOrHold = (set: ParsedSet): SpokenSetIntent =>
+    holdsDuringRest ? { kind: 'unconfirmed', set } : { kind: 'log', set };
+
   if (parsed) {
     if (intended && !context.awaitingDetails) {
       const weight = parseStatedWeight(text, units);
@@ -355,14 +388,15 @@ export function classifySpokenSet(
     if (asked && !context.awaitingDetails) return { kind: 'ignore' };
     const explicitPair = parsed.weight !== null && parsed.unit !== 'seconds';
     if (reported || context.awaitingDetails || explicitPair || parsed.unit === 'seconds' || context.typed) {
-      return { kind: 'log', set: parsed };
+      return logOrHold(parsed);
     }
-    return { kind: 'ignore' };
+    if (!context.confirmsBareReps || legacy) return { kind: 'ignore' };
+    return logOrHold(parsed);
   }
 
   if (!legacy && !context.timedExercise) {
     const loose = extractReportedSet(text, units);
-    if (loose) return { kind: 'log', set: loose };
+    if (loose) return logOrHold(loose);
   }
 
   if (completed) return { kind: 'needs_details' };
@@ -370,23 +404,23 @@ export function classifySpokenSet(
   const weight = parseStatedWeight(text, units);
   if (weight != null) return { kind: 'stated_weight', weight };
   return { kind: 'ignore' };
-}
+};
 
-export function looksLikeFinishedSetReport(text: string): boolean {
+export const looksLikeFinishedSetReport = (text: string): boolean => {
   const raw = straightenQuotes(text).trim();
   if (!raw || isCounting(raw)) return false;
-  if (COMPLETION.test(raw)) return true;
+  if (COMPLETION.test(withoutNegatedCompletion(raw))) return true;
   return extractReportedSet(raw, 'metric') !== null;
-}
+};
 
-export function hasSetCompletionSignal(text: string): boolean {
-  return COMPLETION.test(straightenQuotes(text));
-}
+export const hasSetCompletionSignal = (text: string): boolean => {
+  return COMPLETION.test(withoutNegatedCompletion(straightenQuotes(text)));
+};
 
-export function describesPlannedSet(text: string): boolean {
+export const describesPlannedSet = (text: string): boolean => {
   const raw = straightenQuotes(text);
-  return !COMPLETION.test(raw) && FUTURE_INTENT.test(raw) && extractReportedSet(raw, 'metric') === null;
-}
+  return !COMPLETION.test(withoutNegatedCompletion(raw)) && FUTURE_INTENT.test(raw) && extractReportedSet(raw, 'metric') === null;
+};
 
 const START_SET_PATTERNS = [
   /^(?:ok(?:ay)?|alright|right|yeah|yep)?\s*,?\s*(?:let'?s\s+)?(?:go|start|begin|do|move)(?:ing)?\s*(?:on\s+)?(?:to\s+)?(?:the\s+)?(?:next\s+)?(?:set)?\s*(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)?\s*$/,
@@ -396,17 +430,23 @@ const START_SET_PATTERNS = [
   /^rest\s+(?:is\s+)?(?:done|over|finished)\s*$/,
 ];
 
-export function looksLikeStartSetCommand(raw: string): boolean {
+export const looksLikeStartSetCommand = (raw: string): boolean => {
   const normalized = straightenQuotes(raw).trim().toLowerCase().replace(/[.!?,]+$/g, '');
   if (!normalized) return false;
   return START_SET_PATTERNS.some((pattern) => pattern.test(normalized));
-}
+};
 
 export const AFFIRMATION = /\b(yes|yeah|yep|yup|correct|that['\u2019]?s right|right|confirm(?:ed)?|i did|sure|affirmative)\b/i;
 
 export const NEGATION = /\b(no|nope|nah|wrong|incorrect|didn['\u2019]?t|not right)\b/i;
 
 export const isNegation = (text: string): boolean => NEGATION.test(straightenQuotes(text));
+
+export const confirmsSetDone = (raw: string): boolean => {
+  const text = straightenQuotes(raw);
+  if (isNegation(text)) return false;
+  return isAffirmation(text) || COMPLETION.test(withoutNegatedCompletion(text));
+};
 
 export const isAffirmation = (text: string): boolean =>
   AFFIRMATION.test(straightenQuotes(text)) && !isNegation(text);
@@ -423,21 +463,21 @@ const HIGH_RATIO = 2.5;
 const LOAD_KG = /(\d+(?:\.\d+)?)\s*(?:kgs?|kilos?|kilogrammes?|kilograms?)\b/i;
 const LOAD_LB = /(\d+(?:\.\d+)?)\s*(?:lbs?|pounds?)\b/i;
 
-export function parseLoadSchemeKg(scheme: string | null | undefined): number | null {
+export const parseLoadSchemeKg = (scheme: string | null | undefined): number | null => {
   if (!scheme) return null;
   const kg = LOAD_KG.exec(scheme);
   if (kg) return Number(kg[1]);
   const lb = LOAD_LB.exec(scheme);
   if (lb) return Math.round(Number(lb[1]) * 0.453592 * 10) / 10;
   return null;
-}
+};
 
-export function isImplausibleWeightJump(
+export const isImplausibleWeightJump = (
   next: number | null | undefined,
   reference: number | null | undefined,
-): boolean {
+): boolean => {
   if (next == null || reference == null) return false;
   if (next <= 0 || reference <= 0) return false;
   const ratio = next / reference;
   return ratio < LOW_RATIO || ratio > HIGH_RATIO;
-}
+};

@@ -28,7 +28,7 @@ import { useScreenInsets } from "../hooks/useScreenInsets";
 import { useSharedVoiceSession } from "../session/VoiceSessionProvider";
 import { SYSTEM_CUE_PREFIX } from "../hooks/useVoiceSession";
 import { callBrain } from "../lib/brain";
-import { useActiveSessionContext, type SessionTarget } from "../session/ActiveSessionContext";
+import { useActiveSessionContext, type SessionTarget, type SetOrigin } from "../session/ActiveSessionContext";
 import { usePlanAlternatives } from "../hooks/usePlanAlternatives";
 import { useUnitPrefs } from "../hooks/useUnitPrefs";
 import { convertLoadScheme } from "../lib/loadScheme";
@@ -51,7 +51,7 @@ import {
   parseWeightReply,
   type ParsedSet,
 } from "../lib/parseSetReport";
-import { classifySpokenSet, COACH_ASKS_FOR_SET_DETAILS, isAffirmation, isNegation } from "../lib/spokenSetIntent";
+import { classifySpokenSet, COACH_ASKS_FOR_SET_DETAILS, confirmsSetDone, isAffirmation, isNegation } from "../lib/spokenSetIntent";
 import { isBodyweightWork, isCardioExercise, isTimedExercise } from "../lib/exerciseCatalog";
 import { isImplausibleWeightJump, parseLoadSchemeKg } from "../lib/weightPlausibility";
 import { chooseRestDay } from "../lib/restDay";
@@ -90,7 +90,7 @@ type ChipsState =
   // instead — never silently becomes the running session off a single chip pick.
   | { kind: "switch-confirm-cardio"; activity: string };
 
-export function ActiveSessionScreen({ navigation }: Props) {
+export const ActiveSessionScreen = ({ navigation }: Props) => {
   const insets = useScreenInsets();
   const session = useActiveSessionContext();
 
@@ -222,6 +222,13 @@ export function ActiveSessionScreen({ navigation }: Props) {
       : null;
   };
   const awaitingSetDetailsRef = useRef<{ exerciseIndex: number; at: number } | null>(null);
+  const awaitingDoneRef = useRef<{ exerciseIndex: number; at: number; set: ParsedSet } | null>(null);
+  const heldForDone = () => {
+    const held = awaitingDoneRef.current;
+    return held && held.exerciseIndex === currentExerciseIndex && Date.now() - held.at < WEIGHT_CONFIRM_MS
+      ? held
+      : null;
+  };
   const pendingWeightConfirmRef = useRef<{
     exerciseIndex: number;
     at: number;
@@ -263,10 +270,16 @@ export function ActiveSessionScreen({ navigation }: Props) {
     );
   };
 
-  const commitSet = (weight: number | null, reps: number, viaVoice = false, unit?: "seconds") => {
+  const commitSet = (
+    weight: number | null,
+    reps: number,
+    viaVoice: boolean,
+    unit: "seconds" | undefined,
+    origin: SetOrigin,
+  ): boolean => {
     const followUp = coachSpeaksRef.current ? null : describeAfterSet();
+    if (!session.logSet(weight, reps, unit, origin)) return false;
     followUpShownRef.current = !!followUp;
-    session.logSet(weight, reps, unit);
     session.noteSetLogged(describeParsedSet({ weight, reps, unit }, units), followUp);
     setDraft("");
     // Recorded, not fired here — the "set_logged" cue needs the live_session_state write for
@@ -275,6 +288,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
     // deliberately excluded: the coach already knows about those from its own inline context
     // update a few lines up in the message handler.
     pendingSetCueRef.current = viaVoice ? "skip" : "fire";
+    return true;
   };
 
   //
@@ -291,15 +305,23 @@ export function ActiveSessionScreen({ navigation }: Props) {
   const restManualFinishRef = useRef(-1);
 
   const tryCommitSetRef = useRef<
-    (weight: number | null, reps: number, viaVoice: boolean, unit?: "seconds", weightGiven?: boolean) => boolean
+    (
+      weight: number | null,
+      reps: number,
+      viaVoice: boolean,
+      unit: "seconds" | undefined,
+      weightGiven: boolean,
+      origin: SetOrigin,
+    ) => boolean
   >(() => false);
   const tryCommitSet = (
     weight: number | null,
     reps: number,
     viaVoice: boolean,
-    unit?: "seconds",
-    weightGiven = false,
-  ): boolean => tryCommitSetRef.current(weight, reps, viaVoice, unit, weightGiven);
+    unit: "seconds" | undefined,
+    weightGiven: boolean,
+    origin: SetOrigin,
+  ): boolean => tryCommitSetRef.current(weight, reps, viaVoice, unit, weightGiven, origin);
 
   const {
     orbState, isActive, status: voiceStatus, toggle, sendContextualUpdate, sendUserMessage,
@@ -364,6 +386,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
       // that must still act on the session, and it's what makes "let's go / next set / start
       // set 3" actually clear the timer instead of waiting on a tool call that may never come.
       if (message.role === "user" && !isCardio && resting && looksLikeStartSetCommand(message.text)) {
+        awaitingDoneRef.current = null;
         session.finishRest();
         try {
           // They asked to go, out loud, so this is the one moment that most needs a real spoken
@@ -405,7 +428,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
       if (awaitingWeightConfirm && pendingWeight) {
         if (isAffirmation(message.text)) {
           pendingWeightConfirmRef.current = null;
-          commitSet(pendingWeight.weight, pendingWeight.reps, true, pendingWeight.unit);
+          commitSet(pendingWeight.weight, pendingWeight.reps, true, pendingWeight.unit, { source: "voice" });
           return;
         }
         if (isNegation(message.text)) {
@@ -415,10 +438,20 @@ export function ActiveSessionScreen({ navigation }: Props) {
         }
       }
 
-      const heldSet = heldForWeight();
+      const heldDone = heldForDone();
+      awaitingDoneRef.current = null;
+      if (heldDone && isNegation(message.text)) return;
+      const doneConfirmed =
+        !!heldDone && confirmsSetDone(message.text) && !parseSetReport(message.text, units, { timedExercise: currentIsTimed });
+      if (doneConfirmed && resting) session.finishRest();
+      const heldSet = doneConfirmed ? null : heldForWeight();
       const weightReply = heldSet ? parseWeightReply(message.text, units) : null;
-      let parsed: ParsedSet | null = heldSet && weightReply ? { weight: weightReply.weight, reps: heldSet.reps } : null;
-      const weightGiven = parsed !== null;
+      let parsed: ParsedSet | null = doneConfirmed
+        ? heldDone!.set
+        : heldSet && weightReply
+          ? { weight: weightReply.weight, reps: heldSet.reps }
+          : null;
+      const weightGiven = !doneConfirmed && parsed !== null;
       if (!parsed) {
         const pending = awaitingSetDetailsRef.current;
         const awaitingDetails =
@@ -428,10 +461,20 @@ export function ActiveSessionScreen({ navigation }: Props) {
         const intent = classifySpokenSet(message.text, units, {
           awaitingDetails,
           timedExercise: isTimedExercise(currentExercise?.name),
+          confirmsBareReps: true,
+          resting,
         });
         if (intent.kind === "ignore") return;
         if (intent.kind === "stated_weight") {
           rememberStatedWeight(intent.weight);
+          return;
+        }
+        if ((intent.kind === "log" || intent.kind === "unconfirmed") && session.isRestatementNow()) {
+          awaitingSetDetailsRef.current = null;
+          return;
+        }
+        if (intent.kind === "unconfirmed") {
+          awaitingDoneRef.current = { exerciseIndex: currentExerciseIndex, at: Date.now(), set: intent.set };
           return;
         }
         if (resting) session.finishRest();
@@ -449,10 +492,8 @@ export function ActiveSessionScreen({ navigation }: Props) {
       awaitingSetDetailsRef.current = null;
       const parsedForLog = { ...parsed, weight: weightGiven ? parsed.weight : resolveSetWeight(parsed) };
 
-      if (
-        !awaitingWeightConfirm &&
-        !tryCommitSet(parsedForLog.weight, parsedForLog.reps, true, parsedForLog.unit, weightGiven)
-      ) {
+      if (awaitingWeightConfirm) return;
+      if (!tryCommitSet(parsedForLog.weight, parsedForLog.reps, true, parsedForLog.unit, weightGiven, { source: "voice" })) {
         return;
       }
       const setNumber = currentSetCount + 1;
@@ -571,7 +612,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
       .catch((err) => console.error("[active session] text fallback for coach context failed:", err));
   };
 
-  tryCommitSetRef.current = (weight, reps, viaVoice, unit, weightGiven) => {
+  tryCommitSetRef.current = (weight, reps, viaVoice, unit, weightGiven, origin) => {
     if (!weightGiven && needsWeightBeforeLogging({ weight, reps, unit }, null, currentIsBodyweight)) {
       awaitingWeightRef.current = { exerciseIndex: currentExerciseIndex, at: Date.now(), reps };
       if (!viaVoice) session.announce(`Got ${reps} reps. What weight was that? Nothing logged yet.`);
@@ -595,8 +636,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
       return false;
     }
     pendingWeightConfirmRef.current = null;
-    commitSet(weight, reps, viaVoice, unit);
-    return true;
+    return commitSet(weight, reps, viaVoice, unit, origin);
   };
 
   useEffect(() => {
@@ -622,12 +662,16 @@ export function ActiveSessionScreen({ navigation }: Props) {
   //
   //
 
-  const greetedSessionRef = useRef<typeof target>(null);
+  const { setParsing } = session;
+  useEffect(() => {
+    setParsing(isFocused);
+    return () => setParsing(false);
+  }, [isFocused, setParsing]);
+
   useEffect(() => {
     if (!target || ended) return;
     if (!isCardio && !currentExercise) return;
-    if (greetedSessionRef.current === target) return;
-    greetedSessionRef.current = target;
+    if (!session.claimGreeting()) return;
     // Either outcome sends the cue: a failed live_session_state write is worth greeting through
     // anyway (session_start's own wording falls back to a generic hello when no state block
     // reaches the model), whereas skipping it would leave the user in silence.
@@ -862,7 +906,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
     session.appendMessage("user", text);
     session.persistUserMessage(text);
     setDraft("");
-    tryCommitSet(draftWeightReply.weight, heldDraftSet.reps, false, undefined, true);
+    tryCommitSet(draftWeightReply.weight, heldDraftSet.reps, false, undefined, true, { source: "typed" });
     return true;
   };
 
@@ -881,7 +925,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
         session.persistUserMessage(text);
         setDraft("");
         pendingWeightConfirmRef.current = null;
-        commitSet(pendingWeight.weight, pendingWeight.reps, false, pendingWeight.unit);
+        commitSet(pendingWeight.weight, pendingWeight.reps, false, pendingWeight.unit, { source: "typed" });
         return;
       }
       if (isNegation(text)) {
@@ -921,7 +965,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
         setDraft("");
         awaitingSetDetailsRef.current = null;
         if (resting) session.finishRest();
-        tryCommitSet(resolveSetWeight(intent.set), intent.set.reps, false, intent.set.unit);
+        tryCommitSet(resolveSetWeight(intent.set), intent.set.reps, false, intent.set.unit, false, { source: "typed" });
         return;
       }
       if (intent.kind === "stated_weight") rememberStatedWeight(intent.weight);
@@ -941,7 +985,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
       session.appendMessage("user", text);
       session.persistUserMessage(text);
       setDraft("");
-      tryCommitSet(resolveSetWeight(parsedDraft), parsedDraft.reps, false, parsedDraft.unit);
+      tryCommitSet(resolveSetWeight(parsedDraft), parsedDraft.reps, false, parsedDraft.unit, false, { source: "typed" });
       return;
     }
     const fallbackReps = targetRepsFrom(currentExercise.repScheme);
@@ -1631,7 +1675,7 @@ export function ActiveSessionScreen({ navigation }: Props) {
       />
     </KeyboardAvoidingView>
   );
-}
+};
 
 const styles = StyleSheet.create({
   screen: {

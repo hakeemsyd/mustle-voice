@@ -1,18 +1,32 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
 import { runBrainTurn } from '../_shared/brain-orchestrator.ts';
-import { replayHistory } from '../_shared/replay-history.ts';
+import { APP_LINE_MODALITY, replayHistory } from '../_shared/replay-history.ts';
 import { dropLeadingConcession, dropSelfCorrection } from '../_shared/humanize.ts';
 import { buildSystemPrompt, callModel, MESSAGE_HISTORY_LIMIT } from '../_shared/brain-config.ts';
 import { buildContextBlock, startOfLocalDayUtc } from '../_shared/brain-context.ts';
-import { createHandlers } from '../_shared/brain-handlers.ts';
+import { createHandlers, logSetFromServer, resolveDispute, undoLockFor } from '../_shared/brain-handlers.ts';
+import { describeDisputeOutcome, detectSetCountDispute } from '../_shared/set-dispute.ts';
 import { stripSystemNote } from '../_shared/strip-system-note.ts';
 import { scrubInternalLanguage } from '../_shared/scrub-internal.ts';
-import { describeCueFacts, describeResumedStart, describeTypedTurnSetOutcome } from '../_shared/turn-set-outcome.ts';
+import {
+  describeCueFacts,
+  describeResumedStart,
+  describeTypedTurnSetOutcome,
+  describeUnconfirmedLog,
+  isLiveStrengthSession,
+  resolveTurnSetOutcome,
+  TURN_NOTE_HEADER,
+  type TurnSetOutcome,
+} from '../_shared/turn-set-outcome.ts';
 import { claimFallback, guardClaims, trackToolOutcomes, withGuardedFinalText } from '../_shared/claim-guard.ts';
 import { contextHasInjuryGate } from '../_shared/injury-context.ts';
 import { looksLikeFinishedSetReport } from '../_shared/set-report.ts';
 import { SYSTEM_CUE_PREFIX } from '../_shared/system-cue.ts';
-import { buildLiveSessionSnapshot, LIVE_STATE_MAX_AGE_MS } from '../_shared/live-session-format.ts';
+import {
+  buildLiveSessionSnapshot,
+  describeLiveSessionSnapshot,
+  LIVE_STATE_MAX_AGE_MS,
+} from '../_shared/live-session-format.ts';
 
 const SET_CONFIRMING_CUES = new Set(['set_logged', 'exercise_advanced']);
 const SESSION_START_CUE = 'session_start';
@@ -53,17 +67,8 @@ Deno.serve(async (req) => {
     const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
     const messageText = typeof message === 'string' ? message : '';
     const cueName = messageText.startsWith(SYSTEM_CUE_PREFIX) ? messageText.slice(SYSTEM_CUE_PREFIX.length).trim() : null;
-    const tracked = trackToolOutcomes(
-      createHandlers(supabase, userId, timezone, {
-        currentUserText: message,
-        appLoggedThisTurn: cueName !== null && SET_CONFIRMING_CUES.has(cueName),
-      }),
-    );
-    const handlers = tracked.handlers;
     const liveBlockText = typeof liveSessionState === 'string' ? liveSessionState : '';
-    const liveStrengthSession =
-      liveBlockText.includes('- Current exercise:') && !/Status: finished/.test(liveBlockText);
-    const restActive = /Status: resting/.test(liveBlockText);
+    const sentFromWorkoutScreen = liveBlockText.length > 0;
 
     const askedAt = new Date();
     // Global Chat is a continuous scrollback with no session boundary of its own, so without a
@@ -124,14 +129,68 @@ Deno.serve(async (req) => {
       }
     }
 
-    const sessionStartedAt =
-      liveRow && Date.now() - new Date(liveRow.updated_at).getTime() < LIVE_STATE_MAX_AGE_MS
-        ? (liveRow.state as any)?.startedAt
-        : null;
+    const liveRowFresh = !!liveRow && Date.now() - new Date(liveRow.updated_at).getTime() < LIVE_STATE_MAX_AGE_MS;
+    const sessionStartedAt = liveRowFresh ? (liveRow!.state as any)?.startedAt : null;
+    const turnUnits = unitsRow?.unit_prefs === 'imperial' ? 'imperial' : 'metric';
+    const dispute = cueName === null && liveRowFresh ? detectSetCountDispute(messageText, liveRow!.state) : null;
+    const disputeResolution = dispute ? await resolveDispute(supabase, userId, dispute) : null;
+    let currentLiveState = liveRowFresh ? liveRow!.state : null;
+    if (disputeResolution === 'undone') {
+      const { data: refreshed } = await supabase
+        .from('live_session_state')
+        .select('state')
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (refreshed) currentLiveState = refreshed.state;
+    }
+    if (dispute) {
+      console.log(`[brain] set-count dispute on ${dispute.exerciseName}: ${dispute.done} -> ${dispute.targetDone}, ${disputeResolution}`);
+    }
+    const liveSnapshot = currentLiveState && !isDailyGreeting ? buildLiveSessionSnapshot(currentLiveState) : null;
+    const turnLiveBlock =
+      liveSnapshot && (disputeResolution === 'undone' || !sentFromWorkoutScreen)
+        ? describeLiveSessionSnapshot(liveSnapshot, turnUnits)
+        : liveBlockText;
+    const liveStrengthSession =
+      turnLiveBlock.includes('- Current exercise:') && !/Status: finished/.test(turnLiveBlock);
+    const restActive = /Status: resting/.test(turnLiveBlock);
+
+    let chatSetOutcome: TurnSetOutcome | null = null;
+    if (cueName === null && !dispute && !sentFromWorkoutScreen && isLiveStrengthSession(liveSnapshot)) {
+      const lastCoachRow = (history ?? []).find(
+        (m: any) => m.role === 'assistant' && !m.greeting_key && m.modality !== APP_LINE_MODALITY,
+      );
+      chatSetOutcome = resolveTurnSetOutcome({
+        userText: messageText,
+        snapshot: liveSnapshot,
+        units: turnUnits,
+        lastCoachMessage: lastCoachRow ? { content: String(lastCoachRow.content ?? ''), at: lastCoachRow.at ?? null } : null,
+        recentUserMessages: (history ?? [])
+          .filter((m: any) => m.role === 'user' && !m.hidden && !String(m.content ?? '').startsWith(SYSTEM_CUE_PREFIX))
+          .slice(0, 3)
+          .map((m: any) => ({ content: String(m.content ?? ''), at: m.at ?? null })),
+        holdsMissingWeight: true,
+        appliesRestatementRule: true,
+        confirmsBareReps: true,
+        typed: modality !== 'voice',
+      });
+      if (chatSetOutcome?.kind === 'logged' && chatSetOutcome.set) {
+        const landed = await logSetFromServer(supabase, userId, chatSetOutcome.set, messageText);
+        if (!landed) chatSetOutcome = { kind: 'not_logged', note: describeUnconfirmedLog() };
+      }
+    }
+
+    const tracked = trackToolOutcomes(
+      createHandlers(supabase, userId, timezone, {
+        currentUserText: message,
+        undoLock: undoLockFor(disputeResolution),
+      }),
+    );
+    const handlers = tracked.handlers;
     const scopedHistory =
       cueName === SESSION_START_CUE || isDailyGreeting
         ? []
-        : liveStrengthSession && typeof sessionStartedAt === 'string'
+        : sentFromWorkoutScreen && liveStrengthSession && typeof sessionStartedAt === 'string'
           ? (history ?? []).filter((m: any) => !m.at || m.at >= sessionStartedAt)
           : (history ?? []);
     const priorMessages = replayHistory(scopedHistory.slice().reverse());
@@ -144,12 +203,17 @@ Deno.serve(async (req) => {
       : message;
     const messages = [...priorMessages, { role: 'user', content: userContent }];
 
-    const typedSetNote = liveStrengthSession && cueName === null ? describeTypedTurnSetOutcome(restActive) : null;
-    const turnUnits = unitsRow?.unit_prefs === 'imperial' ? 'imperial' : 'metric';
-    const liveSnapshot = typeof sessionStartedAt === 'string' ? buildLiveSessionSnapshot(liveRow!.state) : null;
+    const typedSetNote =
+      dispute && disputeResolution
+        ? describeDisputeOutcome(dispute, disputeResolution, TURN_NOTE_HEADER, liveSnapshot ? liveSnapshot.status === 'resting' : null)
+        : chatSetOutcome
+          ? chatSetOutcome.note
+          : liveStrengthSession && cueName === null
+            ? describeTypedTurnSetOutcome(restActive)
+            : null;
     const resumeNote = cueName === SESSION_START_CUE ? describeResumedStart(liveSnapshot, turnUnits) : null;
     const cueFacts = describeCueFacts(cueName, liveSnapshot, turnUnits);
-    const fullContextBlock = [contextBlock, liveBlockText || null, typedSetNote, resumeNote, cueFacts]
+    const fullContextBlock = [contextBlock, turnLiveBlock || null, typedSetNote, resumeNote, cueFacts]
       .filter(Boolean)
       .join('\n\n');
     const systemPrompt = buildSystemPrompt((history ?? []).length > 0, fullContextBlock, 'text', isDailyGreeting);
@@ -172,9 +236,9 @@ Deno.serve(async (req) => {
     const guarded = guardClaims(result.reply, {
       liveSession: liveStrengthSession,
       injuryOnFile,
-      setLoggedThisTurn: (cueName !== null && SET_CONFIRMING_CUES.has(cueName)) || tracked.outcomes.setLogged,
+      setLoggedThisTurn: (cueName !== null && SET_CONFIRMING_CUES.has(cueName)) || chatSetOutcome?.kind === 'logged',
       restActive,
-      actionSucceededThisTurn: tracked.outcomes.actionSucceeded,
+      actionSucceededThisTurn: tracked.outcomes.actionSucceeded || disputeResolution === 'undone',
     });
     if (guarded.dropped.length > 0) console.warn('[brain] dropped unbacked claims:', guarded.dropped.join(' | '));
     const guardedReply =

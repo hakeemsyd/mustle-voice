@@ -99,7 +99,7 @@ const STOP_PHRASES = new Set([
 // itself: these are never a stop command on their own, only noise in front of one.
 const LEADING_FILLER_WORDS = new Set(['ok', 'okay', 'alright', 'so', 'well', 'please']);
 
-function isStopCommand(text: string): boolean {
+const isStopCommand = (text: string): boolean => {
   // Confirmed live: "Okay, so that's all. Bye" never matched — the comma after "Okay" blocked
   // the old single prefix-regex, and the fixed sentence-final-punctuation strip only looked at
   // the very end of the whole utterance, never noticing the "Bye" was its own clause. Splitting
@@ -119,7 +119,7 @@ function isStopCommand(text: string): boolean {
     words = words.slice(1);
   }
   return STOP_PHRASES.has(words.join(' '));
-}
+};
 
 // If the user hasn't said anything in this long, the conversation is almost certainly over —
 // close it rather than let the agent keep listening/checking in indefinitely (confirmed live:
@@ -134,14 +134,18 @@ const WORKOUT_SILENCE_TIMEOUT_MS = 10 * 60_000;
 const HANDOFF_GRACE_MS = 600;
 
 const OWED_REPLY_GRACE_MS = 10_000;
+const END_SESSION_TIMEOUT_MS = 3_000;
+
+const settleWithin = (work: unknown, ms: number): Promise<void> =>
+  Promise.race([Promise.resolve(work).then(() => undefined), new Promise<void>((resolve) => setTimeout(resolve, ms))]);
 const SILENCE_CHECK_INTERVAL_MS = 5_000;
 
 // Wraps the real ElevenLabs conversation hook (not a decorative animation) —
 // must be called inside a <ConversationProvider> (see App.tsx).
-export function useVoiceSession(
+export const useVoiceSession = (
   onSpokenMessage?: (message: SpokenMessage) => void,
   config?: VoiceSessionConfig,
-) {
+) => {
   const [reconnecting, setReconnecting] = useState(false);
   const [voiceDropped, setVoiceDropped] = useState(false);
   const [idleClosed, setIdleClosed] = useState(false);
@@ -165,6 +169,10 @@ export function useVoiceSession(
   const typedWhileMutedRef = useRef(false);
   const replyOwedRef = useRef(false);
   const pendingEndRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const teardownRef = useRef<Promise<void>>(Promise.resolve());
+  const endAndReleaseRef = useRef<(context: string) => Promise<void>>(() => Promise.resolve());
+  const startingRef = useRef(false);
+  const startCancelledRef = useRef(false);
   const clearPendingEnd = () => {
     if (pendingEndRef.current) {
       clearTimeout(pendingEndRef.current);
@@ -220,9 +228,7 @@ export function useVoiceSession(
         if (!cleaned.startsWith(SYSTEM_CUE_PREFIX)) lastUserActivityRef.current = Date.now();
         if (isStopCommand(cleaned)) {
           intentionalEndRef.current = true;
-          Promise.resolve(endSession())
-            .then(() => releaseMicrophone())
-            .catch((err) => reportEndSessionFailure(' on stop command', err));
+          void endAndReleaseRef.current(' on stop command');
           return;
         }
       }
@@ -277,24 +283,44 @@ export function useVoiceSession(
   // session in the same app run connected with a mic that couldn't capture: the agent talked,
   // heard nothing back, and kept re-asking the same question. Awaited, not fired alongside, so
   // the session never opens against a still-muted route.
+  endAndReleaseRef.current = (context: string) => {
+    const run = teardownRef.current
+      .catch(() => undefined)
+      .then(() => settleWithin(endSession(), END_SESSION_TIMEOUT_MS))
+      .then(() => releaseMicrophone())
+      .catch((err) => reportEndSessionFailure(context, err));
+    teardownRef.current = run;
+    return run;
+  };
+
   const startSessionWithRecordingEnabled = async (options: {
     userId?: string;
     dynamicVariables?: Record<string, string>;
   }) => {
+    if (startingRef.current) return;
+    startingRef.current = true;
+    startCancelledRef.current = false;
     try {
-      await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
-    } catch (err) {
-      console.warn('[voice] failed to enable recording audio mode:', err);
+      await teardownRef.current.catch(() => undefined);
+      if (startCancelledRef.current) return;
+      try {
+        await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+      } catch (err) {
+        console.warn('[voice] failed to enable recording audio mode:', err);
+      }
+      await enableWebrtcAudio().catch((err) =>
+        console.warn('[voice] failed to enable the WebRTC audio unit:', err),
+      );
+      if (startCancelledRef.current) return;
+      // Deliberately not awaited: the SDK types startSession as `=> void` and its implementation is
+      // fire-and-forget (failures surface through onError, not a rejected promise). Awaiting it
+      // resolved on the very next microtask, which made anything sequenced "after the connection is
+      // up" actually run during the SDK's own audio setup — see the voiceChat note in the
+      // status-connected effect below.
+      startSession(options);
+    } finally {
+      startingRef.current = false;
     }
-    await enableWebrtcAudio().catch((err) =>
-      console.warn('[voice] failed to enable the WebRTC audio unit:', err),
-    );
-    // Deliberately not awaited: the SDK types startSession as `=> void` and its implementation is
-    // fire-and-forget (failures surface through onError, not a rejected promise). Awaiting it
-    // resolved on the very next microtask, which made anything sequenced "after the connection is
-    // up" actually run during the SDK's own audio setup — see the voiceChat note in the
-    // status-connected effect below.
-    startSession(options);
   };
 
   useEffect(() => {
@@ -377,9 +403,7 @@ export function useVoiceSession(
       if (Date.now() - lastUserActivityRef.current < idleTimeoutMs) return;
       intentionalEndRef.current = true;
       setIdleClosed(true);
-      Promise.resolve(endSession())
-        .then(() => releaseMicrophone())
-        .catch((err) => reportEndSessionFailure(' on silence timeout', err));
+      void endAndReleaseRef.current(' on silence timeout');
     }, SILENCE_CHECK_INTERVAL_MS);
     return () => clearInterval(id);
   }, [status, endSession, muted, workoutActive]);
@@ -445,9 +469,7 @@ export function useVoiceSession(
         if (status !== 'connected' && status !== 'connecting') return;
         intentionalEndRef.current = true;
         endedByInterruptionRef.current = true;
-        Promise.resolve(endSession())
-          .then(() => releaseMicrophone())
-          .catch((err) => reportEndSessionFailure(' on audio interruption', err));
+        void endAndReleaseRef.current(' on audio interruption');
       },
       // Only resumes a call this listener itself closed, so a plain "ended" with nothing to
       // restore (an interruption that arrived while voice was already off) never dials out
@@ -496,7 +518,7 @@ export function useVoiceSession(
   // unhandled rejection — a full red-screen crash — rather than the session simply not
   // starting, so every path is caught here.
   const connectNow = () => {
-    if (isActive) return;
+    if (isActive || startingRef.current) return;
     if (reconnectTimerRef.current) {
       clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
@@ -515,6 +537,7 @@ export function useVoiceSession(
   };
 
   const disconnectNow = () => {
+    if (startingRef.current) startCancelledRef.current = true;
     if (!isActive) return;
     if (reconnectTimerRef.current) {
       clearTimeout(reconnectTimerRef.current);
@@ -522,9 +545,7 @@ export function useVoiceSession(
     }
     reconnectAttemptsRef.current = MAX_AUTO_RECONNECTS;
     intentionalEndRef.current = true;
-    Promise.resolve(endSession())
-      .then(() => releaseMicrophone())
-      .catch((err) => reportEndSessionFailure('', err));
+    void endAndReleaseRef.current('');
   };
 
   // Screens put these straight into effect dependency arrays to open/close the mic on focus, so
@@ -660,4 +681,4 @@ export function useVoiceSession(
     setMuteState: applyMute,
     setWorkoutActive,
   };
-}
+};

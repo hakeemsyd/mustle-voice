@@ -1,6 +1,6 @@
 import { useCallback, useRef } from 'react';
 import { AppActionListener, type AppAction } from './AppActionListener';
-import { useActiveSessionContext, type SessionStatus } from './ActiveSessionContext';
+import { useActiveSessionContext, type RestLengthScope, type SessionStatus } from './ActiveSessionContext';
 import { navigateFromAppAction } from '../navigation/navigationRef';
 import { notifyHomeRefresh } from '../lib/homeRefreshBridge';
 
@@ -8,7 +8,9 @@ interface AppActionBridgeProps {
   userId: string | null;
 }
 
-export function AppActionBridge({ userId }: AppActionBridgeProps) {
+const REST_SCOPES = new Set<RestLengthScope>(['current', 'upcoming', 'both']);
+
+export const AppActionBridge = ({ userId }: AppActionBridgeProps) => {
   const session = useActiveSessionContext();
   // The context's own value is a new object on nearly every render during an active session
   // (elapsedSec ticks every second, sets/messages/rest state all change constantly) — confirmed
@@ -44,6 +46,7 @@ export function AppActionBridge({ userId }: AppActionBridgeProps) {
           Number.isFinite(weight) && weight > 0 ? weight : null,
           Math.round(reps),
           action.payload?.unit === 'seconds' ? 'seconds' : undefined,
+          { source: 'coach' },
         );
         break;
       }
@@ -86,6 +89,12 @@ export function AppActionBridge({ userId }: AppActionBridgeProps) {
         if (restAction === 'extend') {
           const seconds = Number(action.payload?.seconds);
           session.extendRest(Number.isFinite(seconds) && seconds > 0 ? seconds : undefined, 'coach');
+        } else if (restAction === 'set') {
+          const seconds = Number(action.payload?.seconds);
+          const scope = action.payload?.scope as RestLengthScope;
+          if (Number.isFinite(seconds) && seconds > 0 && REST_SCOPES.has(scope)) {
+            session.setRestLength(Math.round(seconds), scope, 'coach');
+          }
         } else if (restAction === 'skip') {
           session.finishRest();
         } else if (restAction === 'pause') {
@@ -99,4 +108,4 @@ export function AppActionBridge({ userId }: AppActionBridgeProps) {
   }, []);
 
   return <AppActionListener userId={userId} onAction={onAction} />;
-}
+};
