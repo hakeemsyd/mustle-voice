@@ -3,7 +3,7 @@ import { finalizeStaleLiveSession } from './interrupted-session.ts';
 import { LIVE_STATE_MAX_AGE_MS } from './live-session-format.ts';
 import { buildLoadHistory, describeLoadHistory } from './load-history.ts';
 import { describeActiveInjuries, describeMentionedInjury, describeUnloggedPainReport } from './injury-context.ts';
-import { describeTodaysFoodLog } from './food-log-context.ts';
+import { describeNutritionTargets, describeTodaysFoodLog } from './food-log-context.ts';
 import { describeImportedWorkout } from './rep-target.ts';
 import { describeConsultationStatus } from './consultation-context.ts';
 import {
@@ -14,6 +14,18 @@ import {
   weekdayLabel,
   type ScheduleDay,
 } from './training-schedule.ts';
+import { describeDayMentions } from './day-workout.ts';
+import {
+  closeTimedOutWorkouts,
+  describeSetCount,
+  endsTheDay,
+  followupAskedRecently,
+  isOpenWorkout,
+  LIFECYCLE_COLUMNS,
+  needsFollowup,
+  setCountOf,
+  type LifecycleRow,
+} from './workout-lifecycle.ts';
 
 interface PlanSessionRow {
   id: string;
@@ -23,7 +35,7 @@ interface PlanSessionRow {
   plan_exercise?: { ord: number; exercise: { name: string } | null }[];
 }
 
-interface WorkoutLogRow {
+interface WorkoutLogRow extends LifecycleRow {
   at: string;
   plan_session_id: string | null;
   status?: string | null;
@@ -84,7 +96,14 @@ export function startOfLocalDayUtc(timezone: string | null | undefined, at: Date
 // the full WorkoutLogRow.
 export function logsInTimezone<T extends { at: string }>(logs: T[], timezone: string | null | undefined): T[] {
   if (!timezone) return logs;
-  return logs.map((log) => ({ ...log, at: toTimezone(new Date(log.at), timezone).toISOString() }));
+  const shift = (iso: unknown) =>
+    typeof iso === 'string' && iso ? toTimezone(new Date(iso), timezone).toISOString() : iso;
+  return logs.map((log) => {
+    const shifted: any = { ...log, at: shift(log.at) };
+    if ('last_activity_at' in shifted) shifted.last_activity_at = shift(shifted.last_activity_at);
+    if ('ended_at' in shifted) shifted.ended_at = shift(shifted.ended_at);
+    return shifted as T;
+  });
 }
 
 export async function fetchRestDayDates(supabase: any, userId: string, sinceIso: string): Promise<Set<string>> {
@@ -120,9 +139,7 @@ export async function fetchDayOverrideSession(
   return Array.isArray(session) ? (session[0] ?? null) : session;
 }
 
-// An 'interrupted' session (see interrupted-session.ts) is just as unresolved as a 'partial' one
-// — neither should advance a flexible rotation or count as "done today" until the coach has
-// actually reconciled what happened, so both are treated identically here.
+// 'interrupted' is a retired status (see the 20260929100000 migration); old rows read as partial.
 function isPartial(log: WorkoutLogRow): boolean {
   return log.status === 'partial' || log.status === 'interrupted';
 }
@@ -131,12 +148,13 @@ function sameLocalDay(a: Date, b: Date): boolean {
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }
 
-const holdsRotation = (log: WorkoutLogRow, now: Date): boolean =>
-  isPartial(log) && sameLocalDay(new Date(log.at), now);
+const holdsRotation = (log: WorkoutLogRow, now: Date): boolean => isOpenWorkout(log, now.getTime());
+
+const endsLocalDay = (log: WorkoutLogRow, now: Date): boolean => endsTheDay(log, now.getTime());
 
 const wasFinishedToday = (logs: WorkoutLogRow[], sessionId: string, now: Date): boolean =>
   logs.some(
-    (log) => log.plan_session_id === sessionId && !isPartial(log) && sameLocalDay(new Date(log.at), now),
+    (log) => log.plan_session_id === sessionId && endsLocalDay(log, now) && sameLocalDay(new Date(log.at), now),
   );
 
 const byMostRecentFinishedFirst = (a: WorkoutLogRow, b: WorkoutLogRow): number => {
@@ -169,7 +187,7 @@ export function resolveTodaySession(
   if (!flexible) return null;
   if (trainingDays && trainingDays.length > 0 && !trainingDays.includes(now.getDay())) return null;
 
-  const completedToday = logs.some((log) => !isPartial(log) && sameLocalDay(new Date(log.at), now));
+  const completedToday = logs.some((log) => endsLocalDay(log, now) && sameLocalDay(new Date(log.at), now));
   if (completedToday) return null;
 
   const rotation = sessions.slice().sort((a, b) => a.day_order - b.day_order);
@@ -265,19 +283,199 @@ function describeSession(session: PlanSessionRow): string {
 // or DST it silently drifts from where the user actually is, misclassifying which local day a
 // meal or workout falls on. Confirmed live: a meal logged late at night got pulled into "today"
 // a full day off. Stored value remains only as a fallback for the rare request that omits it.
+const localTimeLabel = (iso: string, timezone: string | null): string =>
+  new Date(iso).toLocaleString('en-US', {
+    weekday: 'long',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZone: timezone ?? 'UTC',
+  });
+
+const describeLoggedExercises = (row: any): string => {
+  const done = Array.isArray(row.exercises_done) ? row.exercises_done : [];
+  return done.length > 0
+    ? done.map((e: any) => `${e.name} ${e.sets} set${Number(e.sets) === 1 ? '' : 's'}`).join(', ')
+    : 'nothing yet';
+};
+
+const lastWorkoutMessages = async (supabase: any, workoutLogId: string): Promise<string[]> => {
+  const { data: conversation } = await supabase
+    .from('conversation')
+    .select('id')
+    .eq('workout_log_id', workoutLogId)
+    .limit(1)
+    .maybeSingle();
+  if (!conversation?.id) return [];
+  const { data } = await supabase
+    .from('message')
+    .select('content')
+    .eq('conversation_id', conversation.id)
+    .eq('role', 'user')
+    .eq('hidden', false)
+    .order('at', { ascending: false })
+    .limit(4);
+  return ((data ?? []) as { content: string }[])
+    .map((m) => String(m.content ?? '').trim())
+    .filter((text) => text && !text.startsWith('['))
+    .reverse();
+};
+
+export const FOLLOWUP_ANSWER_RULES =
+  'How to handle their answer, one step at a time: ' +
+  '(1) Ran out of time or had to leave: acknowledge it, keep the workout as it is with ' +
+  'resolve_interrupted_workout outcome "ended_early" (pass their reason), then help them decide what is next. ' +
+  '(2) Discomfort or pain: ask what hurts and how bad on a 0 to 10 scale before anything else, record it with ' +
+  'record_injury, keep the workout with outcome "ended_early", and adjust today around it. ' +
+  '(3) An app problem: apologise in a few words, keep what was logged with outcome "ended_early", and ask whether ' +
+  'they finished the rest anyway. ' +
+  '(4) They finished it without logging: do NOT assume the planned sets were done. Ask which exercises and sets ' +
+  'they did after what is logged, with reps and weights, and only then call outcome "completed_independent" with ' +
+  'exactly those sets. ' +
+  '(5) They want it gone: outcome "discard" removes it and the same session stays next in their plan. ' +
+  'Never call it complete because of how many sets were logged. Ending it early needs no confirmation step: their ' +
+  'sets are kept either way, so acknowledge it once and never ask them to confirm it or say you are locking it in. ' +
+  'Only adding sets they did elsewhere or discarding it needs a preview and their yes, as the tool says. ' +
+  'When you move on to what is next, it is the session due TODAY, from the "Today\'s scheduled session" line above. ' +
+  'Say "today", never a weekday name and never a future date: the same focus can appear more than once in the ' +
+  'schedule list, and naming the later one tells them to train on the wrong day.';
+
+async function describeUnfinishedWorkout(
+  supabase: any,
+  row: any,
+  displayName: string | null,
+  timezone: string | null,
+): Promise<string | null> {
+  const now = Date.now();
+  const focus = humanizeFocus(row.plan_session?.focus ?? 'training');
+  const count = describeSetCount(setCountOf(row));
+  const logged = describeLoggedExercises(row);
+  const lastSet = localTimeLabel(row.last_activity_at ?? row.at, timezone);
+
+  if (isOpenWorkout(row, now)) {
+    const deadline = localTimeLabel(new Date(new Date(row.last_activity_at ?? row.at).getTime() + 86_400_000).toISOString(), timezone);
+    return (
+      `Unfinished workout they can still continue: "${focus}" (${count}: ${logged}; last set ${lastSet}). ` +
+      `Home and the workout preview show a Continue Session button for it until ${deadline}, and continuing picks ` +
+      'up exactly where they stopped. If they ask about it or want to train, offer to continue it with that button. ' +
+      'It is not finished and not ended early, so never call it done.'
+    );
+  }
+  if (!needsFollowup(row, now)) return null;
+
+  const name = (displayName ?? '').trim() && /[a-z]/i.test(displayName ?? '') ? ` ${displayName!.trim()}` : '';
+  const reference = `workout_log_id ${row.id}`;
+  if (row.followup_asked_at) {
+    if (!followupAskedRecently(row, now)) return null;
+    return (
+      `You already asked them (${localTimeLabel(row.followup_asked_at, timezone)}) how the rest of their unfinished ` +
+      `"${focus}" workout went (${count}: ${logged}; ${reference}). Do not ask again. If their message answers it, ` +
+      `act on it. If they talk about something else, just answer that. ${FOLLOWUP_ANSWER_RULES}`
+    );
+  }
+
+  const said = await lastWorkoutMessages(supabase, row.id);
+  const reason = typeof row.note === 'string' && row.note.trim() ? row.note.trim() : null;
+  const explained =
+    reason || said.length > 0
+      ? ` What they said during that workout: ${[reason ? `(end reason) "${reason}"` : null, ...said.map((t) => `"${t}"`)]
+          .filter(Boolean)
+          .join(', ')}. If any of that already says why they stopped (they had to go, something hurt, the app ` +
+        'broke), acknowledge that reason instead of asking why, for example "Welcome back. You had to cut ' +
+        `${focus} short last time. Did you get the rest of it done, or leave it there?"`
+      : '';
+  return (
+    `Unfinished workout to follow up on: "${focus}", closed on its own after 24 hours with no activity ` +
+    `(${count}: ${logged}; last set ${lastSet}; ${reference}). Nothing has been asked about it yet. Ask about it ` +
+    `FIRST, before today's workout or anything else, in one or two short sentences, for example "Welcome back${name}. ` +
+    `I only have part of your ${focus} workout recorded. How did the rest of it go?" Then stop and wait for their ` +
+    `answer: do not bring up today's workout in the same message.${explained} ${FOLLOWUP_ANSWER_RULES}`
+  );
+}
+
+export const fetchUnaskedFollowup = async (
+  supabase: any,
+  userId: string,
+): Promise<{ id: string; focus: string | null } | null> => {
+  const { data } = await supabase
+    .from('workout_log')
+    .select(`id, at, status, ${LIFECYCLE_COLUMNS}, plan_session!workout_log_plan_session_id_fkey(focus)`)
+    .eq('user_id', userId)
+    .in('status', ['partial', 'interrupted'])
+    .order('last_activity_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (!data || data.followup_asked_at || !needsFollowup(data)) return null;
+  return { id: data.id, focus: (data as any).plan_session?.focus ?? null };
+};
+
+export const markFollowupAskedIfRaised = async (
+  supabase: any,
+  userId: string,
+  reply: string,
+  greetingKey: string | null = null,
+): Promise<void> => {
+  const pending = await fetchUnaskedFollowup(supabase, userId);
+  if (!pending) return;
+  const focus = pending.focus ? humanizeFocus(pending.focus).toLowerCase() : '';
+  const text = (reply ?? '').toLowerCase();
+  const raised =
+    greetingKey === `followup:${pending.id}` ||
+    (text.includes('?') &&
+      ((!!focus && text.includes(focus)) || /\b(?:rest of (?:it|that|the workout)|part of your|last workout|unfinished)\b/.test(text)));
+  if (!raised) return;
+  const { error } = await supabase
+    .from('workout_log')
+    .update({ followup_asked_at: new Date().toISOString() })
+    .eq('id', pending.id)
+    .eq('user_id', userId);
+  if (error) console.error('[brain] failed to mark the follow-up as asked:', error.message);
+};
+
+export const settleFollowupOnAnswer = async (
+  supabase: any,
+  userId: string,
+  userText: string | null | undefined,
+): Promise<void> => {
+  const answer = (userText ?? '').trim();
+  if (!answer) return;
+  const { data } = await supabase
+    .from('workout_log')
+    .select(`id, at, status, note, ${LIFECYCLE_COLUMNS}`)
+    .eq('user_id', userId)
+    .in('status', ['partial', 'interrupted'])
+    .not('followup_asked_at', 'is', null)
+    .is('followup_resolved_at', null)
+    .order('last_activity_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (!data || !needsFollowup(data)) return;
+  const { error } = await supabase
+    .from('workout_log')
+    .update({
+      followup_resolved_at: new Date().toISOString(),
+      note: typeof data.note === 'string' && data.note.trim() ? data.note : answer.slice(0, 300),
+    })
+    .eq('id', data.id)
+    .eq('user_id', userId);
+  if (error) console.error('[brain] failed to settle the follow-up:', error.message);
+};
+
 export async function buildContextBlock(
   supabase: any,
   userId: string,
   requestTimezone?: string | null,
   currentUserText?: string | null,
 ): Promise<string> {
-  // Must resolve before anything below reads workout_log/live_session_state — it can insert a
-  // fresh 'interrupted' row and always clears any stale live_session_state row, both of which
-  // the rest of this function (and resolveTodaySession's rotation logic) need to see this turn,
-  // not next turn.
+  // Must resolve before anything below reads workout_log/live_session_state — it can write a stale
+  // session's sets to its (still open) partial row, closes workouts left for 24 hours, and always
+  // clears any stale live_session_state row, all of which the rest of this function (and
+  // resolveTodaySession's rotation logic) need to see this turn, not next turn.
   // TEMPORARY — voice-timing instrumentation. Remove once the slow phase is identified.
   const tStale0 = Date.now();
-  await finalizeStaleLiveSession(supabase, userId, LIVE_STATE_MAX_AGE_MS);
+  await Promise.all([
+    finalizeStaleLiveSession(supabase, userId, LIVE_STATE_MAX_AGE_MS),
+    closeTimedOutWorkouts(supabase, userId),
+  ]);
   console.log(`[voice-timing:server] finalizeStaleLiveSession: +${Date.now() - tStale0}ms`);
 
   const ninetyDaysAgo = new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10);
@@ -296,13 +494,14 @@ export async function buildContextBlock(
     { data: activePlan },
     { data: recentLogs },
     restDayDates,
-    { data: interrupted },
+    { data: unfinished },
     eagerOverride,
     { data: liveRow },
     { data: lastWeight },
     { data: activeInjuries, error: injuriesError },
     { data: eagerFoodToday },
     { data: consultationProgress },
+    { data: nutritionTarget },
   ] = await Promise.all([
     supabase.from('profile').select('timezone, unit_prefs, display_name').eq('user_id', userId).maybeSingle(),
     supabase
@@ -313,17 +512,19 @@ export async function buildContextBlock(
       .maybeSingle(),
     supabase
       .from('workout_log')
-      .select('at, plan_session_id, status, exercises_done, plan_session!workout_log_plan_session_id_fkey(focus)')
+      .select(`at, plan_session_id, status, exercises_done, ${LIFECYCLE_COLUMNS}, plan_session!workout_log_plan_session_id_fkey(focus)`)
       .eq('user_id', userId)
       .order('at', { ascending: false })
       .limit(10),
     fetchRestDayDates(supabase, userId, ninetyDaysAgo),
     supabase
       .from('workout_log')
-      .select('id, at, exercises_done, plan_session!workout_log_plan_session_id_fkey(focus)')
+      .select(
+        `id, at, status, note, exercises_done, vs_planned, ${LIFECYCLE_COLUMNS}, plan_session!workout_log_plan_session_id_fkey(focus)`,
+      )
       .eq('user_id', userId)
-      .eq('status', 'interrupted')
-      .order('at', { ascending: false })
+      .in('status', ['partial', 'interrupted'])
+      .order('last_activity_at', { ascending: false })
       .limit(1)
       .maybeSingle(),
     eagerTodayKey ? fetchDayOverrideSession(supabase, userId, eagerTodayKey) : Promise.resolve(null),
@@ -349,6 +550,7 @@ export async function buildContextBlock(
           .order('at', { ascending: true })
       : Promise.resolve({ data: null }),
     supabase.from('consultation_progress').select('topics').eq('user_id', userId).maybeSingle(),
+    supabase.from('nutrition_target').select('calories, protein_g, carbs_g, fat_g').eq('user_id', userId).maybeSingle(),
   ]);
 
   const timezone = requestTimezone || profile?.timezone || null;
@@ -383,7 +585,9 @@ export async function buildContextBlock(
     const day = new Date(now.getTime() + offset * 86_400_000);
     upcomingDays.push(`${day.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' })} ${day.toISOString().slice(0, 10)}`);
   }
-  const upcomingLine = `The next seven days are: ${upcomingDays.join(', ')}. Use these exact dates — never work out a date for a weekday yourself.`;
+  const upcomingLine =
+    `The next seven days are: ${upcomingDays.join(', ')}. Use these exact dates — never work out a date for a weekday yourself. ` +
+    'Any other day, up to six months ahead or two months back, can still be looked up with show_daily_workout — never tell the user you cannot see a day.';
 
   const nameLine = describeUserName(profile?.display_name ?? null);
 
@@ -447,6 +651,25 @@ export async function buildContextBlock(
         )
       : null;
 
+  const dayMentionLine =
+    sessions.length > 0 && currentUserText
+      ? describeDayMentions(
+          currentUserText,
+          {
+            todayKey,
+            sessions,
+            trainingDays,
+            logs: logs.map((log) => ({ ...log, dateKey: log.at.slice(0, 10) })),
+            restDayDates,
+            activeFromKey,
+            todayDue: today,
+            todayOverride: dayOverride,
+            restSecondsFor: () => 90,
+          },
+          logs.length >= 10 ? logs[logs.length - 1].at.slice(0, 10) : null,
+        )
+      : null;
+
   let planLine: string;
   if (sessions.length === 0 && !dayOverride) {
     planLine = 'No active training plan yet.';
@@ -469,7 +692,7 @@ export async function buildContextBlock(
         `Home with a Start button. The weekly plan itself is unchanged and resumes tomorrow.`;
     } else {
       const alreadyDone = logs.some(
-        (log) => log.plan_session_id === today.id && !isPartial(log) && sameLocalDay(new Date(log.at), now),
+        (log) => log.plan_session_id === today.id && endsLocalDay(log, now) && sameLocalDay(new Date(log.at), now),
       );
       planLine = alreadyDone
         ? `Today's scheduled session (${describeSession(today)}) was already completed today.`
@@ -506,21 +729,11 @@ export async function buildContextBlock(
           `Completed workouts so far this calendar week (since Sunday): ${thisWeekCount}.`,
         ].join('\n');
 
-  // Surfaced every turn (not just the first) so the model can still act on it if the user brings
-  // it up mid-conversation — but instructed to only actually RAISE it unprompted once, near the
-  // start of a new conversation, not re-nag every turn if the user moves on without addressing it.
   const sessionIsLive =
     !!liveRow && Date.now() - new Date(liveRow.updated_at).getTime() < LIVE_STATE_MAX_AGE_MS;
-  const interruptedFocus = humanizeFocus(interrupted?.plan_session?.focus ?? 'training');
-  const interruptedLine =
-    interrupted && !sessionIsLive
-      ? `An earlier "${interruptedFocus}" workout was interrupted and never finished or reconciled ` +
-        `(${new Date(interrupted.at).toISOString().slice(0, 10)}, ${(interrupted.exercises_done ?? []).length} ` +
-        `exercise(s) logged before it cut off, id ${interrupted.id}). Near the start of a genuinely new ` +
-        `conversation, briefly ask what happened — did they finish it without the app, end early, or want ` +
-        `to discard it — then call resolve_interrupted_workout with that workout_log_id. Don't re-raise ` +
-        `this if the user is already mid-topic on something else; wait for a natural moment or for them ` +
-        `to bring it up.`
+  const unfinishedLine =
+    unfinished && !sessionIsLive
+      ? await describeUnfinishedWorkout(supabase, unfinished, profile?.display_name ?? null, timezone)
       : null;
 
   const loadHistoryLine = describeLoadHistory(buildLoadHistory(recentLogs ?? []), units);
@@ -542,7 +755,8 @@ export async function buildContextBlock(
 
   const importedWorkoutLine = describeImportedWorkout(currentUserText);
 
-  const foodLogLine = describeTodaysFoodLog(foodToday ?? []);
+  const foodLogLine = Array.isArray(foodToday) ? describeTodaysFoodLog(foodToday) : null;
+  const nutritionTargetsLine = describeNutritionTargets(nutritionTarget ?? null, Array.isArray(foodToday) ? foodToday : null);
 
   const consultationLine = describeConsultationStatus(!!activePlan, (consultationProgress?.topics ?? []) as string[]);
 
@@ -564,8 +778,9 @@ export async function buildContextBlock(
     (startDateLine ? `- ${startDateLine}\n` : '') +
     (weeklyPlanLine ? `- ${weeklyPlanLine}\n` : '') +
     (scheduleLine ? `- ${scheduleLine}\n` : '') +
+    (dayMentionLine ? `- ${dayMentionLine}\n` : '') +
     (consultationLine ? `- ${consultationLine}\n` : '') +
-    (interruptedLine ? `- ${interruptedLine}\n` : '') +
+    (unfinishedLine ? `- ${unfinishedLine}\n` : '') +
     `- ${historyLine}` +
     (loadHistoryLine ? `\n- ${loadHistoryLine}` : '') +
     (bodyStatsLine ? `\n- ${bodyStatsLine}` : '') +
@@ -573,6 +788,7 @@ export async function buildContextBlock(
     (mentionedInjuryLine ? `\n- ${mentionedInjuryLine}` : '') +
     (painReportLine ? `\n- ${painReportLine}` : '') +
     (importedWorkoutLine ? `\n- ${importedWorkoutLine}` : '') +
+    (nutritionTargetsLine ? `\n- ${nutritionTargetsLine}` : '') +
     (foodLogLine ? `\n- ${foodLogLine}` : '')
   );
 }

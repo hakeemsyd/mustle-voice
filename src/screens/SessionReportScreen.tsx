@@ -5,7 +5,7 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import { useSessionReport } from "../hooks/useSessionReport";
 import { useUnitPrefs } from "../hooks/useUnitPrefs";
-import { kgToDisplayWeight, kgToDisplayWeightValue } from "../lib/units";
+import { kgToDisplayWeight } from "../lib/units";
 import { formatDuration } from "../lib/sessionReport";
 import { useScreenInsets } from "../hooks/useScreenInsets";
 import { SessionChatThread } from "../components/session-chat/SessionChatThread";
@@ -131,7 +131,7 @@ export function SessionReportScreen({ route, navigation }: Props) {
                   <>
                     <StatChip
                       label="Volume"
-                      value={`${kgToDisplayWeightValue(report.volume, units).toLocaleString()} ${units === "metric" ? "kg" : "lb"}`}
+                      value={`${report.displayVolume.toLocaleString()} ${units === "metric" ? "kg" : "lb"}`}
                       delta={
                         report.volumeDeltaPct === null
                           ? "First session"

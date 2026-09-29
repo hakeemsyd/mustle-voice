@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { describeUserName, resolveTodaySession, startOfLocalDayUtc } from './brain-context.ts';
+import {
+  describeUserName,
+  resolveTodaySession,
+  settleFollowupOnAnswer,
+  startOfLocalDayUtc,
+} from './brain-context.ts';
 
 const session = (id: string, day_order: number, weekday: number | null, focus = id) => ({
   id,
@@ -99,4 +104,73 @@ test('a transcription artifact stored as a name is never read back as one', () =
   for (const junk of ['[background Noise]', '[szum]', '(inaudible)', 'test']) {
     assert.ok(describeUserName(junk).startsWith('No name on file'), junk);
   }
+});
+
+const followupStub = (row: any) => {
+  const updates: any[] = [];
+  const reader: any = {
+    select: () => reader,
+    eq: () => reader,
+    in: () => reader,
+    not: () => reader,
+    is: () => reader,
+    order: () => reader,
+    limit: () => reader,
+    maybeSingle: async () => ({ data: row }),
+  };
+  const writer: any = {
+    eq: () => writer,
+    then: (resolve: any) => resolve({ error: null }),
+  };
+  return {
+    updates,
+    supabase: {
+      from: () => ({
+        select: reader.select,
+        update: (values: any) => {
+          updates.push(values);
+          return writer;
+        },
+      }),
+    },
+  };
+};
+
+const askedRow = (overrides: any = {}) => ({
+  id: 'w1',
+  at: new Date(Date.now() - 30 * 3600_000).toISOString(),
+  status: 'partial',
+  note: null,
+  last_activity_at: new Date(Date.now() - 30 * 3600_000).toISOString(),
+  ended_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+  ended_by: 'timeout',
+  followup_asked_at: new Date(Date.now() - 3600_000).toISOString(),
+  followup_resolved_at: null,
+  ...overrides,
+});
+
+test('answering the welcome-back question settles it without the coach calling a tool', async () => {
+  const { supabase, updates } = followupStub(askedRow());
+  await settleFollowupOnAnswer(supabase, 'u1', 'I ran out of time, I had to leave.');
+  assert.equal(updates.length, 1);
+  assert.ok(updates[0].followup_resolved_at);
+  assert.equal(updates[0].note, 'I ran out of time, I had to leave.');
+});
+
+test('an empty answer settles nothing', async () => {
+  const { supabase, updates } = followupStub(askedRow());
+  await settleFollowupOnAnswer(supabase, 'u1', '   ');
+  assert.equal(updates.length, 0);
+});
+
+test('an already-settled follow-up is not written again', async () => {
+  const { supabase, updates } = followupStub(askedRow({ followup_resolved_at: new Date().toISOString() }));
+  await settleFollowupOnAnswer(supabase, 'u1', 'ran out of time');
+  assert.equal(updates.length, 0);
+});
+
+test('an end reason already on the record is kept over the answer text', async () => {
+  const { supabase, updates } = followupStub(askedRow({ note: 'knee flared up' }));
+  await settleFollowupOnAnswer(supabase, 'u1', 'ran out of time');
+  assert.equal(updates[0].note, 'knee flared up');
 });

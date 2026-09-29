@@ -43,19 +43,27 @@ import { DumbbellIcon } from "../icons/DumbbellIcon";
 import { SettingsIcon } from "../icons/SettingsIcon";
 import { StopIcon } from "../icons/StopIcon";
 import { MoreHorizontalIcon } from "../icons/MoreHorizontalIcon";
-import {
-  describeParsedSet,
-  looksLikeStartSetCommand,
-  needsWeightBeforeLogging,
-  parseSetReport,
-  parseWeightReply,
-  type ParsedSet,
-} from "../lib/parseSetReport";
-import { classifySpokenSet, COACH_ASKS_FOR_SET_DETAILS, confirmsSetDone, isAffirmation, isNegation } from "../lib/spokenSetIntent";
+import { describeParsedSet, needsWeightBeforeLogging, parseSetReport, parseWeightReply, type ParsedSet } from "../lib/parseSetReport";
+import { COACH_ASKS_FOR_SET_DETAILS } from "../lib/spokenSetIntent";
 import { isBodyweightWork, isCardioExercise, isTimedExercise } from "../lib/exerciseCatalog";
-import { isImplausibleWeightJump, parseLoadSchemeKg } from "../lib/weightPlausibility";
 import { chooseRestDay } from "../lib/restDay";
-import { targetRepsFrom } from "../lib/restSuggestion";
+import { estimateRestSeconds } from "../lib/restSuggestion";
+import { customRestFor } from "../../supabase/functions/_shared/rest-length";
+import {
+  decideConfirmTap,
+  decideSetInput,
+  describeNextSetLine,
+  describeUndo,
+  formatRestLength,
+  knownWeightFor,
+  NO_HOLDS,
+  type EngineEffect,
+  type EngineHolds,
+  type EngineSource,
+  type EngineState,
+} from "../lib/setInputEngine";
+import { plannedWeightKg } from "../../supabase/functions/_shared/set-report";
+import { getExerciseReference } from "../lib/exerciseGuides";
 import { titleCase } from "../lib/textFormat";
 import type { RootStackParamList } from "../navigation/types";
 
@@ -65,10 +73,11 @@ const describeRepScheme = (scheme: string): string =>
   /^\d+(\s*[-–]\s*\d+)?$/.test(scheme.trim()) ? `${scheme.trim()} reps` : scheme.trim();
 
 const ADVANCE_CUE_GRACE_MS = 3_000;
+const UNDO_VISIBLE_MS = 8_000;
+const GREETING_VOICE_WAIT_MS = 6_000;
+const GREETING_STATE_WAIT_MS = 2_000;
 
-const AWAITING_SET_DETAILS_MS = 120_000;
-
-const WEIGHT_CONFIRM_MS = 120_000;
+const TRANSITION_CUE = "exercise_advanced_rest";
 
 
 // "30-45 seconds" is three times the width of "8-10", and the collapsed strip gives Reps whatever
@@ -109,9 +118,11 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
 
   useEffect(() => {
     if (session.lastSetLoggedAt === null) return;
+    const remainingMs = UNDO_VISIBLE_MS - (Date.now() - session.lastSetLoggedAt);
+    if (remainingMs <= 0) return;
     setUndoVisible(true);
     if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
-    undoTimerRef.current = setTimeout(() => setUndoVisible(false), 8000);
+    undoTimerRef.current = setTimeout(() => setUndoVisible(false), remainingMs);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.lastSetLoggedAt]);
   // Mic-first: this screen auto-connects on focus and the whole point is reporting sets by
@@ -214,35 +225,40 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
     session.rememberStatedWeight(currentExerciseIndex, weight);
   };
   const currentIsBodyweight = isBodyweightWork(currentExercise?.name, currentExercise?.loadScheme);
-  const awaitingWeightRef = useRef<{ exerciseIndex: number; at: number; reps: number } | null>(null);
-  const heldForWeight = () => {
-    const held = awaitingWeightRef.current;
-    return held && held.exerciseIndex === currentExerciseIndex && Date.now() - held.at < WEIGHT_CONFIRM_MS
-      ? held
-      : null;
+  const holdsRef = useRef<EngineHolds>(NO_HOLDS);
+  const [awaitingConfirm, setAwaitingConfirm] = useState(false);
+  const setHolds = (holds: EngineHolds) => {
+    holdsRef.current = holds;
+    setAwaitingConfirm(!!holds.done || !!holds.weight);
   };
-  const awaitingSetDetailsRef = useRef<{ exerciseIndex: number; at: number } | null>(null);
-  const awaitingDoneRef = useRef<{ exerciseIndex: number; at: number; set: ParsedSet } | null>(null);
-  const heldForDone = () => {
-    const held = awaitingDoneRef.current;
-    return held && held.exerciseIndex === currentExerciseIndex && Date.now() - held.at < WEIGHT_CONFIRM_MS
-      ? held
-      : null;
-  };
-  const pendingWeightConfirmRef = useRef<{
-    exerciseIndex: number;
-    at: number;
-    weight: number | null;
-    reps: number;
-    unit?: "seconds";
-  } | null>(null);
-  const carryWeight = (): number | null =>
-    lastLoggedWeight ??
-    (statedWeightRef.current?.exerciseIndex === currentExerciseIndex
-      ? statedWeightRef.current.weight
-      : null);
-  const resolveSetWeight = (parsed: ParsedSet): number | null =>
-    parsed.weight === null && parsed.unit !== "seconds" ? carryWeight() : parsed.weight;
+  useEffect(() => {
+    holdsRef.current = NO_HOLDS;
+    setAwaitingConfirm(false);
+  }, [session.startedAt]);
+  const engineStateRef = useRef<() => EngineState>(() => ({
+    exercises: [],
+    currentExerciseIndex: 0,
+    loggedSets: [],
+    resting: false,
+    restRemainingSec: null,
+    restFinishedAt: null,
+    statedWeight: null,
+    units,
+    lastCoachLine: null,
+    now: Date.now(),
+  }));
+  engineStateRef.current = () => ({
+    exercises,
+    currentExerciseIndex,
+    loggedSets,
+    resting,
+    restRemainingSec: resting ? restRemaining : null,
+    restFinishedAt: session.restFinishedAt,
+    statedWeight: statedWeightRef.current,
+    units,
+    lastCoachLine: session.messages.at(-1)?.role === "coach" ? session.messages.at(-1)!.text : null,
+    now: Date.now(),
+  });
   const { alternatives: switchAlternatives } = usePlanAlternatives(
     target?.type === "strength" ? target.planSessionId : undefined,
   );
@@ -258,17 +274,16 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
     }
     const next = exercises[currentExerciseIndex + 1];
     if (!next) return "That was the last set. Workout complete.";
-    return `${currentExercise.name} done. Next up: ${next.name}, ${next.sets} sets of ${describeRepScheme(next.repScheme)}.`;
-  };
-
-  const describeNextSet = (): string | null => {
-    if (!currentExercise) return null;
-    const weight = lastLoggedWeight ?? statedWeightForCard;
+    const rest = customRestFor(next, session.restRules)?.seconds ?? estimateRestSeconds(next.repScheme);
+    const load = plannedWeightKg(next.loadScheme);
     return (
-      `Set ${currentSetCount + 1} of ${currentExercise.sets}: ${describeRepScheme(currentExercise.repScheme)}` +
-      `${weight != null ? ` at ${kgToDisplayWeight(weight, units)}` : ""}.`
+      `${currentExercise.name} done. Rest ${formatRestLength(rest)}, then ${next.name}: ${next.sets} sets of ` +
+      `${describeRepScheme(next.repScheme)}${load != null ? ` at ${kgToDisplayWeight(load, units)}` : ""}.`
     );
   };
+
+  const finishesExercise = (): boolean =>
+    !!currentExercise && currentSetCount + 1 >= currentExercise.sets && currentExerciseIndex < exercises.length - 1;
 
   const commitSet = (
     weight: number | null,
@@ -278,16 +293,27 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
     origin: SetOrigin,
   ): boolean => {
     const followUp = coachSpeaksRef.current ? null : describeAfterSet();
-    if (!session.logSet(weight, reps, unit, origin)) return false;
+    const advancing = finishesExercise();
+    const result = session.logSet(weight, reps, unit, origin);
+    if (!result.ok) {
+      if (!viaVoice && result.reason !== "repeat") {
+        session.announce(
+          result.reason === "no_exercise"
+            ? "Couldn't log that set: no exercise is loaded. Go back and reopen the workout from Home."
+            : "That set is already logged, so I didn't add it again.",
+        );
+      }
+      return false;
+    }
     followUpShownRef.current = !!followUp;
     session.noteSetLogged(describeParsedSet({ weight, reps, unit }, units), followUp);
     setDraft("");
-    // Recorded, not fired here — the "set_logged" cue needs the live_session_state write for
-    // THIS set to land first (see the effect below), and that write hasn't even been scheduled
-    // yet this synchronously, logSet's state update hasn't committed. viaVoice sets are
-    // deliberately excluded: the coach already knows about those from its own inline context
-    // update a few lines up in the message handler.
-    pendingSetCueRef.current = viaVoice ? "skip" : "fire";
+    // Recorded, not fired here — the cue needs the live_session_state write for THIS set to land
+    // first (see the effect below), and that write hasn't even been scheduled yet this
+    // synchronously, logSet's state update hasn't committed. viaVoice sets are deliberately
+    // excluded unless the exercise changed: the coach already knows about those from its own
+    // inline context update in the message handler.
+    pendingSetCueRef.current = advancing ? "exercise_advanced" : viaVoice ? "skip" : "set_logged";
     return true;
   };
 
@@ -297,53 +323,25 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
 
   const sendContextRef = useRef<((text: string) => void) | null>(null);
   const triggerCueRef = useRef<((cue: string) => boolean) | null>(null);
-  const pendingSetCueRef = useRef<"fire" | "skip" | null>(null);
+  const pendingSetCueRef = useRef<"set_logged" | "exercise_advanced" | "skip" | null>(null);
   // Cancelled if the coach's own reply to the final set report already names the new exercise.
   // Confirmed live: it announced "Hip Thrust next — four sets of eight to ten" and the cue landed
   // a second later, so it spoke over itself with a near-duplicate question.
   const pendingAdvanceRef = useRef<{ timer: ReturnType<typeof setTimeout>; name: string } | null>(null);
   const restManualFinishRef = useRef(-1);
 
-  const tryCommitSetRef = useRef<
-    (
-      weight: number | null,
-      reps: number,
-      viaVoice: boolean,
-      unit: "seconds" | undefined,
-      weightGiven: boolean,
-      origin: SetOrigin,
-    ) => boolean
-  >(() => false);
-  const tryCommitSet = (
-    weight: number | null,
-    reps: number,
-    viaVoice: boolean,
-    unit: "seconds" | undefined,
-    weightGiven: boolean,
-    origin: SetOrigin,
-  ): boolean => tryCommitSetRef.current(weight, reps, viaVoice, unit, weightGiven, origin);
+  const runEffectsRef = useRef<(effects: EngineEffect[], source: EngineSource) => void>(() => undefined);
 
   const {
     orbState, isActive, status: voiceStatus, toggle, sendContextualUpdate, sendUserMessage,
-    reconnecting, voiceDropped, idleClosed, connect, isMuted, toggleMute, setMuteState, endWhenAnswered,
+    reconnecting, voiceDropped, idleClosed, connect, isMuted, toggleMute, setKeyboardMode, endWhenAnswered,
     setMessageHandler, setSessionConfig, setWorkoutActive,
   } = useSharedVoiceSession();
   coachSpeaksRef.current = voiceStatus === "connected" && !isMuted;
 
-  const autoMutedRef = useRef(false);
   useEffect(() => {
-    if (inputMode === "keyboard") {
-      if (!isMuted) {
-        autoMutedRef.current = true;
-        setMuteState(true);
-      }
-      return;
-    }
-    if (autoMutedRef.current) {
-      autoMutedRef.current = false;
-      setMuteState(false);
-    }
-  }, [inputMode, isMuted, setMuteState]);
+    setKeyboardMode(inputMode === "keyboard");
+  }, [inputMode, isMuted, voiceStatus, setKeyboardMode]);
 
   useEffect(() => {
     setWorkoutActive(!ended);
@@ -382,166 +380,16 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
         clearTimeout(pendingAdvance.timer);
         pendingAdvanceRef.current = null;
       }
-      // Checked before the rest guard below: during rest this is the one thing the user can say
-      // that must still act on the session, and it's what makes "let's go / next set / start
-      // set 3" actually clear the timer instead of waiting on a tool call that may never come.
-      if (message.role === "user" && !isCardio && resting && looksLikeStartSetCommand(message.text)) {
-        awaitingDoneRef.current = null;
-        session.finishRest();
-        try {
-          // They asked to go, out loud, so this is the one moment that most needs a real spoken
-          // prompt — confirmed live: the coach answered "Start set two" with the word "Silence",
-          // reading the stay-quiet-through-rest briefing as still in force. Spelling out the exact
-          // numbers it should say is what makes it coach here instead of going quiet or reaching
-          // for a template.
-          const setNumber = currentSetCount + 1;
-          sendContextRef.current?.(
-            `The user just asked to start the next set out loud, so the app ended their rest early ` +
-              `and the timer is cleared. Rest is over. Answer them — going quiet here is wrong, they ` +
-              `just spoke to you. Give them the real next-set prompt: this is set ${setNumber}` +
-              `${currentExercise ? ` of ${currentExercise.sets} for ${currentExercise.name}` : ""}, ` +
-              `${
-                currentExercise
-                  ? `target ${currentExercise.repScheme}${currentIsTimed ? "" : " reps"}`
-                  : "the target reps"
-              }` +
-              `${lastLoggedWeight != null ? ` at ${lastLoggedWeight}kg, the same weight as their last set` : ""}. ` +
-              `One short line, natural, then let them lift.`,
-          );
-        } catch (err) {
-          console.error("[active session] failed to tell coach rest was skipped:", err);
-        }
-        return;
-      }
       if (isCardio) return;
       if (message.role !== "user") {
         if (COACH_ASKS_FOR_SET_DETAILS.test(message.text)) {
-          awaitingSetDetailsRef.current = { exerciseIndex: currentExerciseIndex, at: Date.now() };
+          holdsRef.current = { ...holdsRef.current, details: { exerciseIndex: currentExerciseIndex, at: Date.now() } };
         }
         return;
       }
-      const pendingWeight = pendingWeightConfirmRef.current;
-      const awaitingWeightConfirm =
-        !!pendingWeight &&
-        pendingWeight.exerciseIndex === currentExerciseIndex &&
-        Date.now() - pendingWeight.at < WEIGHT_CONFIRM_MS;
-      if (awaitingWeightConfirm && pendingWeight) {
-        if (isAffirmation(message.text)) {
-          pendingWeightConfirmRef.current = null;
-          commitSet(pendingWeight.weight, pendingWeight.reps, true, pendingWeight.unit, { source: "voice" });
-          return;
-        }
-        if (isNegation(message.text)) {
-          pendingWeightConfirmRef.current = null;
-          awaitingSetDetailsRef.current = { exerciseIndex: currentExerciseIndex, at: Date.now() };
-          return;
-        }
-      }
-
-      const heldDone = heldForDone();
-      awaitingDoneRef.current = null;
-      if (heldDone && isNegation(message.text)) return;
-      const doneConfirmed =
-        !!heldDone && confirmsSetDone(message.text) && !parseSetReport(message.text, units, { timedExercise: currentIsTimed });
-      if (doneConfirmed && resting) session.finishRest();
-      const heldSet = doneConfirmed ? null : heldForWeight();
-      const weightReply = heldSet ? parseWeightReply(message.text, units) : null;
-      let parsed: ParsedSet | null = doneConfirmed
-        ? heldDone!.set
-        : heldSet && weightReply
-          ? { weight: weightReply.weight, reps: heldSet.reps }
-          : null;
-      const weightGiven = !doneConfirmed && parsed !== null;
-      if (!parsed) {
-        const pending = awaitingSetDetailsRef.current;
-        const awaitingDetails =
-          !!pending &&
-          pending.exerciseIndex === currentExerciseIndex &&
-          Date.now() - pending.at < AWAITING_SET_DETAILS_MS;
-        const intent = classifySpokenSet(message.text, units, {
-          awaitingDetails,
-          timedExercise: isTimedExercise(currentExercise?.name),
-          confirmsBareReps: true,
-          resting,
-        });
-        if (intent.kind === "ignore") return;
-        if (intent.kind === "stated_weight") {
-          rememberStatedWeight(intent.weight);
-          return;
-        }
-        if ((intent.kind === "log" || intent.kind === "unconfirmed") && session.isRestatementNow()) {
-          awaitingSetDetailsRef.current = null;
-          return;
-        }
-        if (intent.kind === "unconfirmed") {
-          awaitingDoneRef.current = { exerciseIndex: currentExerciseIndex, at: Date.now(), set: intent.set };
-          return;
-        }
-        if (resting) session.finishRest();
-        parsed = intent.kind === "log" ? intent.set : null;
-        if (!parsed) {
-          awaitingSetDetailsRef.current = { exerciseIndex: currentExerciseIndex, at: Date.now() };
-          return;
-        }
-      }
-      // A bare "eight reps" follow-up (no weight repeated) reads as bodyweight to the parser,
-      // silently dropping a real weight already established earlier for this exercise — confirmed
-      // live: answering the app's own "How many reps?" clarifying question with reps only logged
-      // 60kg as bodyweight. Carry forward the last weight actually logged for this exercise
-      // instead of trusting "no weight mentioned this sentence" as "true bodyweight movement".
-      awaitingSetDetailsRef.current = null;
-      const parsedForLog = { ...parsed, weight: weightGiven ? parsed.weight : resolveSetWeight(parsed) };
-
-      if (awaitingWeightConfirm) return;
-      if (!tryCommitSet(parsedForLog.weight, parsedForLog.reps, true, parsedForLog.unit, weightGiven, { source: "voice" })) {
-        return;
-      }
-      const setNumber = currentSetCount + 1;
-      // A voice-reported set is logged and acknowledged entirely through this inline context
-      // update, never through the set_logged/exercise_advanced cue system below (that's
-      // deliberately skipped for viaVoice sets — see commitSet's own comment). That means THIS
-      // message is the only place the model can learn a transition happened at all. It used to
-      // only ever describe the set that was just finished — confirmed live: when that set was
-      // the exercise's last one, the model was never told a new exercise had started, so it kept
-      // narrating the OLD exercise's rep scheme and set count indefinitely (a fictional "set
-      // four" on a 3-set exercise, the wrong rep range) since nothing ever corrected it.
-      const exerciseComplete = !!currentExercise && setNumber >= (currentExercise.sets ?? 0);
-      const nextExercise = exerciseComplete ? (exercises[currentExerciseIndex + 1] ?? null) : null;
-      // Moving to a new exercise is the one moment the coach MUST speak, and a contextual update
-      // can't make it: it reaches the model without demanding a reply, so it only ever got
-      // announced when it happened to land before that turn finished generating. Confirmed live:
-      // two of three transitions in one workout were never announced — "Rest." and then nothing,
-      // while the screen had already moved on. Re-arming the cue (voice-reported sets normally skip
-      // it) routes this through exercise_advanced instead, which is sent as a turn and is therefore
-      // always answered. The contextual update below is skipped in that case so the transition is
-      // announced exactly once, by the cue.
-      const handOffToCue = exerciseComplete && !!nextExercise;
-      if (handOffToCue) pendingSetCueRef.current = "fire";
-      // describeParsedSet is unit-aware ("52s held" vs "60kg × 8 reps") — this used to hardcode
-      // "× N reps" regardless, so a timed hold (Plank, etc.) told the coach a rep count that was
-      // actually a duration, and it would confirm "52 reps" out loud for a 52-second hold.
-      if (handOffToCue) return;
-      try {
-        sendContextRef.current?.(
-          `The app just logged this set directly from what the user said: ${currentExercise?.name ?? "the current exercise"}, ` +
-            `set ${setNumber}${currentExercise ? ` of ${currentExercise.sets}` : ""}, ${describeParsedSet(parsedForLog, units)}. ` +
-            `It's already recorded — don't ask what exercise it was, whether they've done it before, or ask them to confirm ` +
-            `any of these details, and if they say it was wrong or misheard, call undo_last_set instead of just apologizing ` +
-            `in text. Acknowledge in one short sentence and move the conversation forward.` +
-            (exerciseComplete
-              ? nextExercise
-                ? ` That was the last set of ${currentExercise!.name} — the app has already moved on to the next ` +
-                  `exercise: ${nextExercise.name}, ${nextExercise.sets} sets of ${nextExercise.repScheme}` +
-                  `${nextExercise.loadScheme ? ` at ${convertLoadScheme(nextExercise.loadScheme, units)}` : ""}. There is no rest timer between ` +
-                  `exercises, so name the new exercise and its real target next — these exact numbers, never ` +
-                  `${currentExercise!.name}'s.`
-                : ` That was the last set of the last exercise — the workout is complete. Wrap it up; don't reference ` +
-                  `another set or exercise.`
-              : ""),
-        );
-      } catch (err) {
-        console.error("[active session] failed to send set-logged context to voice:", err);
-      }
+      const result = decideSetInput(message.text, "voice", engineStateRef.current(), holdsRef.current);
+      setHolds(result.holds);
+      runEffectsRef.current(result.effects, "voice");
     });
     setSessionConfig({
       userId: session.userId,
@@ -560,14 +408,20 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
 
   const cueOverTextRef = useRef<(cue: string) => void>(() => undefined);
   cueOverTextRef.current = (cue: string) => {
-    if (cue === "set_logged" || cue === "exercise_advanced") {
-      if (followUpShownRef.current) {
-        followUpShownRef.current = false;
+    if (cue === "set_logged" && followUpShownRef.current) {
+      followUpShownRef.current = false;
+      return;
+    }
+    if (cue === TRANSITION_CUE) {
+      followUpShownRef.current = false;
+      const setup = getExerciseReference(currentExercise?.name)?.setup ?? [];
+      if (currentExercise && setup.length > 0) {
+        session.announce(`Setting up ${currentExercise.name}: ${setup.slice(0, 2).join(" ")}`);
         return;
       }
     }
     if (cue === "rest_over") {
-      const line = describeNextSet();
+      const line = describeNextSetLine(engineStateRef.current());
       if (line) {
         session.announce(line);
         return;
@@ -612,31 +466,102 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
       .catch((err) => console.error("[active session] text fallback for coach context failed:", err));
   };
 
-  tryCommitSetRef.current = (weight, reps, viaVoice, unit, weightGiven, origin) => {
-    if (!weightGiven && needsWeightBeforeLogging({ weight, reps, unit }, null, currentIsBodyweight)) {
-      awaitingWeightRef.current = { exerciseIndex: currentExerciseIndex, at: Date.now(), reps };
-      if (!viaVoice) session.announce(`Got ${reps} reps. What weight was that? Nothing logged yet.`);
-      return false;
-    }
-    awaitingWeightRef.current = null;
-    const referenceWeight = lastLoggedWeight ?? parseLoadSchemeKg(currentExercise?.loadScheme ?? null);
-    if (isImplausibleWeightJump(weight, referenceWeight)) {
-      pendingWeightConfirmRef.current = { exerciseIndex: currentExerciseIndex, at: Date.now(), weight, reps, unit };
-      const heard = kgToDisplayWeight(weight as number, units);
-      const expected = kgToDisplayWeight(referenceWeight as number, units);
-      session.announce(
-        `That came through as ${heard}, but you were on ${expected}. Nothing logged yet — was that right?`,
+  const tellCoachSetLogged = (set: { weight: number | null; reps: number; unit?: "seconds" }) => {
+    const setNumber = currentSetCount + 1;
+    // A voice-reported set is logged and acknowledged through this inline context update, never
+    // through the set_logged cue (deliberately skipped for voice sets, see commitSet). The one
+    // exception is the last set of an exercise: that transition goes through the
+    // exercise_advanced cue, which is a turn and is therefore always answered, so the contextual
+    // update is skipped there and the change is announced exactly once.
+    if (finishesExercise()) return;
+    const exerciseComplete = !!currentExercise && setNumber >= (currentExercise.sets ?? 0);
+    try {
+      sendContextRef.current?.(
+        `The app just logged this set directly from what the user said: ${currentExercise?.name ?? "the current exercise"}, ` +
+          `set ${setNumber}${currentExercise ? ` of ${currentExercise.sets}` : ""}, ${describeParsedSet(set, units)}. ` +
+          `It's already recorded — don't ask what exercise it was, whether they've done it before, or ask them to confirm ` +
+          `any of these details. If they say a number was wrong, the app corrects that set itself when they say the ` +
+          `right number. Acknowledge in one short sentence and move the conversation forward.` +
+          (exerciseComplete
+            ? ` That was the last set of the last exercise — the workout is complete. Wrap it up; don't reference ` +
+              `another set or exercise.`
+            : ""),
       );
-      tellCoachRef.current(
-        `IMPORTANT: the app heard ${heard} for this set, but the working weight here is ${expected}. ` +
-          `That is too big a jump to trust, so NOTHING was logged and the app is still waiting on set ` +
-          `${currentSetCount + 1}${currentExercise ? ` of ${currentExercise.sets} for ${currentExercise.name}` : ""}. ` +
-          `Ask them once, briefly, to confirm the weight — do not count this set until they do.`,
-      );
-      return false;
+    } catch (err) {
+      console.error("[active session] failed to send set-logged context to voice:", err);
     }
-    pendingWeightConfirmRef.current = null;
-    return commitSet(weight, reps, viaVoice, unit, origin);
+  };
+
+  const startNextSetFromVoice = () => {
+    session.finishRest();
+    try {
+      // They asked to go, out loud, so this is the one moment that most needs a real spoken
+      // prompt — confirmed live: the coach answered "Start set two" with the word "Silence",
+      // reading the stay-quiet-through-rest briefing as still in force. Spelling out the exact
+      // numbers it should say is what makes it coach here instead of going quiet or reaching
+      // for a template.
+      const weight = knownWeightFor(engineStateRef.current());
+      sendContextRef.current?.(
+        `The user just asked to start the next set out loud, so the app ended their rest early ` +
+          `and the timer is cleared. Rest is over. Answer them — going quiet here is wrong, they ` +
+          `just spoke to you. Give them the real next-set prompt: this is set ${currentSetCount + 1}` +
+          `${currentExercise ? ` of ${currentExercise.sets} for ${currentExercise.name}` : ""}, ` +
+          `${
+            currentExercise
+              ? `target ${currentExercise.repScheme}${currentIsTimed ? "" : " reps"}`
+              : "the target reps"
+          }` +
+          `${weight != null && !currentIsTimed ? ` at ${kgToDisplayWeight(weight, units)}` : ""}. ` +
+          `One short line, natural, then let them lift.`,
+      );
+    } catch (err) {
+      console.error("[active session] failed to tell coach rest was skipped:", err);
+    }
+  };
+
+  runEffectsRef.current = (effects, source) => {
+    const viaVoice = source === "voice";
+    for (const effect of effects) {
+      switch (effect.type) {
+        case "log": {
+          const origin: SetOrigin = { source: viaVoice ? "voice" : source === "tap" ? "tap" : "typed" };
+          if (commitSet(effect.weight, effect.reps, viaVoice, effect.unit, origin) && viaVoice) {
+            tellCoachSetLogged(effect);
+          }
+          break;
+        }
+        case "amend":
+          if (!session.amendSet(effect.exerciseIndex, effect.setIndex, effect.weight, effect.reps) && !viaVoice) {
+            session.announce("Couldn't change that set. Tap Undo or tell me the right numbers again.");
+          }
+          break;
+        case "announce":
+          session.announce(effect.text);
+          break;
+        case "set_rest_length":
+          session.setRestLength(effect.seconds, effect.scope, "manual");
+          break;
+        case "extend_rest":
+          session.extendRest(effect.seconds, "manual");
+          break;
+        case "finish_rest":
+          session.finishRest();
+          break;
+        case "start_next_set":
+          if (viaVoice) startNextSetFromVoice();
+          else handleStartSetTap();
+          break;
+        case "undo":
+          handleUndoLastSet();
+          break;
+        case "remember_weight":
+          rememberStatedWeight(effect.weight);
+          break;
+        case "tell_coach":
+          tellCoachRef.current(effect.text);
+          break;
+      }
+    }
   };
 
   useEffect(() => {
@@ -668,18 +593,34 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
     return () => setParsing(false);
   }, [isFocused, setParsing]);
 
+  const [greetingVoiceWaitOver, setGreetingVoiceWaitOver] = useState(false);
+  const greetingSendingRef = useRef(false);
+  useEffect(() => {
+    setGreetingVoiceWaitOver(false);
+    greetingSendingRef.current = false;
+    if (!session.startedAt) return;
+    const timer = setTimeout(() => setGreetingVoiceWaitOver(true), GREETING_VOICE_WAIT_MS);
+    return () => clearTimeout(timer);
+  }, [session.startedAt]);
+
   useEffect(() => {
     if (!target || ended) return;
     if (!isCardio && !currentExercise) return;
-    if (!session.claimGreeting()) return;
-    // Either outcome sends the cue: a failed live_session_state write is worth greeting through
-    // anyway (session_start's own wording falls back to a generic hello when no state block
-    // reaches the model), whereas skipping it would leave the user in silence.
-    void session.publishLiveState().then(
-      () => triggerCueRef.current?.("session_start"),
-      () => triggerCueRef.current?.("session_start"),
-    );
-  }, [target, ended, voiceStatus, isCardio, currentExercise]);
+    const waitingForVoice =
+      inputMode === "mic" && !isMuted && voiceStatus !== "connected" && !greetingVoiceWaitOver;
+    if (waitingForVoice) return;
+    if (greetingSendingRef.current) return;
+    greetingSendingRef.current = true;
+    const stateReady = Promise.race([
+      session.publishLiveState().catch(() => undefined),
+      new Promise<void>((resolve) => setTimeout(resolve, GREETING_STATE_WAIT_MS)),
+    ]);
+    void stateReady.then(() => {
+      greetingSendingRef.current = false;
+      if (!session.claimGreeting()) return;
+      triggerCueRef.current?.("session_start");
+    });
+  }, [target, ended, voiceStatus, isCardio, currentExercise, inputMode, isMuted, greetingVoiceWaitOver]);
 
   // Same race as session_start, just tighter: commitSet fires synchronously, before logSet's own
   // state update has even committed, let alone before the write effect above has re-run for the
@@ -695,16 +636,13 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
     lastSetCueCountRef.current = totalSetsLogged;
     const pending = pendingSetCueRef.current;
     pendingSetCueRef.current = null;
-    if (pending !== "fire") return;
-    // set_logged's wording ("rest has started") is only true when a rest period actually began —
-    // the set that just finished an exercise (advancing to a new one, or ending the workout) never
-    // starts one. resting/ended already reflect the post-commit state by the time this re-runs
-    // (same render as totalSetsLogged), so they're enough to tell the three outcomes apart without
-    // any new state: still resting -> set_logged is accurate; ended -> the workout-complete flow
-    // handles its own acknowledgment, nothing to cue here; neither -> the exercise just advanced
-    // with no rest, which needs exercise_advanced's different wording instead.
+    if (!pending || pending === "skip") return;
+    // The last set of the workout needs no cue (the workout-complete flow acknowledges it), and the
+    // last set of an exercise needs the transition cue rather than set_logged: the app has moved
+    // on and started a rest before the next exercise, so the coach names that exercise instead of
+    // the next set.
     if (ended) return;
-    if (!resting) {
+    if (pending === "exercise_advanced") {
       // Held back briefly rather than fired at once: the coach usually announces the transition
       // itself when it answers the set report, and this cue landing on top of that is what made it
       // cut its own sentence off. If that announcement arrives first the message handler cancels
@@ -716,8 +654,8 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
         timer: setTimeout(() => {
           pendingAdvanceRef.current = null;
           void session.publishLiveState().then(
-            () => triggerCueRef.current?.("exercise_advanced"),
-            () => triggerCueRef.current?.("exercise_advanced"),
+            () => triggerCueRef.current?.(TRANSITION_CUE),
+            () => triggerCueRef.current?.(TRANSITION_CUE),
           );
         }, ADVANCE_CUE_GRACE_MS),
       };
@@ -741,6 +679,11 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
   // reaches zero and the tap flips it false immediately. The card advanced and the coach said
   // nothing until the user asked out loud. Marked here and fired from the effect below so the
   // live_session_state write for the rest end is already in flight, same as every other cue.
+  const restingRef = useRef(resting);
+  restingRef.current = resting;
+  const latestRestKeyRef = useRef(restKey);
+  latestRestKeyRef.current = restKey;
+
   const handleStartSetTap = () => {
     restManualFinishRef.current = restKey;
     session.finishRest();
@@ -753,10 +696,12 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
     const state = restCueStateRef.current;
     if (state.over) return;
     state.over = true;
-    void session.publishLiveState().then(
-      () => triggerCueRef.current?.("rest_over"),
-      () => triggerCueRef.current?.("rest_over"),
-    );
+    const finishedKey = restKey;
+    const cueIfStillCurrent = () => {
+      if (restingRef.current || latestRestKeyRef.current !== finishedKey) return;
+      triggerCueRef.current?.("rest_over");
+    };
+    void session.publishLiveState().then(cueIfStillCurrent, cueIfStillCurrent);
   }, [resting, restKey, voiceStatus]);
 
   // Rest has to end itself. Nothing called finishRest except the expanded card's Continue
@@ -764,8 +709,13 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
   // Deliberately independent of voice status — the timer must advance whether or not a call is
   // connected.
   useEffect(() => {
-    if (!resting || restPausedRemainingSec !== null || restRemaining > 0) return;
+    if (!resting || ended || restPausedRemainingSec !== null || restRemaining > 0) return;
     session.finishRest();
+    if (voiceStatus !== "connected" && !restCueStateRef.current.over) {
+      restCueStateRef.current.over = true;
+      const line = describeNextSetLine(engineStateRef.current());
+      if (line) session.announce(line);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resting, restRemaining, restPausedRemainingSec]);
 
@@ -796,8 +746,7 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
   // more direct one fired — capped there per Damion's spec ("prompt once and follow up once
   // later, then wait"), not the single check-in this used to cap at.
   const restCueStateRef = useRef({ key: -1, countdown: false, over: false, silenceCount: 0 });
-  const restingRef = useRef(resting);
-  restingRef.current = resting;
+
   useEffect(() => {
     if (restCueStateRef.current.key !== restKey) {
       restCueStateRef.current = { key: restKey, countdown: false, over: false, silenceCount: 0 };
@@ -889,127 +838,78 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ended]);
 
-  const parsedDraft = parseSetReport(draft, units, { timedExercise: currentIsTimed });
-  const heldDraftSet = isCardio ? null : heldForWeight();
+  const parsedDraft = isCardio ? null : parseSetReport(draft, units, { timedExercise: currentIsTimed, allowPositional: true });
+  const heldWeight = holdsRef.current.weight;
+  const heldDraftSet =
+    !isCardio && heldWeight && heldWeight.exerciseIndex === currentExerciseIndex ? { reps: heldWeight.reps } : null;
   const draftWeightReply = heldDraftSet ? parseWeightReply(draft, units) : null;
+  const knownDraftWeight = isCardio ? null : knownWeightFor(engineStateRef.current());
   const draftSet: ParsedSet | null =
     heldDraftSet && draftWeightReply
       ? { weight: draftWeightReply.weight, reps: heldDraftSet.reps }
       : parsedDraft
-        ? { ...parsedDraft, weight: resolveSetWeight(parsedDraft) }
+        ? { ...parsedDraft, weight: parsedDraft.weight ?? (parsedDraft.unit === "seconds" ? null : knownDraftWeight) }
         : null;
   const draftNeedsWeight =
     !!draftSet && !draftWeightReply && needsWeightBeforeLogging(draftSet, null, currentIsBodyweight);
 
-  const commitHeldWeightReply = (text: string): boolean => {
-    if (!heldDraftSet || !draftWeightReply) return false;
-    session.appendMessage("user", text);
-    session.persistUserMessage(text);
-    setDraft("");
-    tryCommitSet(draftWeightReply.weight, heldDraftSet.reps, false, undefined, true, { source: "typed" });
-    return true;
-  };
-
   const handleSend = () => {
     const text = draft.trim();
     if (!text) return;
-
-    const pendingWeight = pendingWeightConfirmRef.current;
-    const awaitingWeightConfirm =
-      !!pendingWeight &&
-      pendingWeight.exerciseIndex === currentExerciseIndex &&
-      Date.now() - pendingWeight.at < WEIGHT_CONFIRM_MS;
-    if (awaitingWeightConfirm && pendingWeight) {
-      if (isAffirmation(text)) {
-        session.appendMessage("user", text);
-        session.persistUserMessage(text);
-        setDraft("");
-        pendingWeightConfirmRef.current = null;
-        commitSet(pendingWeight.weight, pendingWeight.reps, false, pendingWeight.unit, { source: "typed" });
-        return;
-      }
-      if (isNegation(text)) {
-        setDraft("");
-        pendingWeightConfirmRef.current = null;
-        void session.askCoach(text);
-        return;
-      }
-    }
-
-    if (commitHeldWeightReply(text)) return;
-
-    if (!isCardio && resting && looksLikeStartSetCommand(text)) {
-      session.appendMessage("user", text);
-      session.persistUserMessage(text);
+    if (isCardio || !currentExercise) {
       setDraft("");
-      handleStartSetTap();
+      void session.askCoach(text);
       return;
     }
-
-    if (!isCardio && currentExercise) {
-      const pending = awaitingSetDetailsRef.current;
-      const lastCoachLine = [...session.messages].reverse().find((m) => m.role === "coach")?.text ?? "";
-      const awaitingDetails =
-        (!!pending &&
-          pending.exerciseIndex === currentExerciseIndex &&
-          Date.now() - pending.at < AWAITING_SET_DETAILS_MS) ||
-        COACH_ASKS_FOR_SET_DETAILS.test(lastCoachLine);
-      const intent = classifySpokenSet(text, units, {
-        awaitingDetails,
-        timedExercise: currentIsTimed,
-        typed: true,
-      });
-      if (intent.kind === "log") {
-        session.appendMessage("user", text);
-        session.persistUserMessage(text);
-        setDraft("");
-        awaitingSetDetailsRef.current = null;
-        if (resting) session.finishRest();
-        tryCommitSet(resolveSetWeight(intent.set), intent.set.reps, false, intent.set.unit, false, { source: "typed" });
-        return;
-      }
-      if (intent.kind === "stated_weight") rememberStatedWeight(intent.weight);
-      if (intent.kind === "needs_details") {
-        awaitingSetDetailsRef.current = { exerciseIndex: currentExerciseIndex, at: Date.now() };
-      }
-    }
+    const result = decideSetInput(text, "typed", engineStateRef.current(), holdsRef.current);
+    setHolds(result.holds);
     setDraft("");
-    void session.askCoach(text);
+    if (!result.handled) {
+      runEffectsRef.current(result.effects, "typed");
+      void session.askCoach(text);
+      return;
+    }
+    session.appendMessage("user", text);
+    session.persistUserMessage(text);
+    runEffectsRef.current(result.effects, "typed");
   };
 
-  const handleDoneSet = () => {
-    if (resting || !currentExercise) return;
-    if (commitHeldWeightReply(draft.trim())) return;
-    if (parsedDraft) {
-      const text = draft.trim();
-      session.appendMessage("user", text);
-      session.persistUserMessage(text);
-      setDraft("");
-      tryCommitSet(resolveSetWeight(parsedDraft), parsedDraft.reps, false, parsedDraft.unit, false, { source: "typed" });
-      return;
-    }
-    const fallbackReps = targetRepsFrom(currentExercise.repScheme);
-    if (fallbackReps != null) {
-      const carried = carryWeight();
-      setDraft(
-        carried != null
-          ? `${kgToDisplayWeight(carried, units)} ${fallbackReps} reps`
-          : `${fallbackReps} reps`,
-      );
-      inputRef.current?.focus();
-      return;
-    }
+  const showInputHint = () => {
     inputRef.current?.focus();
     setInputHint(true);
     if (inputHintTimerRef.current) clearTimeout(inputHintTimerRef.current);
     inputHintTimerRef.current = setTimeout(() => setInputHint(false), 4000);
   };
 
+  const handleDoneSet = () => {
+    if (resting || !currentExercise) return;
+    const text = draft.trim();
+    const result = decideConfirmTap(text, engineStateRef.current(), holdsRef.current);
+    setHolds(result.holds);
+    if (result.draft !== undefined) {
+      setDraft(result.draft);
+      inputRef.current?.focus();
+      return;
+    }
+    if (!result.handled) {
+      showInputHint();
+      return;
+    }
+    if (text) {
+      session.appendMessage("user", text);
+      session.persistUserMessage(text);
+      setDraft("");
+    }
+    runEffectsRef.current(result.effects, "tap");
+    if (!text && result.effects.every((e) => e.type === "announce")) inputRef.current?.focus();
+  };
+
   const handleUndoLastSet = () => {
     setUndoVisible(false);
     if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    const removed = describeUndo(engineStateRef.current());
     session.undoLastSet();
-    session.announce("Undone — that set wasn't logged.");
+    session.announce(removed);
   };
 
   const leaveToHome = () => navigation.popTo("Tabs");
@@ -1357,7 +1257,9 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
                                   <Text style={styles.chipInfoValue} numberOfLines={1}>
                                     {currentSetCount >= (exercise.sets ?? 0) && nextExerciseName
                                       ? nextExerciseName.toUpperCase()
-                                      : `SET ${currentSetCount + 1}`}
+                                      : currentSetCount === 0 && i > 0
+                                        ? exercise.name.toUpperCase()
+                                        : `SET ${currentSetCount + 1}`}
                                   </Text>
                                 </View>
                               </View>
@@ -1577,7 +1479,7 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
                         disabled={isCardio}
                       >
                         <CheckIcon size={14} color={sessionColors.active} />
-                        <Text style={styles.doneBtnText}>{draftSet ? "Confirm set" : "Set done"}</Text>
+                        <Text style={styles.doneBtnText}>{draftSet || awaitingConfirm ? "Confirm set" : "Set done"}</Text>
                       </Pressable>
                     )}
                     <Pressable style={styles.workoutDoneBtn} onPress={() => setEndConfirmOpen(true)}>

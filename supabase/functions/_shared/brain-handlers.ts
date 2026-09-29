@@ -6,7 +6,7 @@
 
 import { humanizeFocus } from './humanize.ts';
 import { convertLoadScheme, localizeWeights, normalizeExercisesDone } from './load-scheme.ts';
-import { isBodyweightExercise, loadSchemeForExercise } from './exercise-catalog.ts';
+import { isBodyweightExercise, isTimedExercise, loadSchemeForExercise } from './exercise-catalog.ts';
 import { issueConfirmToken, verifyConfirmToken } from './confirm-token.ts';
 import { validatePlan, explainViolations, forbiddenTags, type Injury } from './injury-validator.ts';
 import { injuryDirective } from './injury-context.ts';
@@ -27,6 +27,18 @@ import {
 } from './brain-context.ts';
 import { buildLiveSessionSnapshot, LIVE_STATE_MAX_AGE_MS, type LiveSessionSnapshot } from './live-session-format.ts';
 import { buildLoadHistory } from './load-history.ts';
+import { lookupDayWorkout, nextTrainingDayAfter } from './day-workout.ts';
+import { describeRestScope, restKeyOf, REST_SCOPES_FROM_VERSION, type RestLengthScope } from './rest-length.ts';
+import { LIFECYCLE_COLUMNS } from './workout-lifecycle.ts';
+import {
+  parseHoldTargetRequest,
+  parseRestChangeRequest,
+  parseRestLengthRequest,
+  REST_WORD,
+  straightenQuotes,
+  type RestChangeRequest,
+} from './set-report.ts';
+import { TURN_NOTE_HEADER } from './turn-set-outcome.ts';
 import {
   CONSULTATION_TOPICS,
   missingConsultationTopics,
@@ -383,6 +395,29 @@ const readLiveSession = async (supabase: any, userId: string): Promise<LiveSessi
   };
 };
 
+const removeDiscardedWorkout = async (
+  supabase: any,
+  userId: string,
+  workoutLogId: string | null,
+  clearLiveState: boolean,
+): Promise<boolean> => {
+  if (workoutLogId) {
+    const { error } = await supabase.from('workout_log').delete().eq('id', workoutLogId).eq('user_id', userId);
+    if (error) {
+      console.error('[brain] discard: failed to delete the workout log:', error.message);
+      return false;
+    }
+  }
+  if (clearLiveState) {
+    const { error } = await supabase.from('live_session_state').delete().eq('user_id', userId);
+    if (error) {
+      console.error('[brain] discard: failed to clear the live session:', error.message);
+      return false;
+    }
+  }
+  return true;
+};
+
 const totalLoggedSets = (state: any): number =>
   ((state?.loggedSets ?? []) as unknown[][]).reduce((n, sets) => n + (Array.isArray(sets) ? sets.length : 0), 0);
 
@@ -421,6 +456,25 @@ export const logSetFromServer = async (
     source_text: sourceText,
   });
   return waitForLoggedSetTotal(supabase, userId, before + 1);
+};
+
+export const amendSetFromServer = async (
+  supabase: any,
+  userId: string,
+  amend: { exerciseIndex: number; setIndex: number; weight: number | null; reps: number },
+): Promise<boolean> => {
+  const live = await readLiveSession(supabase, userId);
+  if (!live.running) return false;
+  await writeAppAction(supabase, userId, 'amend_set', {
+    exercise_index: amend.exerciseIndex,
+    set_index: amend.setIndex,
+    weight_kg: amend.weight,
+    reps: amend.reps,
+  });
+  return waitForLiveState(supabase, userId, (state) => {
+    const set = state?.loggedSets?.[amend.exerciseIndex]?.[amend.setIndex];
+    return !!set && set.reps === amend.reps && (set.weight ?? null) === amend.weight;
+  });
 };
 
 export type UndoLastSetResult = 'undone' | 'not_confirmed' | 'no_session' | 'no_set_to_undo';
@@ -766,7 +820,7 @@ const resolveTodaysExercises = async (
       .maybeSingle(),
     supabase
       .from('workout_log')
-      .select('at, plan_session_id, status')
+      .select(`at, plan_session_id, status, ${LIFECYCLE_COLUMNS}`)
       .eq('user_id', userId)
       .order('at', { ascending: false })
       .limit(10),
@@ -809,6 +863,17 @@ const resolveTodaysExercises = async (
 
 export type UndoLock = 'already_removed' | 'count_correct';
 
+const REMOVE_A_SET =
+  /\b(?:undo|remove|delete|scratch|cancel|erase|take\s+(?:it\s+|that\s+(?:one\s+)?|this\s+(?:one\s+)?|one\s+)?(?:off|out|away)|get\s+rid\s+of|drop\s+(?:it|that|the|one))\b/i;
+const COUNT_IS_WRONG =
+  /\b(?:twice|double[-\s]?(?:counted|logged)?|extra\s+set|one\s+too\s+many|too\s+many\s+sets|didn'?t\s+do|did\s+not\s+do|haven'?t\s+(?:done|finished|started)|have\s+not\s+(?:done|finished)|never\s+did|only\s+(?:did|done|finished)|should\s+be\s+(?:on\s+)?set|i'?m\s+(?:still\s+|only\s+)?on\s+set|(?:count|counter)\s+is\s+wrong|wrong\s+(?:count|set\s+number))\b/i;
+
+export const asksToRemoveASet = (text: string | null | undefined): boolean => {
+  const said = straightenQuotes(String(text ?? '')).trim();
+  if (!said || said.startsWith('[[SYSTEM_CUE]]')) return false;
+  return REMOVE_A_SET.test(said) || COUNT_IS_WRONG.test(said);
+};
+
 export interface HandlerOptions {
   currentUserText?: string | null;
   undoLock?: UndoLock | null;
@@ -841,6 +906,64 @@ export const createHandlers = (
       .maybeSingle()
       .then(({ data }: any) => (data?.unit_prefs === 'imperial' ? 'imperial' : 'metric'));
     return unitsPromise!;
+  };
+
+  const loadDaySchedule = async (todayOverrideInstead?: { id: string; day_order: number; weekday: number | null; focus: string }) => {
+    const { data: plan, error } = await supabase
+      .from('training_plan')
+      .select('created_at, starts_on, days_per_week, training_days, plan_session(id, day_order, weekday, focus, plan_exercise(ord, sets, rep_scheme, exercise(name)))')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .maybeSingle();
+    if (error) throw new Error(`training_plan fetch: ${error.message}`);
+
+    const sessions = plan?.plan_session ?? [];
+    const since = new Date(Date.now() - 100 * 86_400_000).toISOString();
+    const [timezone, { data: recentLogs }, restDayDates] = await Promise.all([
+      resolveTimezone(supabase, userId, requestTimezone),
+      supabase
+        .from('workout_log')
+        .select(`at, plan_session_id, status, ${LIFECYCLE_COLUMNS}`)
+        .eq('user_id', userId)
+        .gte('at', since)
+        .order('at', { ascending: false })
+        .limit(300),
+      fetchRestDayDates(supabase, userId, since.slice(0, 10)),
+    ]);
+    const now = nowInTimezone(timezone);
+    const todayKey = now.toISOString().slice(0, 10);
+    const override = todayOverrideInstead ?? (await fetchDayOverrideSession(supabase, userId, todayKey));
+    const logs: any[] = logsInTimezone(recentLogs ?? [], timezone);
+    const trainingDays = resolveTrainingDays(plan, sessions);
+    const todayDue =
+      sessions.length === 0 && !override
+        ? null
+        : resolveTodaySession(sessions, logs, now, restDayDates, override, plan?.starts_on ?? null, trainingDays);
+    const planCreatedKey = plan?.created_at
+      ? toTimezone(new Date(plan.created_at), timezone).toISOString().slice(0, 10)
+      : null;
+
+    return {
+      todayKey,
+      sessions,
+      trainingDays,
+      logs: logs.map((log: any) => ({ ...log, dateKey: log.at.slice(0, 10) })),
+      restDayDates,
+      activeFromKey: [planCreatedKey, plan?.starts_on ?? null].filter((k): k is string => !!k).sort().pop() ?? null,
+      todayDue,
+      todayOverride: override,
+      restSecondsFor: estimateRestSeconds,
+    };
+  };
+
+  const planResumesLine = async (customSession: { id: string; day_order: number; weekday: number | null; focus: string }): Promise<string | null> => {
+    try {
+      const schedule = await loadDaySchedule(customSession);
+      return nextTrainingDayAfter(schedule, schedule.todayKey);
+    } catch (err) {
+      console.error('[brain] plan resume lookup failed:', err instanceof Error ? err.message : err);
+      return null;
+    }
   };
 
   const handlers: ToolHandlers = {
@@ -879,7 +1002,7 @@ export const createHandlers = (
             resolveTimezone(supabase, userId, requestTimezone),
             supabase
               .from('workout_log')
-              .select('at, plan_session_id, status')
+              .select(`at, plan_session_id, status, ${LIFECYCLE_COLUMNS}`)
               .eq('user_id', userId)
               .order('at', { ascending: false })
               .limit(10),
@@ -1336,62 +1459,113 @@ export const createHandlers = (
     resolve_interrupted_workout: async (input) => {
       const { data: row, error: fetchError } = await supabase
         .from('workout_log')
-        .select('id, exercises_done')
+        .select('id, exercises_done, vs_planned, note, ended_at, followup_resolved_at')
         .eq('id', input.workout_log_id)
         .eq('user_id', userId)
-        .eq('status', 'interrupted')
+        .in('status', ['partial', 'interrupted'])
         .maybeSingle();
       if (fetchError) throw new Error(`workout_log fetch: ${fetchError.message}`);
       if (!row) return { status: 'not_found' };
 
+      if (input.outcome === 'ended_early' && row.ended_at && row.followup_resolved_at) {
+        return {
+          status: 'already_settled',
+          instruction:
+            'There is nothing to change: it is already saved as a partial workout with only the sets that were ' +
+            'logged. Do not preview it, do not ask them to confirm it again, and do not say you are locking it in. ' +
+            "Move straight on to TODAY's session from the Today entry of the schedule line.",
+        };
+      }
+
+      const additional = (normalizeExercisesDone(input.additional_exercises_done ?? []) as any[]).map((e: any) => ({
+        ...e,
+        tracked: 'reported',
+      }));
+      if (input.outcome === 'completed_independent' && additional.length === 0) {
+        return {
+          status: 'needs_details',
+          instruction:
+            'Nothing has changed. Do not assume the planned sets were done. Ask which exercises and sets they did ' +
+            'after what is already logged, with reps and weights, then call this again with additional_exercises_done.',
+        };
+      }
+
       const tokenKey = input.workout_log_id;
       if (
-        !input.confirm ||
-        !(await verifyConfirmToken(confirmSecret, 'resolve_interrupted_workout', tokenKey, input.confirm_token))
+        input.outcome !== 'ended_early' &&
+        (!input.confirm ||
+          !(await verifyConfirmToken(confirmSecret, 'resolve_interrupted_workout', tokenKey, input.confirm_token)))
       ) {
         return {
           status: 'preview',
           workout_log_id: row.id,
           already_logged: row.exercises_done,
+          would_add: input.outcome === 'completed_independent' ? additional : undefined,
           confirm_token: await issueConfirmToken(confirmSecret, 'resolve_interrupted_workout', tokenKey),
+          what_happens: RESOLVE_OUTCOME_EFFECT[input.outcome as keyof typeof RESOLVE_OUTCOME_EFFECT] ?? null,
           instruction:
-            'Nothing has changed yet. State plainly what will happen for the chosen outcome ' +
-            '(completed_independent/ended_early/discard) and wait for explicit agreement, then call ' +
-            'again with the same fields plus confirm:true and this exact confirm_token.',
+            'Nothing has changed yet. Tell them plainly what will happen (what_happens) and wait for explicit ' +
+            'agreement, then call again with the same fields plus confirm:true and this exact confirm_token. ' +
+            'For what comes next in their plan, read the schedule line in the context; never work it out yourself.',
         };
       }
 
+      const settled = { followup_resolved_at: new Date().toISOString() };
       if (input.outcome === 'discard') {
         const { error: delError } = await supabase.from('workout_log').delete().eq('id', row.id).eq('user_id', userId);
         if (delError) throw new Error(`workout_log delete: ${delError.message}`);
-        return { status: 'discarded' };
+        return {
+          status: 'discarded',
+          instruction:
+            'It is gone and does not count, so this same session is next in their plan. Say that in a few words, ' +
+            "then help with today's next step using the Today entry of the schedule line.",
+        };
       }
 
+      const reason = String(input.reason ?? '').trim();
       if (input.outcome === 'ended_early') {
         const { error: updError } = await supabase
           .from('workout_log')
-          .update({ status: 'partial' })
+          .update({
+            status: 'partial',
+            ended_at: new Date().toISOString(),
+            ended_by: 'coach',
+            note: reason || row.note || null,
+            ...settled,
+          })
           .eq('id', row.id)
           .eq('user_id', userId);
         if (updError) throw new Error(`workout_log update: ${updError.message}`);
-        return { status: 'partial' };
+        return {
+          status: 'partial',
+          instruction:
+            'Kept as a partial workout with only the sets that were logged. Say that in a few words, then help them ' +
+            'with the next step for TODAY: name the session the schedule line shows for Today (or say it is a rest ' +
+            'day) and ask if they want to do it. Never lead with a later day, and never offer this same session again.',
+        };
       }
 
       // completed_independent — whatever was tracked live before the interruption stays exactly
       // as it was; anything the user reports happened afterward is appended and marked reported,
       // never merged into or replacing the live entries.
-      const additional = (normalizeExercisesDone(input.additional_exercises_done ?? []) as any[]).map((e: any) => ({
-        ...e,
-        tracked: 'reported',
-      }));
       const merged = [...(row.exercises_done ?? []), ...additional];
       const { error: updError } = await supabase
         .from('workout_log')
-        .update({ status: 'completed', source: 'independent', exercises_done: merged })
+        .update({
+          status: 'completed',
+          source: 'independent',
+          exercises_done: merged,
+          ended_at: new Date().toISOString(),
+          ended_by: 'coach',
+          ...settled,
+        })
         .eq('id', row.id)
         .eq('user_id', userId);
       if (updError) throw new Error(`workout_log update: ${updError.message}`);
-      return { status: 'completed' };
+      return {
+        status: 'completed',
+        instruction: "Saved as completed with the sets they described. Then help with today's next step using the Today entry of the schedule line.",
+      };
     },
 
     log_checkin: async (input) => {
@@ -1457,7 +1631,7 @@ export const createHandlers = (
         resolveTimezone(supabase, userId, requestTimezone),
         supabase
           .from('workout_log')
-          .select('at, plan_session_id, status')
+          .select(`at, plan_session_id, status, ${LIFECYCLE_COLUMNS}`)
           .eq('user_id', userId)
           .order('at', { ascending: false })
           .limit(10),
@@ -1502,7 +1676,7 @@ export const createHandlers = (
         resolveTimezone(supabase, userId, requestTimezone),
         supabase
           .from('workout_log')
-          .select('at, plan_session_id, status')
+          .select(`at, plan_session_id, status, ${LIFECYCLE_COLUMNS}`)
           .eq('user_id', userId)
           .order('at', { ascending: false })
           .limit(10),
@@ -1634,6 +1808,15 @@ export const createHandlers = (
     },
 
     undo_last_set: async () => {
+      if (!asksToRemoveASet(options.currentUserText)) {
+        return {
+          status: 'not_asked',
+          instruction:
+            'Nothing was removed, and every logged set stays. Their message did not ask to remove or undo a set, ' +
+            'and a set they report again, or numbers they repeat, never mean the last one was wrong. If you really ' +
+            'think a set was counted twice, ask them in one short question and only remove it after they say so.',
+        };
+      }
       if (options.undoLock === 'already_removed') {
         return {
           status: 'already_undone',
@@ -1715,7 +1898,7 @@ export const createHandlers = (
       const [{ data: recentLogs }, restDayDates] = await Promise.all([
         supabase
           .from('workout_log')
-          .select('at, plan_session_id, status')
+          .select(`at, plan_session_id, status, ${LIFECYCLE_COLUMNS}`)
           .eq('user_id', userId)
           .order('at', { ascending: false })
           .limit(10),
@@ -2021,17 +2204,23 @@ export const createHandlers = (
       const tokenKey = 'custom_session';
       if (!input.confirm || !(await verifyConfirmToken(confirmSecret, 'create_custom_session', tokenKey, input.confirm_token))) {
         const omissions = (input.source_omissions ?? []) as string[];
+        const resumes = await planResumesLine({ id: 'pending_custom_session', day_order: 0, weekday: null, focus });
         return {
           status: 'preview',
           focus,
           exercises: requested,
           source_omissions: omissions,
+          ...(resumes ? { plan_resumes: resumes } : {}),
           confirm_token: await issueConfirmToken(confirmSecret, 'create_custom_session', tokenKey),
           instruction:
             `NOTHING HAS BEEN CREATED YET — do not tell the user they are all set, do not tell them ` +
             `to start it, and do not describe this session as existing. Read back the "${focus}" ` +
             `session (one line per exercise with sets and reps), say it replaces today's scheduled ` +
-            `session and that the weekly plan itself is unchanged, wait for explicit agreement, then ` +
+            `session and that the weekly plan itself is unchanged` +
+            (resumes
+              ? ` and picks up on ${resumes} (say exactly that day and session if you name what comes next; the schedule in your context was worked out before this swap)`
+              : '') +
+            `, wait for explicit agreement, then ` +
             `call create_custom_session again with the same fields plus confirm:true and this exact ` +
             `confirm_token.` +
             (omissions.length > 0
@@ -2070,16 +2259,21 @@ export const createHandlers = (
       }
 
       await writeAppAction(supabase, userId, 'refresh_home', { reason: 'custom_session_created' });
+      const resumes = await planResumesLine(override);
 
       return {
         status: 'created',
         plan_session_id: sessionId,
         focus,
         exercises: requested,
+        ...(resumes ? { plan_resumes: resumes } : {}),
         instruction:
           `The session now exists and is today's session — Home is showing it with a Start button. ` +
           `Tell them it's ready in one short line. Do not start it for them unless they ask; if they ` +
-          `do ask, use start_todays_workout.`,
+          `do ask, use start_todays_workout.` +
+          (resumes
+            ? ` If you mention what comes next, the plan picks up on ${resumes}; the schedule in your context was worked out before this swap, so do not use it for the next few days.`
+            : ''),
       };
     },
 
@@ -2145,68 +2339,9 @@ export const createHandlers = (
       };
     },
 
-    show_daily_workout: async () => {
-      const { data: plan, error } = await supabase
-        .from('training_plan')
-        .select('starts_on, days_per_week, training_days, plan_session(id, day_order, weekday, focus, plan_exercise(ord, sets, rep_scheme, exercise(name)))')
-        .eq('user_id', userId)
-        .eq('status', 'active')
-        .maybeSingle();
-      if (error) throw new Error(`training_plan fetch: ${error.message}`);
-
-      const sessions = plan?.plan_session ?? [];
-      const [timezone, { data: recentLogs }, restDayDates] = await Promise.all([
-        resolveTimezone(supabase, userId, requestTimezone),
-        supabase
-          .from('workout_log')
-          .select('at, plan_session_id, status')
-          .eq('user_id', userId)
-          .order('at', { ascending: false })
-          .limit(10),
-        // This call was resolving today with neither rest days nor the override, so the card it
-        // returned could name a session Home had already moved off — the coach showing one
-        // workout while the screen showed another.
-        fetchRestDayDates(supabase, userId, new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10)),
-      ]);
-      const now = nowInTimezone(timezone);
-      const override = await fetchDayOverrideSession(supabase, userId, now.toISOString().slice(0, 10));
-      if (sessions.length === 0 && !override) return { status: 'no_session', reason: 'no_active_plan' };
-
-      const today = resolveTodaySession(
-        sessions,
-        logsInTimezone(recentLogs ?? [], timezone),
-        now,
-        restDayDates,
-        override,
-        plan?.starts_on ?? null,
-        resolveTrainingDays(plan, sessions),
-      );
-      if (!today) return { status: 'no_session', reason: 'rest_day' };
-
-      const exercises = (today.plan_exercise ?? [])
-        .slice()
-        .sort((a: any, b: any) => a.ord - b.ord)
-        .map((e: any) => ({
-          name: e.exercise?.name,
-          sets: e.sets ?? 1,
-          reps: e.rep_scheme ?? '',
-          rest_sec: estimateRestSeconds(e.rep_scheme),
-        }));
-
-      const estimatedMinutes = Math.round(
-        exercises.reduce((total: number, e: any) => total + e.sets * (40 + e.rest_sec), 0) / 60,
-      );
-
-      return {
-        status: 'shown',
-        card: {
-          type: 'daily_workout',
-          plan_session_id: today.id,
-          day_label: `Today · ${humanizeFocus(today.focus)}`,
-          estimated_minutes: estimatedMinutes,
-          exercises,
-        },
-      };
+    show_daily_workout: async (input) => {
+      const schedule = await loadDaySchedule();
+      return lookupDayWorkout({ ...schedule, day: typeof input?.day === 'string' ? input.day : null });
     },
 
     show_nutrition_summary: async () => {
@@ -2677,32 +2812,52 @@ export const createHandlers = (
         };
       }
 
+      const workoutLogId = typeof live.state?.workoutLogId === 'string' ? live.state.workoutLogId : null;
       await writeAppAction(supabase, userId, 'discard_workout', {});
+      let appCleared = false;
       const deadline = Date.now() + 8000;
       while (Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 600));
         if (!(await readLiveSession(supabase, userId)).running) {
-          return {
-            status: 'discarded',
-            instruction:
-              'The workout is gone from the app and nothing from it was saved. Say so in one short line. ' +
-              'Their plan is unchanged, so the same session is still next.',
-          };
+          appCleared = true;
+          break;
         }
+      }
+      const removed = await removeDiscardedWorkout(supabase, userId, workoutLogId, !appCleared);
+      if (removed) {
+        return {
+          status: 'discarded',
+          instruction:
+            'The workout is gone and nothing from it was saved. Say so in one short line. ' +
+            'Their plan is unchanged, so the same session is still next.',
+        };
       }
       return {
         status: 'not_confirmed',
         instruction:
-          'The discard was sent but the app has NOT confirmed it. Do not say it was deleted. Ask them to ' +
+          'The discard was sent but it could not be confirmed. Do not say it was deleted. Ask them to ' +
           'check whether the workout screen closed.',
       };
     },
 
     adjust_rest_timer: async (input) => {
-      if (input.action === 'set') return setRestLength(supabase, userId, input.seconds, input.scope);
-      const seconds =
-        typeof input.seconds === 'number' ? Math.min(120, Math.max(1, Math.round(input.seconds))) : null;
-      await writeAppAction(supabase, userId, 'adjust_rest_timer', { action: input.action, seconds });
+      if (input.action === 'set')
+        return setRestLength(supabase, userId, input.seconds, input.scope, options.currentUserText ?? null);
+      const live = await readLiveSession(supabase, userId);
+      if (live.running && live.snapshot?.status !== 'resting') {
+        return {
+          status: 'not_resting',
+          instruction:
+            'Nothing changed: no rest timer is running. A rest only starts when a set is logged, so if they ' +
+            'want to rest, ask exactly "How many reps did you get?" and the app starts the rest when it logs ' +
+            'their answer. Never say rest is running or has started.',
+        };
+      }
+      if (input.action === 'extend') {
+        const seconds = typeof input.seconds === 'number' ? Math.round(input.seconds) : EXTEND_REST_DEFAULT_SEC;
+        return extendRestFromServer(supabase, userId, seconds);
+      }
+      await writeAppAction(supabase, userId, 'adjust_rest_timer', { action: input.action, seconds: null });
       return { status: 'requested' };
     },
 
@@ -2724,12 +2879,127 @@ export const createHandlers = (
   );
 };
 
+const RESOLVE_OUTCOME_EFFECT = {
+  ended_early:
+    'It stays saved as a partial workout with only the sets that were logged. It counts as done for the schedule, ' +
+    'so the plan moves on: the NEXT session is the one the schedule line shows, not this one again.',
+  completed_independent: 'The sets they described are added and the workout is saved as completed. The plan moves on.',
+  discard: 'The workout is deleted and does not count, so this same session stays next in their plan.',
+};
+
 export const REST_LENGTH_MIN_SEC = 15;
 export const REST_LENGTH_MAX_SEC = 600;
 
-type RestScope = 'current' | 'upcoming' | 'both';
+type LegacyRestScope = 'current' | 'upcoming' | 'both';
 
-const setRestLength = async (supabase: any, userId: string, rawSeconds: unknown, rawScope: unknown) => {
+const REST_SCOPES: RestLengthScope[] = ['current', 'exercise', 'workout', 'always'];
+
+const EXTEND_REST_DEFAULT_SEC = 10;
+const EXTEND_REST_MAX_SEC = 300;
+const EXTEND_DUPLICATE_WINDOW_MS = 10_000;
+
+export interface RestChangeOutcome {
+  status: string;
+  seconds?: number;
+  scope?: RestLengthScope;
+  summary?: string;
+  sayBack?: string;
+  instruction: string;
+}
+
+const currentExerciseOf = (state: any): { name: string; exerciseId: string | null } | null => {
+  const exercise = state?.exercises?.[state?.currentExerciseIndex];
+  if (!exercise?.name) return null;
+  return { name: String(exercise.name), exerciseId: exercise.exerciseId ? String(exercise.exerciseId) : null };
+};
+
+const saveRestPreference = async (supabase: any, userId: string, exerciseId: string, seconds: number): Promise<boolean> => {
+  const { error } = await supabase
+    .from('exercise_rest_preference')
+    .upsert(
+      { user_id: userId, exercise_id: exerciseId, rest_sec: seconds, updated_at: new Date().toISOString() },
+      { onConflict: 'user_id,exercise_id' },
+    );
+  if (error) console.error('[brain] failed to save rest preference:', error.message);
+  return !error;
+};
+
+const setLegacyRestLength = async (
+  supabase: any,
+  userId: string,
+  seconds: number,
+  scope: RestLengthScope,
+  resting: boolean,
+): Promise<RestChangeOutcome> => {
+  const applied: LegacyRestScope = scope === 'current' ? 'current' : resting ? 'both' : 'upcoming';
+  await writeAppAction(supabase, userId, 'adjust_rest_timer', { action: 'set', seconds, scope: applied });
+  const landed = await waitForLiveState(supabase, userId, (state) => {
+    const currentOk = applied === 'upcoming' || (state?.resting && state?.restTargetSec === seconds);
+    const upcomingOk = applied === 'current' || state?.restOverrideSec === seconds;
+    return !!currentOk && !!upcomingOk;
+  });
+  if (!landed) return notConfirmedRest(seconds);
+  const summary =
+    applied === 'current'
+      ? `made the rest running now ${seconds} seconds in total; later rests are unchanged`
+      : `set every rest in this workout to ${seconds} seconds${applied === 'both' ? ', including the one running now' : ''}`;
+  const sayBack = 'Say that in one short line.';
+  return { status: 'set', seconds, scope, summary, sayBack, instruction: `The app has ${summary}. ${sayBack}` };
+};
+
+const notConfirmedRest = (seconds: number): RestChangeOutcome => ({
+  status: 'not_confirmed',
+  seconds,
+  instruction:
+    `The change was sent but the app has NOT confirmed it. Do not say rest is now ${seconds} seconds; say you ` +
+    'asked for it and that the timer on screen is what counts.',
+});
+
+export const describeHoldTarget = (seconds: number): string =>
+  seconds % 60 === 0 && seconds >= 120 ? `${seconds / 60} minutes` : `${seconds} seconds`;
+
+export const setHoldTarget = async (
+  supabase: any,
+  userId: string,
+  seconds: number,
+  exerciseName: string,
+): Promise<RestChangeOutcome> => {
+  const live = await readLiveSession(supabase, userId);
+  if (!live.running) {
+    return { status: 'no_session', instruction: 'Nothing changed. There is no workout running in the app right now.' };
+  }
+  const label = describeHoldTarget(seconds);
+  await writeAppAction(supabase, userId, 'set_hold_target', { seconds, exercise_name: exerciseName });
+  const landed = await waitForLiveState(supabase, userId, (state) => {
+    const current = state?.exercises?.[state?.currentExerciseIndex];
+    return String(current?.repScheme ?? '') === label;
+  });
+  if (!landed) {
+    return {
+      status: 'not_confirmed',
+      seconds,
+      instruction:
+        `The change was sent but the app has NOT confirmed it. Do not say the hold is now ${label}; say you asked ` +
+        'for it and that the card on screen is what counts.',
+    };
+  }
+  const summary = `set the ${exerciseName} hold to ${label} for the rest of this workout`;
+  const sayBack = `Say that back in one short line, like "${label} per set on ${exerciseName}."`;
+  return { status: 'set', seconds, summary, sayBack, instruction: `The app has ${summary}. ${sayBack}` };
+};
+
+export const meansTheHoldNotTheRest = (
+  exerciseName: string | null | undefined,
+  userText: string | null | undefined,
+): boolean => !!exerciseName && isTimedExercise(exerciseName) && !REST_WORD.test(userText ?? '');
+
+export const setRestLength = async (
+  supabase: any,
+  userId: string,
+  rawSeconds: unknown,
+  rawScope: unknown,
+  userText: string | null = null,
+): Promise<RestChangeOutcome> => {
   const seconds = typeof rawSeconds === 'number' ? Math.round(rawSeconds) : NaN;
   if (!Number.isFinite(seconds) || seconds < REST_LENGTH_MIN_SEC || seconds > REST_LENGTH_MAX_SEC) {
     return {
@@ -2737,14 +3007,14 @@ const setRestLength = async (supabase: any, userId: string, rawSeconds: unknown,
       instruction: `Nothing changed. A rest length has to be between ${REST_LENGTH_MIN_SEC} and ${REST_LENGTH_MAX_SEC} seconds.`,
     };
   }
-  const scope: RestScope | null =
-    rawScope === 'current' || rawScope === 'upcoming' || rawScope === 'both' ? rawScope : null;
+  const scope = REST_SCOPES.includes(rawScope as RestLengthScope) ? (rawScope as RestLengthScope) : null;
   if (!scope) {
     return {
       status: 'invalid_scope',
       instruction:
-        'Nothing changed. Call again with scope "current" (only the rest running now), "upcoming" (every rest ' +
-        'after this one) or "both".',
+        'Nothing changed. Call again with scope "current" (only the rest running now), "exercise" (every rest for ' +
+        'the current exercise for the rest of this workout), "workout" (every exercise, only when they said so) or ' +
+        '"always" (this exercise, saved for future workouts).',
     };
   }
   const live = await readLiveSession(supabase, userId);
@@ -2756,34 +3026,168 @@ const setRestLength = async (supabase: any, userId: string, rawSeconds: unknown,
     return {
       status: 'not_resting',
       instruction:
-        'Nothing changed: no rest is running right now. If they want their next rests at that length, call again ' +
-        'with scope "upcoming".',
+        'Nothing changed: no rest is running right now. If they want the rests for this exercise at that length, ' +
+        'call again with scope "exercise".',
     };
   }
-  const applied: RestScope = scope === 'both' && !resting ? 'upcoming' : scope;
-  await writeAppAction(supabase, userId, 'adjust_rest_timer', { action: 'set', seconds, scope: applied });
+  if (Number(live.state?.setParser ?? 1) < REST_SCOPES_FROM_VERSION) {
+    return setLegacyRestLength(supabase, userId, seconds, scope, resting);
+  }
+
+  const exercise = currentExerciseOf(live.state);
+  const exerciseName = exercise?.name ?? null;
+  if (meansTheHoldNotTheRest(exerciseName, userText)) {
+    return {
+      status: 'timed_exercise_ambiguous',
+      instruction:
+        `Nothing changed, and do NOT say their rest is now ${seconds} seconds. ${exerciseName} is a timed hold, so ` +
+        `"${seconds} seconds" reads as the hold, and the app already changes the hold itself when they ask for it. ` +
+        'Only their rest BETWEEN sets comes through this tool. Ask which of the two they meant, in one short line, ' +
+        'and say nothing has changed yet.',
+    };
+  }
+  let savedForLater = false;
+  if (scope === 'always') {
+    if (!exercise?.exerciseId) {
+      return {
+        status: 'cannot_save',
+        instruction:
+          `Nothing changed. ${exerciseName ?? 'This exercise'} cannot be saved for future workouts. Offer to set it ` +
+          'for the rest of this workout instead (scope "exercise").',
+      };
+    }
+    savedForLater = await saveRestPreference(supabase, userId, exercise.exerciseId, seconds);
+  }
+
+  await writeAppAction(supabase, userId, 'adjust_rest_timer', { action: 'set', seconds, scope });
+  const key = exerciseName ? restKeyOf(exerciseName) : null;
   const landed = await waitForLiveState(supabase, userId, (state) => {
-    const currentOk = applied === 'upcoming' || (state?.resting && state?.restTargetSec === seconds);
-    const upcomingOk = applied === 'current' || state?.restOverrideSec === seconds;
-    return !!currentOk && !!upcomingOk;
+    const currentOk = !resting || (state?.resting && state?.restTargetSec === seconds);
+    const ruleOk =
+      scope === 'current' ||
+      (scope === 'workout' ? state?.restOverrideSec === seconds : !!key && state?.restByExercise?.[key] === seconds);
+    return !!currentOk && ruleOk;
   });
+  if (!landed) return notConfirmedRest(seconds);
+
+  const summary = `set rest to ${seconds} seconds ${describeRestScope(scope, exerciseName, resting)}`;
+  const savedNote =
+    scope === 'always' && !savedForLater
+      ? ' Saving it for future workouts FAILED, so say it is set for this workout and that it could not be saved for next time.'
+      : '';
+  const example =
+    scope === 'current'
+      ? `${seconds} seconds for this rest only.`
+      : scope === 'workout'
+        ? `${seconds} seconds for every exercise today.`
+        : scope === 'always'
+          ? `${seconds} seconds on ${exerciseName}, saved for next time too.`
+          : `${seconds} seconds for the rest of your ${exerciseName ?? 'exercise'}.`;
+  const sayBack = `${savedNote} Say that scope back in one short line, like "${example}"`.trim();
+  return { status: 'set', seconds, scope, summary, sayBack, instruction: `The app has ${summary}. ${sayBack}` };
+};
+
+export const extendRestFromServer = async (supabase: any, userId: string, rawSeconds: number): Promise<RestChangeOutcome> => {
+  const seconds = Math.min(EXTEND_REST_MAX_SEC, Math.max(1, Math.round(rawSeconds)));
+  const live = await readLiveSession(supabase, userId);
+  if (!live.running) {
+    return { status: 'no_session', instruction: 'Nothing changed. There is no workout running in the app right now.' };
+  }
+  if (live.snapshot?.status !== 'resting') {
+    return {
+      status: 'not_resting',
+      instruction:
+        'Nothing changed: no rest timer is running. A rest only starts when a set is logged, so if they want to rest, ' +
+        'ask exactly "How many reps did you get?" and the app starts the rest when it logs their answer. Never say ' +
+        'rest is running or has started.',
+    };
+  }
+  const { data: recent } = await supabase
+    .from('app_action')
+    .select('payload')
+    .eq('user_id', userId)
+    .eq('type', 'adjust_rest_timer')
+    .gte('created_at', new Date(Date.now() - EXTEND_DUPLICATE_WINDOW_MS).toISOString());
+  const summary = `added ${seconds} seconds to the rest running now; later rests are unchanged`;
+  const sayBack = 'Say that in one short line.';
+  const extended: RestChangeOutcome = { status: 'extended', seconds, summary, sayBack, instruction: `The app has ${summary}. ${sayBack}` };
+  if ((recent ?? []).some((row: any) => row.payload?.action === 'extend' && Number(row.payload?.seconds) === seconds)) {
+    return extended;
+  }
+  const before = Number(live.state?.restTargetSec ?? 0);
+  await writeAppAction(supabase, userId, 'adjust_rest_timer', { action: 'extend', seconds });
+  const landed = await waitForLiveState(
+    supabase,
+    userId,
+    (state) => !!state?.resting && Number(state?.restTargetSec ?? 0) >= before + seconds,
+  );
   if (!landed) {
     return {
       status: 'not_confirmed',
+      seconds,
       instruction:
-        `The change was sent but the app has NOT confirmed it. Do not say rest is now ${seconds} seconds; say you ` +
-        'asked for it and that the timer on screen is what counts.',
+        `The extra ${seconds} seconds were asked for but the app has NOT confirmed them. Say you asked for more time ` +
+        'and that the timer on screen is what counts.',
     };
   }
-  return {
-    status: 'set',
-    seconds,
-    scope: applied,
-    instruction:
-      applied === 'current'
-        ? `The rest running now is ${seconds} seconds in total. Later rests are unchanged.`
-        : applied === 'upcoming'
-          ? `Every rest after this one will be ${seconds} seconds for the rest of this workout.${resting ? ' The rest running now is unchanged.' : ''}`
-          : `The rest running now and every rest after it are ${seconds} seconds for the rest of this workout.`,
-  };
+  return extended;
+};
+
+export interface RestChangeTurn {
+  requested: boolean;
+  applied: boolean;
+  note: string | null;
+  label: string | null;
+}
+
+const NO_REST_CHANGE: RestChangeTurn = { requested: false, applied: false, note: null, label: null };
+
+export const applyRestChangeFromMessage = async (
+  supabase: any,
+  userId: string,
+  text: string,
+  clientParserVersion: number,
+  resting: boolean,
+  currentExerciseName: string | null = null,
+): Promise<RestChangeTurn> => {
+  const timed = !!currentExerciseName && isTimedExercise(currentExerciseName);
+  if (timed && clientParserVersion >= REST_SCOPES_FROM_VERSION) {
+    const holdSeconds = parseHoldTargetRequest(text);
+    if (holdSeconds !== null) {
+      const outcome = await setHoldTarget(supabase, userId, holdSeconds, currentExerciseName);
+      const applied = outcome.status === 'set';
+      const note = applied
+        ? `${TURN_NOTE_HEADER}\n- They asked to change how long they hold ${currentExerciseName}. The app has ALREADY ` +
+          `${outcome.summary}, and the card on screen shows it. ${outcome.sayBack ?? ''} Nothing was logged from this ` +
+          'message, and their rest between sets is unchanged.'
+        : `${TURN_NOTE_HEADER}\n- They asked to change how long they hold ${currentExerciseName}. ${outcome.instruction} ` +
+          'Nothing was logged from this message.';
+      return {
+        requested: true,
+        applied,
+        note: note.replace(/\s+Nothing was/, ' Nothing was'),
+        label: `hold ${holdSeconds}s: ${outcome.status}`,
+      };
+    }
+  }
+  let change: RestChangeRequest | null;
+  if (clientParserVersion >= REST_SCOPES_FROM_VERSION) {
+    change = parseRestChangeRequest(text, { resting, timedExercise: currentExerciseName ? timed : undefined });
+  } else {
+    const seconds = parseRestLengthRequest(text);
+    change = seconds === null ? null : { kind: 'set', seconds, scope: 'workout' };
+  }
+  if (!change) return NO_REST_CHANGE;
+  const outcome =
+    change.kind === 'extend'
+      ? await extendRestFromServer(supabase, userId, change.seconds)
+      : await setRestLength(supabase, userId, change.seconds, change.scope, text);
+  const applied = outcome.status === 'set' || outcome.status === 'extended';
+  const note = applied
+    ? `${TURN_NOTE_HEADER}\n- They asked to change their rest. The app has ALREADY ${outcome.summary}, and it is on ` +
+      `screen. ${outcome.sayBack ?? ''} Do not call adjust_rest_timer, and nothing was logged from this message.`
+    : `${TURN_NOTE_HEADER}\n- They asked to change their rest. ${outcome.instruction} Do not call adjust_rest_timer ` +
+      'again, and nothing was logged from this message.';
+  const label = change.kind === 'extend' ? `extend ${change.seconds}s` : `set ${change.seconds}s ${change.scope}`;
+  return { requested: true, applied, note: note.replace(/\s+Do not/, ' Do not'), label: `${label}: ${outcome.status}` };
 };

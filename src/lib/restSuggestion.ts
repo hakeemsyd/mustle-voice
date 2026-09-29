@@ -49,7 +49,7 @@ export function suggestRestSeconds(
   const target = targetRepsFrom(repScheme);
   if (target === null) return { seconds: DEFAULT_REST_SEC, reason: 'on_target' };
 
-  let rest = DEFAULT_REST_SEC;
+  let rest = estimateRestSeconds(repScheme);
   let reason: RestSuggestionReason = 'on_target';
   if (reps < target - 2) {
     rest += 45;

@@ -442,6 +442,14 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                           )}
                           <Text style={styles.weekFocus}>{day.focus ? titleCase(day.focus) : "Rest day"}</Text>
                         </View>
+                        {day.alsoLogged.length > 0 && (
+                          <Text style={styles.weekSub}>
+                            Also{" "}
+                            {day.alsoLogged
+                              .map((other) => `${titleCase(other.focus)}${other.unfinished ? " (started)" : ""}`)
+                              .join(", ")}
+                          </Text>
+                        )}
                         {day.mealsCount > 0 && (
                           <Text style={styles.weekSub}>
                             {day.mealsCount} {day.mealsCount === 1 ? "meal" : "meals"} logged

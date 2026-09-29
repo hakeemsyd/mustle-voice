@@ -104,3 +104,12 @@ test('a pain chip still raises the injury check', () => {
   const report = buildSessionReport(partialLog(null, ['Felt pain']) as never, null, [], 1, null);
   assert.ok(report.debrief.injuryCheck);
 });
+
+test('volume adds up to exactly what the per-set rows show in pounds', async () => {
+  const { computeDisplayVolume } = await import('./sessionReport');
+  const rows = buildSetLog([
+    { name: 'Incline Dumbbell Curl', sets: 4, reps: '8,10,8,10', load: '18.1,18.1,18.1,18.1' },
+    { name: 'Cable Tricep Pushdown', sets: 4, reps: '12,11,12,12', load: '24.9,24.9,24.9,24.9' },
+  ]);
+  assert.equal(computeDisplayVolume(rows, 'imperial'), 40 * 36 + 55 * 47);
+});

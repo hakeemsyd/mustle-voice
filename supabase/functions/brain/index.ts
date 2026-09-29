@@ -3,32 +3,71 @@ import { runBrainTurn } from '../_shared/brain-orchestrator.ts';
 import { APP_LINE_MODALITY, replayHistory } from '../_shared/replay-history.ts';
 import { dropLeadingConcession, dropSelfCorrection } from '../_shared/humanize.ts';
 import { buildSystemPrompt, callModel, MESSAGE_HISTORY_LIMIT } from '../_shared/brain-config.ts';
-import { buildContextBlock, startOfLocalDayUtc } from '../_shared/brain-context.ts';
-import { createHandlers, logSetFromServer, resolveDispute, undoLockFor } from '../_shared/brain-handlers.ts';
+import {
+  buildContextBlock,
+  markFollowupAskedIfRaised,
+  settleFollowupOnAnswer,
+  startOfLocalDayUtc,
+} from '../_shared/brain-context.ts';
+import { describeEarlierInConversation, loadConversationHistory } from '../_shared/conversation-history.ts';
+import {
+  amendSetFromServer,
+  createHandlers,
+  logSetFromServer,
+  resolveDispute,
+  applyRestChangeFromMessage,
+  undoLockFor,
+} from '../_shared/brain-handlers.ts';
 import { describeDisputeOutcome, detectSetCountDispute } from '../_shared/set-dispute.ts';
 import { stripSystemNote } from '../_shared/strip-system-note.ts';
 import { scrubInternalLanguage } from '../_shared/scrub-internal.ts';
 import {
+  describeAmendNotConfirmed,
   describeCueFacts,
+  describeExpectedExerciseLine,
   describeResumedStart,
   describeTypedTurnSetOutcome,
   describeUnconfirmedLog,
   isLiveStrengthSession,
+  lastLoggedSetOf,
+  missingRequiredAsk,
   resolveTurnSetOutcome,
   TURN_NOTE_HEADER,
+  TYPED_REST_REQUEST_ASK,
   type TurnSetOutcome,
 } from '../_shared/turn-set-outcome.ts';
-import { claimFallback, guardClaims, trackToolOutcomes, withGuardedFinalText } from '../_shared/claim-guard.ts';
+import {
+  claimFallback,
+  guardClaims,
+  isClearanceClaim,
+  isFragment,
+  trackToolOutcomes,
+  withGuardedFinalText,
+} from '../_shared/claim-guard.ts';
 import { contextHasInjuryGate } from '../_shared/injury-context.ts';
-import { looksLikeFinishedSetReport } from '../_shared/set-report.ts';
-import { SYSTEM_CUE_PREFIX } from '../_shared/system-cue.ts';
+import {
+  EXERCISE_NAMING_CUES,
+  exerciseMentionContext,
+  mentionsCurrentExercise,
+  TRANSITION_CUES,
+} from '../_shared/exercise-mention-guard.ts';
+import {
+  looksLikeFinishedSetReport,
+  looksLikeRestRequest,
+  looksLikeStartSetCommand,
+  SET_PARSER_VERSION,
+} from '../_shared/set-report.ts';
+
+const SETS_REST_LENGTH_FROM_VERSION = 5;
+import { resolveTurnText, SYSTEM_CUE_PREFIX } from '../_shared/system-cue.ts';
 import {
   buildLiveSessionSnapshot,
+  describeEarlierExercises,
   describeLiveSessionSnapshot,
   LIVE_STATE_MAX_AGE_MS,
 } from '../_shared/live-session-format.ts';
 
-const SET_CONFIRMING_CUES = new Set(['set_logged', 'exercise_advanced']);
+const SET_CONFIRMING_CUES = new Set(['set_logged', 'exercise_advanced', 'exercise_advanced_rest']);
 const SESSION_START_CUE = 'session_start';
 
 // How far back a still-unfinished consultation stays readable. Long enough to cover leaving it
@@ -96,27 +135,36 @@ Deno.serve(async (req) => {
       .maybeSingle();
     const midConsultation = !activePlanRow;
 
+    const historyColumns = 'role,content,blocks,hidden,greeting_key,modality,at';
     const fetchHistory = () =>
-      supabase
-        .from('message')
-        .select('role,content,blocks,hidden,greeting_key,modality,at')
-        .eq('user_id', userId)
-        .gte(
-          'at',
-          midConsultation
-            ? new Date(Date.now() - CONSULTATION_HISTORY_LOOKBACK_MS).toISOString()
-            : startOfLocalDayUtc(timezone).toISOString(),
-        )
-        .order('at', { ascending: false })
-        .order('role', { ascending: true })
-        .limit(MESSAGE_HISTORY_LIMIT);
+      midConsultation
+        ? supabase
+            .from('message')
+            .select(historyColumns)
+            .eq('user_id', userId)
+            .gte('at', new Date(Date.now() - CONSULTATION_HISTORY_LOOKBACK_MS).toISOString())
+            .order('at', { ascending: false })
+            .order('role', { ascending: true })
+            .limit(MESSAGE_HISTORY_LIMIT)
+        : loadConversationHistory({
+            supabase,
+            userId,
+            at: askedAt,
+            text: messageText,
+            columns: historyColumns,
+            limit: MESSAGE_HISTORY_LIMIT,
+            fallbackSince: startOfLocalDayUtc(timezone).toISOString(),
+          });
 
-    let [{ data: history, error: historyError }, contextBlock, { data: liveRow }, { data: unitsRow }] = await Promise.all([
+    let [historyResult, contextBlock, { data: liveRow }, { data: unitsRow }] = await Promise.all([
       fetchHistory(),
       buildContextBlock(supabase, userId, timezone, typeof message === 'string' ? message : null),
       supabase.from('live_session_state').select('state, updated_at').eq('user_id', userId).maybeSingle(),
       supabase.from('profile').select('unit_prefs').eq('user_id', userId).maybeSingle(),
     ]);
+
+    let { data: history, error: historyError } = historyResult;
+    const earlierNote = describeEarlierInConversation((historyResult as any).earlier ?? []);
 
     // Clock skew between Supabase edge nodes can reject a valid service-role token ("JWT issued at
     // future"), which threw away the whole turn. Retry, then continue without today's scrollback.
@@ -147,16 +195,39 @@ Deno.serve(async (req) => {
       console.log(`[brain] set-count dispute on ${dispute.exerciseName}: ${dispute.done} -> ${dispute.targetDone}, ${disputeResolution}`);
     }
     const liveSnapshot = currentLiveState && !isDailyGreeting ? buildLiveSessionSnapshot(currentLiveState) : null;
-    const turnLiveBlock =
-      liveSnapshot && (disputeResolution === 'undone' || !sentFromWorkoutScreen)
-        ? describeLiveSessionSnapshot(liveSnapshot, turnUnits)
+    const serverDescribesLive = !!liveSnapshot && (disputeResolution === 'undone' || !sentFromWorkoutScreen);
+    const earlierExercisesLine =
+      !serverDescribesLive && liveBlockText && !liveBlockText.includes('earlier messages in this workout')
+        ? describeEarlierExercises(liveSnapshot, turnUnits)
+        : null;
+    const turnLiveBlock = serverDescribesLive
+      ? describeLiveSessionSnapshot(liveSnapshot!, turnUnits)
+      : earlierExercisesLine
+        ? `${liveBlockText}\n${earlierExercisesLine}`
         : liveBlockText;
     const liveStrengthSession =
       turnLiveBlock.includes('- Current exercise:') && !/Status: finished/.test(turnLiveBlock);
     const restActive = /Status: resting/.test(turnLiveBlock);
 
+    const clientParserVersion = Number((currentLiveState as any)?.setParser ?? 1);
+    const restChange =
+      cueName === null && !dispute && isLiveStrengthSession(liveSnapshot) && clientParserVersion >= SETS_REST_LENGTH_FROM_VERSION
+        ? await applyRestChangeFromMessage(
+            supabase,
+            userId,
+            messageText,
+            clientParserVersion,
+            liveSnapshot?.status === 'resting',
+            liveSnapshot?.currentExercise?.name ?? null,
+          )
+        : null;
+    const restLengthRequested = !!restChange?.requested;
+    const restLengthApplied = !!restChange?.applied;
+    const restLengthNote = restChange?.note ?? null;
+    if (restChange?.label) console.log(`[brain] rest change ${restChange.label}`);
+
     let chatSetOutcome: TurnSetOutcome | null = null;
-    if (cueName === null && !dispute && !sentFromWorkoutScreen && isLiveStrengthSession(liveSnapshot)) {
+    if (cueName === null && !dispute && !restLengthRequested && !sentFromWorkoutScreen && isLiveStrengthSession(liveSnapshot)) {
       const lastCoachRow = (history ?? []).find(
         (m: any) => m.role === 'assistant' && !m.greeting_key && m.modality !== APP_LINE_MODALITY,
       );
@@ -173,10 +244,17 @@ Deno.serve(async (req) => {
         appliesRestatementRule: true,
         confirmsBareReps: true,
         typed: modality !== 'voice',
+        parserVersion: SET_PARSER_VERSION,
+        clientVersion: clientParserVersion,
+        lastSet: lastLoggedSetOf(currentLiveState),
       });
       if (chatSetOutcome?.kind === 'logged' && chatSetOutcome.set) {
         const landed = await logSetFromServer(supabase, userId, chatSetOutcome.set, messageText);
         if (!landed) chatSetOutcome = { kind: 'not_logged', note: describeUnconfirmedLog() };
+      }
+      if (chatSetOutcome?.kind === 'corrected' && chatSetOutcome.amend) {
+        const landed = await amendSetFromServer(supabase, userId, chatSetOutcome.amend);
+        if (!landed) chatSetOutcome = { kind: 'not_logged', note: describeAmendNotConfirmed() };
       }
     }
 
@@ -200,20 +278,34 @@ Deno.serve(async (req) => {
           { type: 'image', source: { type: 'url', url: attachmentUrl } },
           { type: 'text', text: message ? message : 'What do you see here?' },
         ]
-      : message;
+      : cueName !== null
+        ? resolveTurnText(messageText)
+        : message;
     const messages = [...priorMessages, { role: 'user', content: userContent }];
 
     const typedSetNote =
       dispute && disputeResolution
         ? describeDisputeOutcome(dispute, disputeResolution, TURN_NOTE_HEADER, liveSnapshot ? liveSnapshot.status === 'resting' : null)
-        : chatSetOutcome
-          ? chatSetOutcome.note
-          : liveStrengthSession && cueName === null
-            ? describeTypedTurnSetOutcome(restActive)
-            : null;
+        : restLengthNote
+          ? restLengthNote
+          : chatSetOutcome
+            ? chatSetOutcome.note
+            : liveStrengthSession && cueName === null
+              ? describeTypedTurnSetOutcome(restActive, messageText)
+              : null;
+    const typedRestRequest =
+      !chatSetOutcome &&
+      !dispute &&
+      !restLengthRequested &&
+      liveStrengthSession &&
+      cueName === null &&
+      !restActive &&
+      looksLikeRestRequest(messageText) &&
+      !looksLikeStartSetCommand(messageText);
+    const requiredAsk = dispute ? null : chatSetOutcome?.requiredAsk ?? (typedRestRequest ? TYPED_REST_REQUEST_ASK : null);
     const resumeNote = cueName === SESSION_START_CUE ? describeResumedStart(liveSnapshot, turnUnits) : null;
     const cueFacts = describeCueFacts(cueName, liveSnapshot, turnUnits);
-    const fullContextBlock = [contextBlock, turnLiveBlock || null, typedSetNote, resumeNote, cueFacts]
+    const fullContextBlock = [contextBlock, earlierNote, turnLiveBlock || null, typedSetNote, resumeNote, cueFacts]
       .filter(Boolean)
       .join('\n\n');
     const systemPrompt = buildSystemPrompt((history ?? []).length > 0, fullContextBlock, 'text', isDailyGreeting);
@@ -233,22 +325,56 @@ Deno.serve(async (req) => {
     const result = await runBrainTurn({ systemPrompt, messages, handlers, callModel });
 
     const injuryOnFile = contextHasInjuryGate(fullContextBlock);
+    const userReportedSet =
+      cueName === null &&
+      (looksLikeFinishedSetReport(messageText) ||
+        typedRestRequest ||
+        ['needs_details', 'needs_confirmation', 'needs_weight', 'repeat', 'rest_request'].includes(chatSetOutcome?.kind ?? ''));
+    const exerciseMentions =
+      cueName !== null && EXERCISE_NAMING_CUES.has(cueName) && isLiveStrengthSession(liveSnapshot)
+        ? exerciseMentionContext(currentLiveState)
+        : null;
+    const expectedExerciseLine = exerciseMentions ? describeExpectedExerciseLine(cueName, liveSnapshot, turnUnits) : null;
     const guarded = guardClaims(result.reply, {
       liveSession: liveStrengthSession,
       injuryOnFile,
+      userReportedSet,
+      exerciseMentions,
       setLoggedThisTurn: (cueName !== null && SET_CONFIRMING_CUES.has(cueName)) || chatSetOutcome?.kind === 'logged',
       restActive,
-      actionSucceededThisTurn: tracked.outcomes.actionSucceeded || disputeResolution === 'undone',
+      actionSucceededThisTurn:
+        tracked.outcomes.actionSucceeded ||
+        disputeResolution === 'undone' ||
+        restLengthApplied ||
+        chatSetOutcome?.kind === 'corrected',
     });
     if (guarded.dropped.length > 0) console.warn('[brain] dropped unbacked claims:', guarded.dropped.join(' | '));
-    const guardedReply =
+    const claimsCleared =
       guarded.dropped.length === 0
         ? result.reply
-        : guarded.text ||
-          claimFallback(liveStrengthSession, cueName === null && looksLikeFinishedSetReport(messageText), injuryOnFile);
+        : (isFragment(guarded.text) ? '' : guarded.text) ||
+          requiredAsk ||
+          expectedExerciseLine ||
+          claimFallback(
+            liveStrengthSession,
+            cueName === null && looksLikeFinishedSetReport(messageText),
+            injuryOnFile,
+            guarded.dropped.some(isClearanceClaim),
+          );
+    const extraAsk = missingRequiredAsk(claimsCleared, requiredAsk);
+    if (extraAsk) console.warn('[brain] coach skipped the required question, appended:', extraAsk);
+    const withAsk = extraAsk ? `${claimsCleared.trim()} ${extraAsk}`.trim() : claimsCleared;
+    const needsExerciseLine =
+      !!exerciseMentions &&
+      !!expectedExerciseLine &&
+      cueName !== null &&
+      TRANSITION_CUES.has(cueName) &&
+      !mentionsCurrentExercise(withAsk, exerciseMentions);
+    if (needsExerciseLine) console.warn('[brain] coach did not name the current exercise, appended:', expectedExerciseLine);
+    const guardedReply = needsExerciseLine ? `${withAsk.trim()} ${expectedExerciseLine}`.trim() : withAsk;
 
     const turnBlocks =
-      guarded.dropped.length === 0
+      guardedReply === result.reply
         ? result.messages.slice(messages.length)
         : withGuardedFinalText(result.messages.slice(messages.length), guardedReply);
 
@@ -285,6 +411,13 @@ Deno.serve(async (req) => {
       at: repliedAt.toISOString(),
     });
     if (logError) console.error('[brain] failed to log conversation:', logError.message);
+    if (cueName === null) {
+      if (isDailyGreeting) await markFollowupAskedIfRaised(supabase, userId, reply, greetingKey);
+      else {
+        await markFollowupAskedIfRaised(supabase, userId, reply, null);
+        await settleFollowupOnAnswer(supabase, userId, message);
+      }
+    }
 
     return new Response(
       JSON.stringify({

@@ -24,6 +24,8 @@ export interface PlanBreakdownCard {
 export interface DailyWorkoutCard {
   type: 'daily_workout';
   plan_session_id: string;
+  date_key?: string;
+  is_today?: boolean;
   day_label: string;
   estimated_minutes: number;
   exercises: {

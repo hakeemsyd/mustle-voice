@@ -9,7 +9,7 @@ export type RootStackParamList = {
   SessionReport: { workoutLogId: string; sessionMessages?: SessionThreadMessage[] };
   Calendar: { initialScope?: "today" | "week" | "month" } | undefined;
   GlobalChat:
-    | { initialMode?: "mic" | "keyboard"; jumpToMessageId?: string; autoSendMessage?: string }
+    | { initialMode?: "mic" | "keyboard"; conversationId?: string; autoSendMessage?: string }
     | undefined;
 };
 

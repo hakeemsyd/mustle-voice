@@ -67,10 +67,41 @@ test('a set ordinal frames a report', () => {
   expectLog('3rd set, 6 reps at 75 lb.', { weight: 34, reps: 6 });
 });
 
-test('an explicit weight and rep pair is a report on its own', () => {
-  expectLog('75 pounds, 8 reps.', { weight: 34, reps: 8 });
-  expectLog('8 reps at 75 pounds.', { weight: 34, reps: 8 });
-  expectLog('60 kg 8 reps', { weight: 60, reps: 8 }, idle, 'metric');
+const idleV5 = { awaitingDetails: false, version: 5 };
+
+test('up to build 29 (parser v5), an explicit weight and rep pair is a report on its own', () => {
+  expectLog('75 pounds, 8 reps.', { weight: 34, reps: 8 }, idleV5);
+  expectLog('8 reps at 75 pounds.', { weight: 34, reps: 8 }, idleV5);
+  expectLog('60 kg 8 reps', { weight: 60, reps: 8 }, idleV5, 'metric');
+});
+
+const expectUnconfirmed = (text: string, set: { weight: number | null; reps: number }, ctx = idle) => {
+  const intent = classifySpokenSet(text, 'imperial', ctx);
+  assert.equal(intent.kind, 'unconfirmed', text);
+  if (intent.kind === 'unconfirmed') assert.deepEqual(intent.set, set, text);
+};
+
+test('spoken numbers with no completion word are confirmed before they count (Damion, 25 Sep)', () => {
+  expectUnconfirmed('75 pounds, 8 reps.', { weight: 34, reps: 8 });
+  expectUnconfirmed('8 reps at 75 pounds.', { weight: 34, reps: 8 });
+  expectUnconfirmed('Eight reps.', { weight: null, reps: 8 });
+  expectLog('Done, 8 reps at 75 pounds.', { weight: 34, reps: 8 });
+  expectLog('That was 8 reps at 75.', { weight: 34, reps: 8 });
+  expectLog('Set one, eight reps.', { weight: null, reps: 8 });
+  expectLog('Eight.', { weight: null, reps: 8 }, { awaitingDetails: true, confirmsBareReps: true } as any);
+});
+
+test('typed numbers follow the same rule: only a clear completion logs, the rest is confirmed first', () => {
+  const typed = { awaitingDetails: false, typed: true } as any;
+  expectUnconfirmed('75 pounds, 8 reps.', { weight: 34, reps: 8 }, typed);
+  expectUnconfirmed('12 reps', { weight: null, reps: 12 }, typed);
+  expectUnconfirmed('39.9 lb 10 reps', { weight: 18.1, reps: 10 }, typed);
+  expectLog('Done 40/8', { weight: 18.1, reps: 8 }, typed);
+  expectLog('I did 8 reps', { weight: null, reps: 8 }, typed);
+  expectLog('12 reps', { weight: null, reps: 12 }, { ...typed, confirmed: true });
+  expectLog('12', { weight: null, reps: 12 }, { ...typed, awaitingDetails: true, confirmsBareReps: true });
+  expectIgnore("I'll do about 10 reps", typed);
+  expectIgnore('How about 10 reps?', typed);
 });
 
 test('stating the weight you are about to use never logs a set', () => {
@@ -101,9 +132,9 @@ test('answering the pending question logs, with or without a weight', () => {
   expectLog('12 reps', { weight: null, reps: 12 }, asked);
 });
 
-test('a bare rep count with nothing pending is left to the coach', () => {
-  expectIgnore('8 reps.');
-  expectIgnore('12 reps');
+test('up to build 29 (parser v5), a bare rep count with nothing pending is left to the coach', () => {
+  expectIgnore('8 reps.', idleV5);
+  expectIgnore('12 reps', idleV5);
 });
 
 test('a duration only logs while the current exercise is actually timed', () => {
@@ -198,8 +229,8 @@ test('loose reps never land on a timed exercise', () => {
   expectIgnore('I did 10.', onTimedExercise);
 });
 
-test('typed input logs a plain count but never a plan or a question', () => {
-  const typed = { ...idle, typed: true };
+test('up to build 29 (parser v5), typed input logs a plain count but never a plan or a question', () => {
+  const typed = { ...idle, typed: true, version: 5 };
   expectLog('8 reps', { weight: null, reps: 8 }, typed);
   expectLog('60 8', { weight: 60, reps: 8 }, typed, 'metric');
   expectLog('75 lb 8', { weight: 34, reps: 8 }, typed);

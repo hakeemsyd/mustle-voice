@@ -1,9 +1,13 @@
+import { namesWrongExercise, type ExerciseMentionContext } from './exercise-mention-guard.ts';
+
 export interface ClaimGuardState {
   liveSession: boolean;
   setLoggedThisTurn: boolean;
   restActive: boolean;
   actionSucceededThisTurn: boolean;
   injuryOnFile?: boolean;
+  userReportedSet?: boolean;
+  exerciseMentions?: ExerciseMentionContext | null;
 }
 
 const SET_CLAIMS: RegExp[] = [
@@ -23,9 +27,20 @@ const REST_CLAIMS: RegExp[] = [
   /\b(?:start|starting|begin|beginning)\s+(?:your|the)\s+rest\b/i,
   /\b(?:your|the)\s+rest\s+timer\s+(?:is|has)\b/i,
   /\btime\s+to\s+rest\b/i,
+  /^\s*resting\b/i,
+  /\b(?:you'?re|you\s+are|we'?re|we\s+are)\s+(?:now\s+)?resting\b/i,
+  /\bresting\s+(?:now|for)\b/i,
+  /\b(?:\d+|thirty|forty[-\s]five|sixty|ninety|one|two|three)[-\s](?:seconds?|minutes?)\s+(?:of\s+)?rest\s+(?:starts?|starting|started|now|begins?|is\s+on|running)\b/i,
+  /\btimer(?:'s|\s+is)\s+(?:now\s+)?(?:on|going|running|started|set)\b/i,
+  /\b(?:starting|started|set)\s+(?:the|your|a)\s+(?:rest\s+)?timer\b/i,
 ];
 
+const PRAISE_ONLY =
+  /^(?:(?:very|really|so)\s+)?(?:solid|nice|great|good|strong|clean|awesome|perfect|beautiful|excellent|brilliant|sweet|huge|big|crushed\s+it|nailed\s+it|boom|there\s+you\s+go|that'?s\s+it|let'?s\s+go|(?:nice|good|great|strong|solid)\s+(?:work|job|one|effort|stuff))(?:\s*(?:,|!|\.|—|-)\s*(?:(?:very|really|so)\s+)?(?:solid|nice|great|good|strong|clean|awesome|perfect|work|job|one|effort|stuff|keep\s+it\s+up|keep\s+going))*\s*[.!]*$/i;
+
 const ACTION_CLAIMS: RegExp[] = [
+  /\b(?:adjusting|changing|setting|updating|switching)\s+(?:it|that|your\s+rests?|the\s+rests?|rests?|the\s+timer|your\s+timer|the\s+rest\s+timer)\s+(?:to|at|over\s+to)\s+(?:\d+|thirty|forty[-\s]five|sixty|ninety|a|one|two|three)\s*(?:seconds?|secs?|minutes?|mins?)\b/i,
+  /\b(?:your|the)\s+rests?\s+(?:is|are)\s+now\b/i,
   /\b(?:is|was|has\s+been|have\s+been|got|been)\s+(?:now\s+)?(?:cleared|deleted|discarded|dropped|removed|wiped|swapped|switched|cancel+ed)\b/i,
   /\bi(?:'ve|\s+have)\s+(?:just\s+|now\s+)?(?:cleared|deleted|discarded|dropped|removed|wiped|swapped|switched|saved|cancel+ed|updated|changed|moved|added|created|reset)\b/i,
 ];
@@ -70,14 +85,18 @@ export const isUnbackedClaim = (clause: string, state: ClaimGuardState): boolean
   const text = clause.replace(/[\u2018\u2019\u201B\u02BC]/g, "'").trim();
   if (!text) return false;
   if (state.liveSession && matchesAny(SCREEN_QUESTIONS, text)) return true;
+  if (state.liveSession && namesWrongExercise(text, state.exerciseMentions ?? null)) return true;
   if (state.liveSession && !state.setLoggedThisTurn) {
     if (matchesAny(SET_CLAIMS, text)) return true;
     if (!state.restActive && matchesAny(REST_CLAIMS, text)) return true;
+    if (state.userReportedSet && PRAISE_ONLY.test(text)) return true;
   }
   if (!state.actionSucceededThisTurn && matchesAny(ACTION_CLAIMS, text)) return true;
   if (state.injuryOnFile && matchesAny(CLEARANCE_CLAIMS, text)) return true;
   return false;
 };
+
+export const isFragment = (text: string): boolean => text.trim().split(/\s+/).filter(Boolean).length < 4;
 
 export const guardClaims = (text: string, state: ClaimGuardState): { text: string; dropped: string[] } => {
   const sentences = text.split(/(?<=[.!?])\s+/);
@@ -151,7 +170,16 @@ export const withGuardedFinalText = (blocks: any[], reply: string): any[] => {
   return out;
 };
 
-export const claimFallback = (liveSession: boolean, userReportedSet: boolean, injuryOnFile = false): string => {
+export const isClearanceClaim = (sentence: string): boolean =>
+  matchesAny(CLEARANCE_CLAIMS, sentence.replace(/[\u2018\u2019\u201B\u02BC]/g, "'").trim());
+
+export const claimFallback = (
+  liveSession: boolean,
+  userReportedSet: boolean,
+  injuryOnFile = false,
+  clearanceDropped = false,
+): string => {
+  if (injuryOnFile && clearanceDropped) return INJURY_FALLBACK;
   if (userReportedSet) return SET_DETAILS_FALLBACK;
   if (liveSession) return LIVE_SESSION_FALLBACK;
   return injuryOnFile ? INJURY_FALLBACK : ACTION_FALLBACK;

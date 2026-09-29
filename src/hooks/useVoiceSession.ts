@@ -3,6 +3,7 @@ import { AudioSession } from '@livekit/react-native';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { setAudioModeAsync } from 'expo-audio';
 import {
+  describeAudioSessionState,
   enableWebrtcAudio,
   releaseWebrtcAudio,
   subscribeToAudioInterruptions,
@@ -134,10 +135,7 @@ const WORKOUT_SILENCE_TIMEOUT_MS = 10 * 60_000;
 const HANDOFF_GRACE_MS = 600;
 
 const OWED_REPLY_GRACE_MS = 10_000;
-const END_SESSION_TIMEOUT_MS = 3_000;
-
-const settleWithin = (work: unknown, ms: number): Promise<void> =>
-  Promise.race([Promise.resolve(work).then(() => undefined), new Promise<void>((resolve) => setTimeout(resolve, ms))]);
+const END_SESSION_TIMEOUT_MS = 5_000;
 const SILENCE_CHECK_INTERVAL_MS = 5_000;
 
 // Wraps the real ElevenLabs conversation hook (not a decorative animation) —
@@ -166,6 +164,7 @@ export const useVoiceSession = (
   const [muted, setMutedState] = useState(false);
   const mutedRef = useRef(false);
   mutedRef.current = muted;
+  const keyboardMutedRef = useRef(false);
   const typedWhileMutedRef = useRef(false);
   const replyOwedRef = useRef(false);
   const pendingEndRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -278,6 +277,37 @@ export const useVoiceSession = (
     },
   });
 
+  const statusRef = useRef(status);
+  statusRef.current = status;
+  const endedWaitersRef = useRef<(() => void)[]>([]);
+  useEffect(() => {
+    if (status !== 'disconnected' && status !== 'error') return;
+    const waiters = endedWaitersRef.current;
+    endedWaitersRef.current = [];
+    waiters.forEach((resolve) => resolve());
+  }, [status]);
+
+  const endSessionAndWait = (): Promise<void> =>
+    new Promise<void>((resolve) => {
+      const alreadyEnded = statusRef.current === 'disconnected' || statusRef.current === 'error';
+      endSession();
+      if (alreadyEnded) {
+        resolve();
+        return;
+      }
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      endedWaitersRef.current.push(finish);
+      setTimeout(() => {
+        if (!settled) console.warn('[voice] call teardown still running after timeout, continuing');
+        finish();
+      }, END_SESSION_TIMEOUT_MS);
+    });
+
   // Every end path above disables recording on the iOS audio session, so it has to be re-enabled
   // before each start — not just once at app launch. Missing this was why a *second* voice
   // session in the same app run connected with a mic that couldn't capture: the agent talked,
@@ -286,7 +316,7 @@ export const useVoiceSession = (
   endAndReleaseRef.current = (context: string) => {
     const run = teardownRef.current
       .catch(() => undefined)
-      .then(() => settleWithin(endSession(), END_SESSION_TIMEOUT_MS))
+      .then(() => endSessionAndWait())
       .then(() => releaseMicrophone())
       .catch((err) => reportEndSessionFailure(context, err));
     teardownRef.current = run;
@@ -360,6 +390,11 @@ export const useVoiceSession = (
       AudioSession.setAppleAudioConfiguration({ audioMode: 'voiceChat' }).catch((err) =>
         console.warn('[voice] failed to set voiceChat audio mode:', err),
       );
+      void describeAudioSessionState().then((state) => {
+        if (state && /activationCount=-/.test(state)) {
+          console.warn('[voice] audio session activation count went negative, the mic may be deaf:', state);
+        }
+      });
     }
   }, [status]);
 
@@ -423,10 +458,11 @@ export const useVoiceSession = (
       reconnectAttemptsRef.current += 1;
       intentionalEndRef.current = true;
       setReconnecting(true);
-      Promise.resolve(endSession())
-        .catch(() => undefined)
-        .finally(() => setReconnectTrigger((n) => n + 1));
+      const run = teardownRef.current.catch(() => undefined).then(() => endSessionAndWait());
+      teardownRef.current = run;
+      void run.catch(() => undefined).finally(() => setReconnectTrigger((n) => n + 1));
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [endSession],
   );
   forceFreshSessionRef.current = forceFreshSession;
@@ -528,6 +564,7 @@ export const useVoiceSession = (
     setIdleClosed(false);
     setMutedState(false);
     mutedRef.current = false;
+    keyboardMutedRef.current = false;
     Promise.resolve(
       startSessionWithRecordingEnabled({
         userId: config?.userId ?? undefined,
@@ -632,7 +669,27 @@ export const useVoiceSession = (
     }
   };
 
-  const toggleMute = () => applyMute(!mutedRef.current);
+  const toggleMute = () => {
+    keyboardMutedRef.current = false;
+    applyMute(!mutedRef.current);
+  };
+
+  const applyMuteRef = useRef(applyMute);
+  applyMuteRef.current = applyMute;
+
+  const setKeyboardMode = useCallback((keyboard: boolean) => {
+    if (keyboard) {
+      if (!mutedRef.current) {
+        keyboardMutedRef.current = true;
+        applyMuteRef.current(true);
+      }
+      return;
+    }
+    if (keyboardMutedRef.current) {
+      keyboardMutedRef.current = false;
+      applyMuteRef.current(false);
+    }
+  }, []);
 
   const endWhenAnswered = useCallback(() => {
     cancelRelease();
@@ -679,6 +736,7 @@ export const useVoiceSession = (
     isMuted: muted,
     toggleMute,
     setMuteState: applyMute,
+    setKeyboardMode,
     setWorkoutActive,
   };
 };

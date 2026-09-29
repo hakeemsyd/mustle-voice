@@ -1,4 +1,4 @@
-import { kgToDisplayWeight, type Units } from './units';
+import { kgToDisplayWeight, kgToDisplayWeightValue, type Units } from './units';
 import { titleCase } from './textFormat';
 export interface LoggedExercise {
   name: string;
@@ -79,6 +79,7 @@ export interface SessionReport {
   totalSets: number;
   targetSets: number;
   volume: number;
+  displayVolume: number;
   volumeDeltaPct: number | null;
   topSetLabel: string;
   streakDays: number;
@@ -138,6 +139,14 @@ export function buildSetLog(exercises: LoggedExercise[]): SetLogRow[] {
 
 export function computeVolume(setLog: SetLogRow[]): number {
   return setLog.reduce((sum, row) => sum + (row.weight ?? 0) * (row.reps ?? 0), 0);
+}
+
+export function computeDisplayVolume(setLog: SetLogRow[], units: Units): number {
+  const total = setLog.reduce(
+    (sum, row) => sum + (row.weight == null ? 0 : kgToDisplayWeightValue(row.weight, units)) * (row.reps ?? 0),
+    0,
+  );
+  return Math.round(total * 10) / 10;
 }
 
 export function buildTopSetLabel(setLog: SetLogRow[], units: Units = 'metric'): string {
@@ -346,6 +355,7 @@ export function buildSessionReport(
     totalSets,
     targetSets,
     volume,
+    displayVolume: computeDisplayVolume(setLog, units),
     volumeDeltaPct,
     topSetLabel: buildTopSetLabel(setLog, units),
     streakDays,

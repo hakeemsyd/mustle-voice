@@ -62,16 +62,19 @@ export const finalizeStaleLiveSession = async (
       ? state.startedAt
       : liveRow.updated_at;
 
+  const setTimes = (state.loggedSets ?? []).flat().map((s: any) => s?.at).filter((at: any) => typeof at === 'number');
+  const lastActivityAt = new Date(setTimes.length > 0 ? Math.max(...setTimes) : Date.parse(liveRow.updated_at)).toISOString();
+
   const existingId = await findExistingRowId(supabase, userId, state, startedAt);
   if (existingId) {
     const { data: updated, error: updateError } = await supabase
       .from('workout_log')
-      .update({ status: 'interrupted', duration_sec: state.elapsedSec ?? 0, exercises_done: exercisesDone })
+      .update({ duration_sec: state.elapsedSec ?? 0, exercises_done: exercisesDone, last_activity_at: lastActivityAt })
       .eq('id', existingId)
       .eq('user_id', userId)
       .select('id')
       .maybeSingle();
-    if (updateError) console.error('[interrupted-session] failed to mark session interrupted:', updateError.message);
+    if (updateError) console.error('[interrupted-session] failed to save the stale session:', updateError.message);
     if (updated?.id) return { finalized: true, workoutLogId: updated.id };
   }
 
@@ -86,7 +89,8 @@ export const finalizeStaleLiveSession = async (
       cardio_activity: isCardio ? state.target.activity : null,
       duration_sec: state.elapsedSec ?? 0,
       exercises_done: exercisesDone,
-      status: 'interrupted',
+      status: 'partial',
+      last_activity_at: lastActivityAt,
       source: 'mustle',
       note: null,
     })

@@ -12,10 +12,11 @@ import { supabase } from "../lib/supabase";
 import { dispatchQuery } from "../lib/dispatchQuery";
 import { persistChatLine } from "../lib/chatLog";
 import { callBrain, COACH_UNREACHABLE_MESSAGE } from "../lib/brain";
-import { DEFAULT_REST_SEC, suggestRestSeconds, type RestSuggestionReason } from "../lib/restSuggestion";
+import { DEFAULT_REST_SEC, estimateRestSeconds, suggestRestSeconds, type RestSuggestionReason } from "../lib/restSuggestion";
 import { useProfileName } from "../hooks/useProfileName";
 import { buildLiveSessionSnapshot, describeLiveSessionSnapshot } from "./liveSessionState";
 import { isRestatement, SET_PARSER_VERSION } from "../../supabase/functions/_shared/set-report";
+import { customRestFor, restKeyOf, type RestLengthRules, type RestLengthScope } from "../../supabase/functions/_shared/rest-length";
 import { normalizeLoadScheme } from "../../supabase/functions/_shared/load-intent";
 import { rebuildResumedSession, type ResumePlanEntry } from "./resumeSession";
 import type { SetSource } from "../../supabase/functions/_shared/set-dispute";
@@ -32,12 +33,23 @@ import { useUnitPrefs } from "../hooks/useUnitPrefs";
 // collide on.
 
 const EXTEND_REST_SEC = 10;
+const EXTEND_REST_MAX_SEC = 300;
+
+const REST_SAVE_FAILED_MESSAGE =
+  "Couldn't save that rest length for future workouts. It still applies for the rest of this workout.";
 // How long an identical set report is treated as a repeat of the one just logged rather than a
 // new set. Generous because logging a set immediately starts a rest period, so a real second set
 // of the same load and reps cannot physically arrive inside this window.
 const DUPLICATE_SET_WINDOW_MS = 10_000;
 
 const LIVE_STATE_HEARTBEAT_MS = 5 * 60_000;
+
+const WORKOUT_WRITE_RETRIES_MS = [1_000, 3_000];
+
+const SAVE_FAILED_MESSAGE =
+  "Couldn't save your workout just now. Your sets are still on this screen, and I'll save them again with your next set.";
+
+const SAVE_RECOVERED_MESSAGE = "Saved — your workout is up to date again.";
 
 export interface SessionExercise {
   id: string;
@@ -70,7 +82,7 @@ export interface SetOrigin {
   source: SetSource;
 }
 
-export type RestLengthScope = "current" | "upcoming" | "both";
+export type { RestLengthScope };
 
 /** Same shape workout_log.exercises_done is written in (see writeWorkoutLog below) — passed
  *  back in to resume a partial session at its actual saved position instead of restarting at
@@ -88,7 +100,13 @@ export interface SessionResume {
   sessionPlan?: ResumePlanEntry[] | null;
   workoutLogId?: string | null;
   elapsedSec?: number | null;
+  restOverrideSec?: number | null;
+  restByExercise?: Record<string, number> | null;
 }
+
+export type LogSetResult =
+  | { ok: true }
+  | { ok: false; reason: "no_exercise" | "busy" | "repeat" | "duplicate" };
 
 interface LastSetSnapshot {
   loggedSets: LoggedSet[][];
@@ -102,6 +120,18 @@ interface LastSetSnapshot {
    *  whether it also needs to delete a row, not just roll back in-memory state. */
   createdWorkoutLogId: string | null;
 }
+
+const closeOtherOpenWorkouts = (userId: string | null, keepId: string | null) => {
+  if (!userId) return;
+  let query = supabase
+    .from("workout_log")
+    .update({ ended_at: new Date().toISOString(), ended_by: "user" })
+    .eq("user_id", userId)
+    .in("status", ["partial", "interrupted"])
+    .is("ended_at", null);
+  if (keepId) query = query.neq("id", keepId);
+  dispatchQuery(query, "close open workouts");
+};
 
 const restReasonCopy = (reason: RestSuggestionReason): string | null => {
   switch (reason) {
@@ -189,7 +219,10 @@ interface ActiveSessionValue {
   restReasonLabel: string | null;
   extendRest: (seconds?: number, source?: "manual" | "coach") => void;
   restOverrideSec: number | null;
+  restByExercise: Record<string, number>;
+  restRules: RestLengthRules;
   setRestLength: (seconds: number, scope: RestLengthScope, source?: "manual" | "coach") => void;
+  setHoldTarget: (seconds: number) => void;
   toggleRestPause: () => void;
   pauseRest: () => void;
   resumeRest: () => void;
@@ -220,7 +253,9 @@ interface ActiveSessionValue {
   ) => void;
   minimize: () => void;
   restore: () => void;
-  logSet: (weight: number | null, reps: number, unit?: 'seconds', origin?: SetOrigin) => boolean;
+  logSet: (weight: number | null, reps: number, unit?: 'seconds', origin?: SetOrigin) => LogSetResult;
+  amendSet: (exerciseIndex: number, setIndex: number, weight: number | null, reps: number) => boolean;
+  restFinishedAt: number | null;
   isRestatementNow: () => boolean;
   setParsing: (parsing: boolean) => void;
   claimGreeting: () => boolean;
@@ -286,6 +321,8 @@ export const ActiveSessionProvider = ({
   >(null);
   const [restReasonLabel, setRestReasonLabel] = useState<string | null>(null);
   const [restOverrideSec, setRestOverrideSec] = useState<number | null>(null);
+  const [restByExercise, setRestByExercise] = useState<Record<string, number>>({});
+  const [savedRestByExercise, setSavedRestByExercise] = useState<Record<string, number>>({});
   const [restFinishedAt, setRestFinishedAt] = useState<number | null>(null);
   const [ended, setEnded] = useState(false);
   const [endedStatus, setEndedStatus] = useState<SessionStatus | null>(null);
@@ -300,6 +337,10 @@ export const ActiveSessionProvider = ({
   const [minimized, setMinimized] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
   const userName = useProfileName(userId);
+  const restRules = useMemo(
+    () => ({ restByExercise, restOverrideSec, savedRestByExercise }),
+    [restByExercise, restOverrideSec, savedRestByExercise],
+  );
 
   const userIdRef = useRef<string | null>(null);
   const logIdRef = useRef<string | null>(null);
@@ -316,7 +357,7 @@ export const ActiveSessionProvider = ({
   // Latest writeWorkoutLog, kept current every render (assigned right after its own declaration
   // below) — lets start() call it before resetting state without needing writeWorkoutLog defined
   // earlier in this file, and without start()'s own identity needing to depend on it.
-  const writeWorkoutLogRef = useRef<((sets: LoggedSet[][], status: SessionStatus) => Promise<void>) | null>(null);
+  const writeWorkoutLogRef = useRef<((sets: LoggedSet[][], status: SessionStatus, closing?: boolean) => Promise<void>) | null>(null);
   // Set once a run has been written as finished. A run is written progressively now (every logged
   // set updates the row), so this no longer guards against duplicate inserts — writeChainRef does
   // that — it stops a late progress write downgrading a completed workout back to partial.
@@ -336,6 +377,8 @@ export const ActiveSessionProvider = ({
   const recentSetRef = useRef<{ key: string; at: number } | null>(null);
   const lastSetSnapshotRef = useRef<LastSetSnapshot | null>(null);
   const greetedStartedAtRef = useRef<string | null>(null);
+  const announceRef = useRef<((text: string, options?: { persist?: boolean }) => void) | null>(null);
+  const saveFailureShownRef = useRef(false);
 
   const start = useCallback(
     (
@@ -347,8 +390,9 @@ export const ActiveSessionProvider = ({
       // exercises/target/elapsedSec are still what writeWorkoutLogRef's current closure holds
       // at this point, since state hasn't reset yet.
       if (target && !ended && loggedSets.some((sets) => sets.length > 0)) {
-        void writeWorkoutLogRef.current?.(loggedSets, "partial");
+        void writeWorkoutLogRef.current?.(loggedSets, "partial", true);
       }
+      closeOtherOpenWorkouts(userIdRef.current, resume?.workoutLogId ?? null);
       workoutLogWrittenRef.current = false;
       loggingRef.current = false;
       lastSetSnapshotRef.current = null;
@@ -375,8 +419,10 @@ export const ActiveSessionProvider = ({
       setRestEndAt(null);
       setRestPausedRemainingSec(null);
       setRestReasonLabel(null);
-      setRestOverrideSec(null);
+      setRestOverrideSec(resume?.restOverrideSec ?? null);
+      setRestByExercise(resume?.restByExercise ?? {});
       setRestFinishedAt(null);
+      setLastSetLoggedAt(null);
       setEnded(false);
       setEndedStatus(null);
       setCoachMessage("Ready when you are.");
@@ -450,7 +496,9 @@ export const ActiveSessionProvider = ({
     setRestPausedRemainingSec(null);
     setRestReasonLabel(null);
     setRestOverrideSec(null);
+    setRestByExercise({});
     setRestFinishedAt(null);
+    setLastSetLoggedAt(null);
     setMessages([]);
     workoutLogWrittenRef.current = false;
     loggingRef.current = false;
@@ -545,6 +593,38 @@ export const ActiveSessionProvider = ({
     };
   }, [target]);
 
+  const exerciseIdsKey = exercises
+    .map((exercise) => exercise.exerciseId)
+    .filter(Boolean)
+    .sort()
+    .join(",");
+  useEffect(() => {
+    const ids = exerciseIdsKey ? exerciseIdsKey.split(",") : [];
+    if (!userId || ids.length === 0) {
+      setSavedRestByExercise({});
+      return;
+    }
+    let cancelled = false;
+    void supabase
+      .from("exercise_rest_preference")
+      .select("exercise_id, rest_sec")
+      .eq("user_id", userId)
+      .in("exercise_id", ids)
+      .then(({ data, error: loadError }) => {
+        if (cancelled) return;
+        if (loadError) {
+          console.error("[active session] failed to load rest preferences:", loadError.message);
+          return;
+        }
+        setSavedRestByExercise(
+          Object.fromEntries(((data ?? []) as { exercise_id: string; rest_sec: number }[]).map((row) => [row.exercise_id, row.rest_sec])),
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [userId, exerciseIdsKey]);
+
   // Cardio is timed work, so the session itself is the clock. Strength sessions track
   // elapsed time too — it's what the log's duration_sec records either way.
   useEffect(() => {
@@ -576,7 +656,7 @@ export const ActiveSessionProvider = ({
   // The row is now written on the first set and updated on every one after, so an interrupted run
   // survives as a partial exactly as an explicitly abandoned one does.
   const writeWorkoutLog = useCallback(
-    async (sets: LoggedSet[][], status: SessionStatus) => {
+    async (sets: LoggedSet[][], status: SessionStatus, closing: boolean = status === "completed") => {
       const userId = userIdRef.current;
       if (!userId || !target || workoutLogWrittenRef.current) return;
 
@@ -605,6 +685,8 @@ export const ActiveSessionProvider = ({
       const vsPlanned = isCardio
         ? null
         : {
+            rest_override_sec: restOverrideSec,
+            rest_by_exercise: restByExercise,
             planned_exercises: exercises.length,
             completed_exercises: exercisesDone.length,
             planned_sets: exercises.reduce((sum, ex) => sum + ex.sets, 0),
@@ -619,8 +701,12 @@ export const ActiveSessionProvider = ({
             })),
           };
 
+      const writtenAt = new Date().toISOString();
       const row = {
         user_id: userId,
+        last_activity_at: writtenAt,
+        ended_at: closing ? writtenAt : null,
+        ended_by: closing ? "user" : null,
         plan_session_id:
           target.type === "strength" ? target.planSessionId : null,
         switched_from_session_id: target.switchedFromSessionId ?? null,
@@ -632,8 +718,7 @@ export const ActiveSessionProvider = ({
         status,
       };
 
-      const write = async () => {
-        setSaving(true);
+      const attempt = async () => {
         const existingId = logIdRef.current;
         const { data, error: writeError } = existingId
           ? await supabase
@@ -647,31 +732,78 @@ export const ActiveSessionProvider = ({
               .insert({ ...row, note: null })
               .select("id")
               .maybeSingle();
+        return { data, writeError, existingId };
+      };
+
+      const write = async () => {
+        setSaving(true);
+        let result = await attempt();
+        for (let retry = 0; result.writeError && retry < WORKOUT_WRITE_RETRIES_MS.length; retry++) {
+          await new Promise((resolve) => setTimeout(resolve, WORKOUT_WRITE_RETRIES_MS[retry]));
+          result = await attempt();
+        }
         setSaving(false);
 
-        if (writeError) {
+        if (result.writeError) {
           if (status === "completed") workoutLogWrittenRef.current = false;
           console.error(
             "[active session] failed to log workout:",
-            writeError.message,
+            result.writeError.message,
           );
+          if (!saveFailureShownRef.current) {
+            saveFailureShownRef.current = true;
+            announceRef.current?.(SAVE_FAILED_MESSAGE, { persist: false });
+          }
           return;
         }
-        logIdRef.current = data?.id ?? existingId;
+        if (saveFailureShownRef.current) {
+          saveFailureShownRef.current = false;
+          announceRef.current?.(SAVE_RECOVERED_MESSAGE, { persist: false });
+        }
+        logIdRef.current = result.data?.id ?? result.existingId;
         setWorkoutLogId(logIdRef.current);
       };
 
       writeChainRef.current = writeChainRef.current.then(write, write);
       await writeChainRef.current;
     },
-    [exercises, target, elapsedSec],
+    [exercises, target, elapsedSec, restOverrideSec, restByExercise],
   );
   writeWorkoutLogRef.current = writeWorkoutLog;
+
+  const restRulesRef = useRef<string | null>(null);
+  useEffect(() => {
+    const rules = JSON.stringify({ restOverrideSec, restByExercise });
+    if (restRulesRef.current === null) {
+      restRulesRef.current = rules;
+      return;
+    }
+    if (restRulesRef.current === rules) return;
+    restRulesRef.current = rules;
+    const save = async () => {
+      const id = logIdRef.current;
+      if (!id) return;
+      const { data, error: readError } = await supabase
+        .from("workout_log")
+        .select("vs_planned")
+        .eq("id", id)
+        .maybeSingle();
+      if (readError || !data?.vs_planned) return;
+      const { error: saveError } = await supabase
+        .from("workout_log")
+        .update({
+          vs_planned: { ...data.vs_planned, rest_override_sec: restOverrideSec, rest_by_exercise: restByExercise },
+        })
+        .eq("id", id);
+      if (saveError) console.error("[active session] failed to save rest rules:", saveError.message);
+    };
+    writeChainRef.current = writeChainRef.current.then(save, save);
+  }, [restOverrideSec, restByExercise]);
 
   const persistPartialIfAny = useCallback(async () => {
     if (!target || ended) return;
     if (!loggedSets.some((sets) => sets.length > 0)) return;
-    await writeWorkoutLogRef.current?.(loggedSets, "partial");
+    await writeWorkoutLogRef.current?.(loggedSets, "partial", true);
   }, [target, ended, loggedSets]);
 
   const latestSetTime = (): number | null => {
@@ -693,14 +825,15 @@ export const ActiveSessionProvider = ({
   }, [startedAt]);
 
   const logSet = useCallback(
-    (weight: number | null, reps: number, unit?: 'seconds', origin?: SetOrigin): boolean => {
+    (weight: number | null, reps: number, unit?: 'seconds', origin?: SetOrigin): LogSetResult => {
       const exercise = exercises[currentExerciseIndex];
-      if (!exercise || loggingRef.current) return false;
+      if (!exercise) return { ok: false, reason: "no_exercise" };
+      if (loggingRef.current) return { ok: false, reason: "busy" };
 
       const spokenOrChat = origin?.source === "voice" || origin?.source === "coach";
       if (spokenOrChat && isRestatement(latestSetTime(), Date.now(), restFinishedAt)) {
         console.warn("[session] ignored a set reported seconds after the last one:", weight, reps);
-        return false;
+        return { ok: false, reason: "repeat" };
       }
 
       // Set-indexed so a genuine repeat of the same weight/reps (routine in straight-set
@@ -713,7 +846,7 @@ export const ActiveSessionProvider = ({
       const recent = recentSetRef.current;
       if (recent && recent.key === dedupeKey && now - recent.at < DUPLICATE_SET_WINDOW_MS) {
         console.warn('[session] ignored a duplicate set report:', dedupeKey);
-        return false;
+        return { ok: false, reason: "duplicate" };
       }
       recentSetRef.current = { key: dedupeKey, at: now };
       setLastSetLoggedAt(now);
@@ -746,13 +879,14 @@ export const ActiveSessionProvider = ({
           setsSoFar,
           exercise.sets,
         );
-        const restSeconds = restOverrideSec ?? suggestion.seconds;
+        const custom = customRestFor(exercise, restRules);
+        const restSeconds = custom?.seconds ?? suggestion.seconds;
         setRestTargetSec(restSeconds);
         setRestEndAt(Date.now() + restSeconds * 1000);
         setRestPausedRemainingSec(null);
         setResting(true);
         setRestKey((k) => k + 1);
-        setRestReasonLabel(restOverrideSec ? "Your rest length" : restReasonCopy(suggestion.reason));
+        setRestReasonLabel(custom ? "Your rest length" : restReasonCopy(suggestion.reason));
         void writeWorkoutLogRef.current?.(next, "partial");
       } else if (currentExerciseIndex === exercises.length - 1) {
         setEnded(true);
@@ -762,17 +896,25 @@ export const ActiveSessionProvider = ({
           if (lastSetSnapshotRef.current) lastSetSnapshotRef.current.createdWorkoutLogId = logIdRef.current;
         });
       } else {
+        const upcoming = exercises[currentExerciseIndex + 1];
+        const restSeconds = customRestFor(upcoming, restRules)?.seconds ?? estimateRestSeconds(upcoming?.repScheme ?? null);
         setCurrentExerciseIndex((i) => i + 1);
+        setRestTargetSec(restSeconds);
+        setRestEndAt(Date.now() + restSeconds * 1000);
+        setRestPausedRemainingSec(null);
+        setResting(true);
+        setRestKey((k) => k + 1);
+        setRestReasonLabel(upcoming ? `Next: ${upcoming.name}` : null);
         void writeWorkoutLogRef.current?.(next, "partial");
       }
 
       queueMicrotask(() => {
         loggingRef.current = false;
       });
-      return true;
+      return { ok: true };
     },
     [
-      restOverrideSec,
+      restRules,
       restFinishedAt,
       currentExerciseIndex,
       exercises,
@@ -848,6 +990,20 @@ export const ActiveSessionProvider = ({
     setEndedStatus(null);
   }, [currentExerciseIndex, loggedSets]);
 
+  const amendSet = useCallback(
+    (exerciseIndex: number, setIndex: number, weight: number | null, reps: number): boolean => {
+      const existing = loggedSets[exerciseIndex]?.[setIndex];
+      if (!existing || !Number.isFinite(reps) || reps <= 0) return false;
+      const next = loggedSets.map((sets) => sets.slice());
+      next[exerciseIndex][setIndex] = { ...existing, weight, reps: Math.round(reps) };
+      setLoggedSets(next);
+      workoutLogWrittenRef.current = false;
+      void writeWorkoutLogRef.current?.(next, ended && endedStatus ? endedStatus : "partial", ended);
+      return true;
+    },
+    [loggedSets, ended, endedStatus],
+  );
+
   const rememberStatedWeight = useCallback((exerciseIndex: number, weight: number) => {
     setStatedWeight({ exerciseIndex, weight });
   }, []);
@@ -866,7 +1022,7 @@ export const ActiveSessionProvider = ({
       setEnded(true);
       setEndedStatus(status);
       clearLiveSessionState();
-      void writeWorkoutLog(loggedSets, status);
+      void writeWorkoutLog(loggedSets, status, true);
     } else {
       setCurrentExerciseIndex((i) => i + 1);
     }
@@ -958,7 +1114,7 @@ export const ActiveSessionProvider = ({
   const extendRest = useCallback(
     (seconds?: number, source: "manual" | "coach" = "manual") => {
       if (!resting) return; // nothing actively resting — matches adjust_rest_timer's own "ask before calling" contract
-      const amount = seconds && seconds > 0 ? Math.min(120, seconds) : EXTEND_REST_SEC;
+      const amount = seconds && seconds > 0 ? Math.min(EXTEND_REST_MAX_SEC, seconds) : EXTEND_REST_SEC;
       setRestTargetSec((sec) => sec + amount);
       setRestEndAt((endAt) => (endAt === null ? endAt : endAt + amount * 1000));
       setRestPausedRemainingSec((remaining) =>
@@ -969,17 +1125,53 @@ export const ActiveSessionProvider = ({
     [resting],
   );
 
+  const setHoldTarget = useCallback(
+    (seconds: number) => {
+      if (!Number.isFinite(seconds) || seconds <= 0) return;
+      const label = seconds % 60 === 0 && seconds >= 120 ? `${seconds / 60} minutes` : `${seconds} seconds`;
+      setExercises((prev) =>
+        prev.map((exercise, index) => (index === currentExerciseIndex ? { ...exercise, repScheme: label } : exercise)),
+      );
+    },
+    [currentExerciseIndex],
+  );
+
   const setRestLength = useCallback(
     (seconds: number, scope: RestLengthScope, source: "manual" | "coach" = "manual") => {
-      if (scope !== "current") setRestOverrideSec(seconds);
-      if (scope === "upcoming" || !resting) return;
+      const exercise = exercises[currentExerciseIndex] ?? null;
+      if (scope === "workout") {
+        setRestOverrideSec(seconds);
+        setRestByExercise({});
+      } else if ((scope === "exercise" || scope === "always") && exercise) {
+        setRestByExercise((prev) => ({ ...prev, [restKeyOf(exercise.name)]: seconds }));
+      }
+      if (scope === "always" && exercise) {
+        const userId = userIdRef.current;
+        if (userId && exercise.exerciseId) {
+          setSavedRestByExercise((prev) => ({ ...prev, [exercise.exerciseId]: seconds }));
+          void supabase
+            .from("exercise_rest_preference")
+            .upsert(
+              { user_id: userId, exercise_id: exercise.exerciseId, rest_sec: seconds, updated_at: new Date().toISOString() },
+              { onConflict: "user_id,exercise_id" },
+            )
+            .then(({ error: saveError }) => {
+              if (!saveError) return;
+              console.error("[active session] failed to save rest preference:", saveError.message);
+              announceRef.current?.(REST_SAVE_FAILED_MESSAGE, { persist: false });
+            });
+        } else {
+          announceRef.current?.(REST_SAVE_FAILED_MESSAGE, { persist: false });
+        }
+      }
+      if (!resting) return;
       const delta = seconds - restTargetSec;
       setRestTargetSec(seconds);
       setRestEndAt((endAt) => (endAt === null ? endAt : endAt + delta * 1000));
       setRestPausedRemainingSec((remaining) => (remaining === null ? remaining : Math.max(0, remaining + delta)));
-      setRestReasonLabel(source === "coach" ? "Coach set your rest" : null);
+      setRestReasonLabel(source === "coach" ? "Coach set your rest" : "Your rest length");
     },
-    [resting, restTargetSec],
+    [resting, restTargetSec, exercises, currentExerciseIndex],
   );
 
   // Split into explicit pause/resume (not just a toggle) so a voice command like "pause the
@@ -1014,6 +1206,9 @@ export const ActiveSessionProvider = ({
       const status: SessionStatus =
         requestedStatus === "completed" && totalLoggedSets < totalTargetSets ? "partial" : requestedStatus;
       lastSetSnapshotRef.current = null;
+      setResting(false);
+      setRestEndAt(null);
+      setRestPausedRemainingSec(null);
       setEnded(true);
       setEndedStatus(status);
       // Deleted here, not deferred to clear() — confirmed live: clear() only runs once the
@@ -1029,7 +1224,7 @@ export const ActiveSessionProvider = ({
           supabase.from("live_session_state").delete().eq("user_id", endingUserId),
           "live-state clear (end session)",
         );
-      await writeWorkoutLog(loggedSets, status);
+      await writeWorkoutLog(loggedSets, status, true);
       const logId = logIdRef.current;
       if (logId && reason?.trim()) {
         dispatchQuery(
@@ -1091,10 +1286,14 @@ export const ActiveSessionProvider = ({
       elapsedSec,
       statedWeight,
       restOverrideSec,
+      restByExercise,
+      savedRestByExercise,
     });
     return snapshot ? describeLiveSessionSnapshot(snapshot, units) : undefined;
   }, [
     restOverrideSec,
+    restByExercise,
+    savedRestByExercise,
     target,
     focus,
     exercises,
@@ -1134,6 +1333,8 @@ export const ActiveSessionProvider = ({
             elapsedSec,
             statedWeight,
             restOverrideSec,
+            restByExercise,
+            savedRestByExercise,
             restFinishedAt,
             workoutLogId,
             parsing,
@@ -1172,6 +1373,8 @@ export const ActiveSessionProvider = ({
     ended,
     statedWeight,
     restOverrideSec,
+    restByExercise,
+    savedRestByExercise,
     workoutLogId,
     parsing,
     restFinishedAt,
@@ -1209,6 +1412,8 @@ export const ActiveSessionProvider = ({
           elapsedSec,
           statedWeight,
           restOverrideSec,
+          restByExercise,
+          savedRestByExercise,
         });
         liveSessionState = snapshot ? describeLiveSessionSnapshot(snapshot, units) : undefined;
       } catch (err) {
@@ -1245,6 +1450,8 @@ export const ActiveSessionProvider = ({
     },
     [
       restOverrideSec,
+      restByExercise,
+      savedRestByExercise,
       currentExerciseIndex,
       exercises,
       target,
@@ -1271,6 +1478,7 @@ export const ActiveSessionProvider = ({
     },
     [appendMessage],
   );
+  announceRef.current = announce;
 
   const noteSetLogged = useCallback(
     (summary: string, followUp?: string | null) => {
@@ -1318,6 +1526,8 @@ export const ActiveSessionProvider = ({
       minimize,
       restore,
       logSet,
+      amendSet,
+      restFinishedAt,
       isRestatementNow,
       setParsing,
       claimGreeting,
@@ -1343,7 +1553,10 @@ export const ActiveSessionProvider = ({
       toggleRestPause,
       extendRest,
       restOverrideSec,
+      restByExercise,
+      restRules,
       setRestLength,
+      setHoldTarget,
       pauseRest,
       resumeRest,
     }),
@@ -1382,6 +1595,8 @@ export const ActiveSessionProvider = ({
       minimize,
       restore,
       logSet,
+      amendSet,
+      restFinishedAt,
       isRestatementNow,
       setParsing,
       claimGreeting,
@@ -1406,7 +1621,10 @@ export const ActiveSessionProvider = ({
       toggleRestPause,
       extendRest,
       restOverrideSec,
+      restByExercise,
+      restRules,
       setRestLength,
+      setHoldTarget,
       pauseRest,
       resumeRest,
     ],

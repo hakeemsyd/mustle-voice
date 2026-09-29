@@ -3,6 +3,7 @@ import { supabase } from '../lib/supabase';
 import { callBrain, COACH_UNREACHABLE_MESSAGE, type ChatCard } from '../lib/brain';
 import { resolveAttachmentUrls, uploadChatFile, uploadChatImage } from '../lib/chatAttachments';
 import { stripNonSpeechArtifacts } from '../lib/elevenLabsVoice';
+import { enterConversation } from '../lib/conversations';
 
 export interface ChatMessage {
   id: string;
@@ -16,10 +17,6 @@ export interface ChatMessage {
    *  upload was still running, had finished, or had failed outright: confirmed live, an image
    *  that never reached the coach was indistinguishable from one that had. */
   attachmentStatus?: 'uploading' | 'sent' | 'failed';
-  /** ISO timestamp — real for a loaded/persisted row, synthesized (Date.now()) for a local
-   *  optimistic entry. Sorts correctly either way (ISO strings compare lexicographically in
-   *  chronological order); only needed so loadMessageContext can merge an older window into the
-   *  transcript in the right place instead of just appending it at the end. */
   at: string;
 }
 
@@ -32,17 +29,17 @@ export interface ChatMessage {
  *  network round trip, and blocking on it held the entire transcript — every line of text
  *  included — behind a call that only the images needed. The text lands immediately and each
  *  thumbnail fills in when its URL arrives. */
-async function patchResolvedAttachments(
+const patchResolvedAttachments = async (
   rows: ChatMessage[],
   apply: (patch: Map<string, string>) => void,
-) {
+) => {
   const refs = rows.map((r) => r.imageUrl).filter((u): u is string => !!u);
   if (refs.length === 0) return;
   const resolved = await resolveAttachmentUrls(refs);
   // Nothing actually needed re-signing (all local previews), so skip the re-render entirely.
   if (![...resolved].some(([ref, url]) => ref !== url)) return;
   apply(resolved);
-}
+};
 
 /** Rewrites imageUrl in place for whichever rows were re-signed, leaving the rest untouched. */
 const applyAttachmentPatch = (rows: ChatMessage[], patch: Map<string, string>): ChatMessage[] =>
@@ -52,38 +49,47 @@ const applyAttachmentPatch = (rows: ChatMessage[], patch: Map<string, string>): 
     return next && next !== r.imageUrl ? { ...r, imageUrl: next } : r;
   });
 
-export function useHomeChat(userId: string | null) {
+const toChatMessage = (row: any): ChatMessage => ({
+  id: row.id,
+  role: (row.role === 'assistant' ? 'assistant' : 'user') as ChatMessage['role'],
+  text: row.content,
+  card: row.card,
+  imageUrl: row.attachment_url ?? undefined,
+  at: row.at,
+});
+
+export const useHomeChat = (userId: string | null, requestedConversationId: string | null = null) => {
   const [transcript, setTranscript] = useState<ChatMessage[]>([]);
   const [coachTyping, setCoachTyping] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [conversationId, setConversationId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!userId) return;
     let cancelled = false;
+    setLoaded(false);
 
     (async () => {
-      // Descending + limit, then re-ascend for display — was ascending+limit(50), which fetched
-      // the OLDEST 50 messages ever (a real, unrelated correctness bug found while touching this
-      // file for History's tap-to-jump: a long-running account's Home chat only ever showed its
-      // very first exchanges, never anything recent).
-      //
-      // Bounded to today's local calendar day so Global Chat starts fresh each day instead of
-      // reopening onto yesterday's tail — older conversations are still there in History, this
-      // only changes what's shown by default on open. The server applies the same day boundary
-      // (see brain/index.ts) so the model's own reply doesn't awkwardly continue a stale thread.
-      const startOfDay = new Date();
-      startOfDay.setHours(0, 0, 0, 0);
+      const id = await enterConversation(requestedConversationId);
+      if (cancelled) return;
+      setConversationId(id);
+      if (!id) {
+        setTranscript([]);
+        setLoaded(true);
+        return;
+      }
+
       const { data, error } = await supabase
         .from('message')
         .select('id,role,content,card,attachment_url,at')
         .eq('user_id', userId)
+        .eq('conversation_id', id)
         .eq('hidden', false)
-        .gte('at', startOfDay.toISOString())
         .order('at', { ascending: false })
-        .limit(200);
+        .limit(300);
       if (cancelled) return;
       if (error) {
-        console.error('[useHomeChat] failed to load history:', error.message);
+        console.error('[useHomeChat] failed to load conversation:', error.message);
       } else {
         const rows = (data ?? [])
           .slice()
@@ -92,14 +98,7 @@ export function useHomeChat(userId: string | null) {
           // onMessage), but rows already persisted from before that fix still need hiding —
           // an image-only row is the one legitimate case of empty text.
           .filter((row) => row.attachment_url || /[\p{L}\p{N}]/u.test(row.content ?? ''))
-          .map((row) => ({
-            id: row.id,
-            role: (row.role === 'assistant' ? 'assistant' : 'user') as ChatMessage['role'],
-            text: row.content,
-            card: row.card,
-            imageUrl: row.attachment_url ?? undefined,
-            at: row.at,
-          }));
+          .map(toChatMessage);
         setTranscript(rows);
         void patchResolvedAttachments(rows, (patch) => {
           if (cancelled) return;
@@ -112,7 +111,17 @@ export function useHomeChat(userId: string | null) {
     return () => {
       cancelled = true;
     };
-  }, [userId]);
+  }, [userId, requestedConversationId]);
+
+  const keepConversationOpen = useCallback(async () => {
+    if (requestedConversationId) await enterConversation(requestedConversationId);
+  }, [requestedConversationId]);
+
+  const settleConversation = useCallback(async () => {
+    if (requestedConversationId || conversationId) return;
+    const id = await enterConversation(null);
+    if (id) setConversationId(id);
+  }, [requestedConversationId, conversationId]);
 
   // Voice turns come from the ElevenLabs SDK's own transcript (see useVoiceSession),
   // not from the brain — nothing to persist here, just reflect them in the same feed
@@ -147,6 +156,7 @@ export function useHomeChat(userId: string | null) {
       setCoachTyping(true);
 
       try {
+        await keepConversationOpen();
         const result = await callBrain({ userId, message: trimmed });
         if (latestRequestRef.current !== requestId) return;
         setTranscript((prev) => [
@@ -163,68 +173,10 @@ export function useHomeChat(userId: string | null) {
       } finally {
         inFlightTextsRef.current.delete(inFlightKey);
         if (latestRequestRef.current === requestId) setCoachTyping(false);
+        void settleConversation();
       }
     },
-    [userId],
-  );
-
-  // Loads a window of messages around a specific one (a History-entry tap, e.g.) and merges it
-  // into the current transcript, deduped by id — used when that message isn't already in the
-  // currently-loaded window (only the most recent 50 are loaded up front). Returns true once the
-  // target message is confirmed present so the caller can scroll to it.
-  const loadMessageContext = useCallback(
-    async (messageId: string): Promise<boolean> => {
-      if (!userId) return false;
-
-      const { data: target } = await supabase
-        .from('message')
-        .select('at')
-        .eq('id', messageId)
-        .eq('user_id', userId)
-        .maybeSingle();
-      if (!target) return false;
-
-      const { data, error } = await supabase
-        .from('message')
-        .select('id,role,content,card,attachment_url,at')
-        .eq('user_id', userId)
-        .eq('hidden', false)
-        .lte('at', target.at)
-        .order('at', { ascending: false })
-        .limit(200);
-      if (error || !data) {
-        console.error('[useHomeChat] failed to load message context:', error?.message);
-        return false;
-      }
-
-      const incoming: ChatMessage[] = data.map((row) => ({
-        id: row.id,
-        role: (row.role === 'assistant' ? 'assistant' : 'user') as ChatMessage['role'],
-        text: row.content,
-        card: row.card,
-        imageUrl: row.attachment_url ?? undefined,
-        at: row.at,
-      }));
-      // Same as the initial load: merge the text now, sign the attachments after. An older window
-      // is exactly where expired refs live, so this is the path that most needs not to stall.
-      void patchResolvedAttachments(incoming, (patch) =>
-        setTranscript((prev) => applyAttachmentPatch(prev, patch)),
-      );
-
-      setTranscript((prev) => {
-        const seen = new Set(prev.map((m) => m.id));
-        const merged = [...prev];
-        for (const row of incoming) {
-          if (seen.has(row.id)) continue;
-          seen.add(row.id);
-          merged.push(row);
-        }
-        merged.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
-        return merged;
-      });
-      return true;
-    },
-    [userId],
+    [userId, keepConversationOpen, settleConversation],
   );
 
   const attachImage = useCallback(
@@ -255,6 +207,7 @@ export function useHomeChat(userId: string | null) {
       try {
         const { path, signedUrl } = await uploadChatImage(userId, uri);
         if (latestRequestRef.current !== requestId) return;
+        await keepConversationOpen();
         const result = await callBrain({
           userId,
           message: '',
@@ -280,9 +233,10 @@ export function useHomeChat(userId: string | null) {
         ]);
       } finally {
         if (latestRequestRef.current === requestId) setCoachTyping(false);
+        void settleConversation();
       }
     },
-    [userId],
+    [userId, keepConversationOpen, settleConversation],
   );
 
   const attachFile = useCallback(
@@ -297,6 +251,7 @@ export function useHomeChat(userId: string | null) {
 
       try {
         await uploadChatFile(userId, uri, name);
+        await keepConversationOpen();
         const result = await callBrain({ userId, message: `Attached a file: ${name}`, modality: 'file' });
         if (latestRequestRef.current !== requestId) return;
         setTranscript((prev) => [
@@ -312,10 +267,21 @@ export function useHomeChat(userId: string | null) {
         ]);
       } finally {
         if (latestRequestRef.current === requestId) setCoachTyping(false);
+        void settleConversation();
       }
     },
-    [userId],
+    [userId, keepConversationOpen, settleConversation],
   );
 
-  return { transcript, coachTyping, loaded, sendMessage, appendLocal, loadMessageContext, attachImage, attachFile };
-}
+  return {
+    transcript,
+    coachTyping,
+    loaded,
+    conversationId,
+    sendMessage,
+    appendLocal,
+    keepConversationOpen,
+    attachImage,
+    attachFile,
+  };
+};

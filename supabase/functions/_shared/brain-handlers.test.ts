@@ -25,3 +25,13 @@ test('empty or missing descriptions never match', () => {
   assert.equal(looksLikeSameMeal('', 'chicken and rice'), false);
   assert.equal(looksLikeSameMeal('chicken and rice', ''), false);
 });
+
+test('the coach can only remove a set when the user asked for it (Hakeem, 29 Sep: "176 for five reps" deleted set 1)', async () => {
+  const { asksToRemoveASet } = await import('./brain-handlers.ts');
+  for (const said of ['176 for five reps.', '17645.', 'Done, 176 for 5.', 'No.', 'Yes', 'Make it 90 seconds', '[[SYSTEM_CUE]] rest_over']) {
+    assert.equal(asksToRemoveASet(said), false, said);
+  }
+  for (const said of ['undo that', 'remove the last set', 'You logged it twice', "I haven't done set 2 yet", 'take that one off', 'I only did 1 set']) {
+    assert.equal(asksToRemoveASet(said), true, said);
+  }
+});

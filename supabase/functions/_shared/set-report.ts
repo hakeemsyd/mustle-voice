@@ -1,15 +1,20 @@
+import { kgToLb } from './weight-units.ts';
+import type { RestLengthScope } from './rest-length.ts';
+
 export type SetReportUnits = 'metric' | 'imperial';
 
 export interface ParsedSet {
   weight: number | null;
   reps: number;
   unit?: 'seconds';
+  inferredWeight?: boolean;
 }
 
 export interface ParseSetOptions {
   allowPositional?: boolean;
   timedExercise?: boolean;
   bareWeight?: boolean;
+  version?: number;
 }
 
 export type SpokenSetIntent =
@@ -26,9 +31,13 @@ export interface SpokenSetContext {
   legacy?: boolean;
   confirmsBareReps?: boolean;
   resting?: boolean;
+  version?: number;
+  confirmed?: boolean;
 }
 
-export const SET_PARSER_VERSION = 5;
+export const SET_PARSER_VERSION = 7;
+
+export const STRICT_REPORTS_FROM_VERSION = 6;
 
 export const CONFIRMS_BARE_REPS_FROM_VERSION = 5;
 
@@ -37,6 +46,11 @@ export const SHARED_PARSER_FROM_VERSION = 2;
 export const HOLDS_MISSING_WEIGHT_FROM_VERSION = 3;
 
 export const RESTATEMENT_RULE_FROM_VERSION = 4;
+
+export const DURATION_INSTRUCTIONS_FROM_VERSION = 7;
+
+const DURATION_INSTRUCTION =
+  /^(?:(?:ok(?:ay)?|actually|hey|coach|um+|uh+|so|and|alright|yeah|yes|no|can\s+you|could\s+you|please|let'?s)[\s,]+)*(?:always\s+|from\s+now\s+on\s+)?(?:(?:make|set|change|put|bump|drop|keep)\s+(?:it|that|this|this\s+one|the\s+timer|timer|my\s+rests?|the\s+rests?|rests?)|add|adding|extend|give\s+me|use|go\s+with)\b/i;
 
 export const RESTATEMENT_WINDOW_MS = 20_000;
 
@@ -48,7 +62,7 @@ export const isRestatement = (
   typeof lastSetLoggedAt === 'number' &&
   now - lastSetLoggedAt >= 0 &&
   now - lastSetLoggedAt < RESTATEMENT_WINDOW_MS &&
-  !(typeof restFinishedAt === 'number' && restFinishedAt >= lastSetLoggedAt);
+  !(typeof restFinishedAt === 'number' && restFinishedAt > lastSetLoggedAt);
 
 export const straightenQuotes = (text: string): string =>
   (text ?? '').replace(/[\u2018\u2019\u201A\u201B\u2032\u02BC\u0060\u00B4]/g, "'");
@@ -162,6 +176,16 @@ const WEIGHT_WITH_UNIT = /(\d+(?:\.\d+)?)\s*(kilogrammes?|kilograms?|kgs?|kilos?
 
 const BARE_WEIGHT = /\b(?:at|with)\s+(\d+(?:\.\d+)?)(?=\s*(?:$|[.,!;]|(?:for|x|by|and|on)\b|×))/i;
 
+const BARE_WEIGHT_STRICT =
+  /\b(?:at|(?<!\b(?:done|finished|completed)\s+)with)\s+(\d+(?:\.\d+)?)(?!\d|\.\d)(?!\s*(?:reps?|times|sets?|seconds?|secs?|minutes?|mins?|more|left|to\s+go)\b)(?=\s*(?:$|[.,!;]|(?:for|x|by|and|on|done|finished|completed|complete|each|per|a\s+side|this|that|then|now|today)\b|×))/i;
+
+const MOVED_WEIGHT =
+  /\b(?:(?:went|bumped|moved|jumped|stepped)\s+(?:it\s+)?(?:up\s+)?to|up\s+to|i\s+used|dropped\s+(?:it\s+)?(?:down\s+)?to)\s+(\d+(?:\.\d+)?)\s*(kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?)?(?!\d|\.\d)(?!\s*(?:reps?|times|sets?|seconds?|secs?|minutes?|mins?|more)\b)/i;
+
+const DUMBBELL_PLURAL_PAIR = /\b(\d+(?:\.\d+)?)s(?=\s*(?:[x×]|for)\s*\d)/gi;
+
+const NOT_A_WEIGHT_NUMBER =
+  /\b(?:this|that|the|last|next|each|every|another|no|any)\s+1\b|\b(?:rpe|rir)\s*\d+(?:\.\d+)?|\b\d+(?:\.\d+)?\s*(?:sets?|more|left|to\s+go|minutes?|mins?|seconds?|secs?|%|percent|days?|weeks?|hours?|times|am|pm|out\s+of\s+\d+)\b/gi;
 const WEIGHT_BY_REPS = /^(\d+(?:\.\d+)?)\s*[x×]\s*(\d+)\s*(?:reps?)?\.?$/i;
 
 const SET_COUNT = /\b\d+\s*sets?\b/gi;
@@ -171,12 +195,44 @@ const toKg = (value: number, statedUnit: string | null, units: SetReportUnits): 
   return isPounds ? Math.round(value * 0.453592 * 10) / 10 : value;
 };
 
+const isStrict = (version: number | undefined): boolean =>
+  (version ?? SET_PARSER_VERSION) >= STRICT_REPORTS_FROM_VERSION;
+
+const UNIT_GROUP = '(kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?)';
+const NOT_AFTER_NUMBER = '(?![\\d.:/])(?!\\s*(?:sets?|seconds?|secs?|minutes?|mins?|more|rounds?|%|percent)\\b)';
+const NOT_A_SET_REFERENCE = '(?<!\\bsets?\\s*#?\\s*)(?<![\\d.:/])';
+
+const SLASH_PAIR = new RegExp(`${NOT_A_SET_REFERENCE}(\\d+(?:\\.\\d+)?)\\s*${UNIT_GROUP}?\\s*\\/\\s*(\\d+)${NOT_AFTER_NUMBER}`, 'i');
+const AT_PAIR = new RegExp(`${NOT_A_SET_REFERENCE}(\\d+)\\s*(?:reps?\\s*)?@\\s*(\\d+(?:\\.\\d+)?)\\s*${UNIT_GROUP}?`, 'i');
+const FOR_PAIR = new RegExp(`${NOT_A_SET_REFERENCE}(\\d+(?:\\.\\d+)?)\\s*${UNIT_GROUP}?\\s+for\\s+(\\d+)${NOT_AFTER_NUMBER}`, 'i');
+const X_PAIR = new RegExp(`${NOT_A_SET_REFERENCE}(\\d+(?:\\.\\d+)?)\\s*${UNIT_GROUP}?\\s*[x×]\\s*(\\d+)${NOT_AFTER_NUMBER}`, 'i');
+
+const pairOf = (weight: string, unit: string | undefined, reps: string, units: SetReportUnits): ParsedSet | null => {
+  const r = Number(reps);
+  const w = Number(weight);
+  if (!Number.isInteger(r) || r < 1 || r > 100 || !(w > 0)) return null;
+  return { weight: toKg(w, unit ?? null, units), reps: r };
+};
+
+const findWeightRepsPair = (text: string, units: SetReportUnits): ParsedSet | null => {
+  const slash = text.match(SLASH_PAIR);
+  if (slash) return pairOf(slash[1], slash[2], slash[3], units);
+  const at = text.match(AT_PAIR);
+  if (at) return pairOf(at[2], at[3], at[1], units);
+  const forPair = text.match(FOR_PAIR);
+  if (forPair) return pairOf(forPair[1], forPair[2], forPair[3], units);
+  const x = text.match(X_PAIR);
+  if (x && (x[2] || Number(x[1]) >= 15)) return pairOf(x[1], x[2], x[3], units);
+  return null;
+};
+
 export const parseSetReport = (
   raw: string,
   units: SetReportUnits = 'metric',
   options: ParseSetOptions = {},
 ): ParsedSet | null => {
   const normalized = normalizeSpokenNumbers(straightenQuotes(raw));
+  const strict = isStrict(options.version);
 
   if (options.timedExercise) {
     const durationMatch = normalized.match(
@@ -190,38 +246,66 @@ export const parseSetReport = (
   }
 
   const bareAllowed = options.bareWeight !== false;
-  const weightByReps = bareAllowed ? normalized.trim().match(WEIGHT_BY_REPS) : null;
+  const text = strict ? normalized.replace(DUMBBELL_PLURAL_PAIR, '$1') : normalized;
+  const weightByReps = bareAllowed ? text.trim().match(WEIGHT_BY_REPS) : null;
   if (weightByReps) {
     const reps = Math.round(Number(weightByReps[2]));
     return reps > 0 ? { weight: toKg(Number(weightByReps[1]), null, units), reps } : null;
   }
 
-  const weightMatch = normalized.match(WEIGHT_WITH_UNIT);
-  const bareMatch = !weightMatch && bareAllowed ? normalized.match(BARE_WEIGHT) : null;
-  const weightText = weightMatch?.[0] ?? bareMatch?.[0] ?? null;
-  const repsMatch = (bareMatch ? normalized.replace(bareMatch[0], ' ') : normalized).match(/(\d+)\s*(?:reps?|x)\b/i);
+  if (strict && bareAllowed) {
+    const pair = findWeightRepsPair(text, units);
+    if (pair) return pair;
+  }
+
+  const movedMatch = strict && bareAllowed ? text.match(MOVED_WEIGHT) : null;
+  const weightMatch = movedMatch ? null : text.match(WEIGHT_WITH_UNIT);
+  const bareMatch = !movedMatch && !weightMatch && bareAllowed ? text.match(strict ? BARE_WEIGHT_STRICT : BARE_WEIGHT) : null;
+  const weightText = movedMatch?.[0] ?? weightMatch?.[0] ?? bareMatch?.[0] ?? null;
+  const repsMatch = (bareMatch || movedMatch ? text.replace((bareMatch ?? movedMatch)![0], ' ') : text).match(
+    strict ? /(?<![\d.])(\d+)\s*(?:reps?|x)\b/i : /(\d+)\s*(?:reps?|x)\b/i,
+  );
 
   if (weightText || repsMatch) {
-    const weight = weightMatch
-      ? toKg(Number(weightMatch[1]), weightMatch[2], units)
-      : bareMatch
-        ? toKg(Number(bareMatch[1]), null, units)
-        : null;
+    let weight = movedMatch
+      ? toKg(Number(movedMatch[1]), movedMatch[2] ?? null, units)
+      : weightMatch
+        ? toKg(Number(weightMatch[1]), weightMatch[2], units)
+        : bareMatch
+          ? toKg(Number(bareMatch[1]), null, units)
+          : null;
     let reps = repsMatch ? Math.round(Number(repsMatch[1])) : null;
+    let inferredWeight = false;
+
+    if (strict && weight === null && repsMatch && bareAllowed) {
+      const leftovers = (text.replace(repsMatch[0], ' ').replace(SET_ORDINAL_PATTERN, ' ').replace(NOT_A_WEIGHT_NUMBER, ' ').match(/(?<![\d.])\d+(?:\.\d+)?(?![\d.])/g) ?? [])
+        .map(Number)
+        .filter((n) => n >= 5 && n <= 1000);
+      if (leftovers.length === 1) {
+        weight = toKg(leftovers[0], null, units);
+        inferredWeight = true;
+      }
+    }
 
     if (reps === null && weightText) {
-      const withoutWeight = normalized.replace(weightText, ' ').replace(SET_ORDINAL_PATTERN, ' ');
-      const leftover = (bareAllowed ? withoutWeight.replace(SET_COUNT, ' ') : withoutWeight).match(/\d+/);
-      if (leftover) reps = Math.round(Number(leftover[0]));
+      const withoutWeight = text.replace(weightText, ' ').replace(SET_ORDINAL_PATTERN, ' ');
+      const rest = bareAllowed ? withoutWeight.replace(SET_COUNT, ' ') : withoutWeight;
+      if (strict) {
+        const whole = (rest.match(/\d+(?:\.\d+)?/g) ?? []).find((n) => !n.includes('.'));
+        if (whole) reps = Number(whole);
+      } else {
+        const leftover = rest.match(/\d+/);
+        if (leftover) reps = Math.round(Number(leftover[0]));
+      }
     }
     if (reps === null || reps <= 0) return null;
-    return { weight, reps };
+    return inferredWeight ? { weight, reps, inferredWeight } : { weight, reps };
   }
 
   if (options.allowPositional === false) return null;
 
-  const positional = normalized.trim().match(
-    /^(\d+(?:\.\d+)?)\s*(?:,|for|x|by)?\s*(\d+)\s*(?:reps?|times|each)?\.?$/i,
+  const positional = text.trim().match(
+    /^(\d+(?:\.\d+)?)(?:\s*(?:,|for|x|by)\s*|\s+)(\d+)\s*(?:reps?|times|each)?\.?$/i,
   );
   if (!positional) return null;
 
@@ -233,8 +317,8 @@ export const parseSetReport = (
 const STATED_WEIGHT_PATTERN =
   /^(?:(?:it'?s|its|i'?m\s+using|im\s+using|using|with|at|about|around|roughly|maybe|let'?s\s+do|lets\s+do|do|go\s+with|going\s+with|make\s+it|put\s+on)\s+)?(\d+(?:\.\d+)?)\s*(kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?)\s*\.?$/i;
 
-export const parseStatedWeight = (raw: string, units: SetReportUnits = 'metric'): number | null => {
-  if (parseSetReport(raw, units) !== null) return null;
+export const parseStatedWeight = (raw: string, units: SetReportUnits = 'metric', version?: number): number | null => {
+  if (parseSetReport(raw, units, { version }) !== null) return null;
   const match = normalizeSpokenNumbers(straightenQuotes(raw)).trim().match(STATED_WEIGHT_PATTERN);
   if (!match) return null;
   const weight = toKg(Number(match[1]), match[2] ?? null, units);
@@ -273,11 +357,15 @@ const withoutNegatedCompletion = (text: string): string => text.replace(NEGATED_
 
 const PAST_REPORT = /\b(did|got|hit|managed|knocked\s+out|banged\s+out|pushed\s+out|squeezed\s+out|ended\s+up|only\s+got)\b/i;
 
+const PAST_STATEMENT = /\b(?:that|it|this\s+one|that\s+one)\s+was\b|\bi\s+(?:just\s+)?(?:made|completed|finished)\b/i;
+
 const SET_ORDINAL =
   /\b(?:sets?\s*#?\s*\d+|\d+(?:st|nd|rd|th)\s+set|(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+set)\b/i;
 
 const FUTURE_INTENT =
   /\b(gonna|going\s+to|i'?ll|let'?s|plan(?:ning)?\s+to|about\s+to|start(?:ing)?\s+with|i'?m\s+using|im\s+using|using|i'?m\s+on|aiming|try(?:ing)?\s+for|shoot(?:ing)?\s+for|next\s+set|this\s+set|target|want\s+to|wanna|will\s+do|should\s+i)\b/i;
+
+const STRICT_FUTURE_INTENT = /\bnext\s+(?:time|week|session|workout|round)\b|\bcan\s+i\b|\bshould\s+i\b/i;
 
 const LEGACY_COMPLETION =
   /\b(done|complete|completed|finished|that'?s\s+it|that\s+was\s+it|racked|logged\s+it|in\s+the\s+bank)\b/i;
@@ -293,6 +381,8 @@ const PAST_CONTEXT =
 const NOT_A_REP_COUNT =
   /\b\d+(?:\.\d+)?\s*(?:sets?|more|left|to\s+go|minutes?|mins?|seconds?|secs?|%|percent|kgs?|kilos?|kilograms?|lbs?|pounds?|days?|weeks?|hours?|times|am|pm)\b/gi;
 
+export const mentionsEarlierWorkout = (raw: string): boolean => PAST_CONTEXT.test(straightenQuotes(raw ?? ''));
+
 const isCounting = (raw: string): boolean => {
   const bare = normalizeSpokenNumbers(raw)
     .trim()
@@ -307,35 +397,64 @@ const splitSentences = (text: string): string[] =>
     .map((s) => s.trim())
     .filter(Boolean);
 
-const isReportFramed = (sentence: string): boolean =>
-  COMPLETION.test(sentence) || PAST_REPORT.test(sentence) || SET_ORDINAL.test(sentence);
+const LAST_SET = /\b(?:last|final)\s+(?:set|one)\b/i;
+
+const STRICT_PAST_REPORT =
+  /\b(?:nailed|crushed|smashed|killed|cranked\s+out|pumped\s+out|ground\s+out|finished\s+off|did\s+all)\b/i;
+
+const THATS_A_COUNT = /\bthat'?s\s+(?=\d)/i;
+
+const isReportFramed = (sentence: string, strict: boolean): boolean =>
+  COMPLETION.test(sentence) ||
+  PAST_REPORT.test(sentence) ||
+  SET_ORDINAL.test(sentence) ||
+  (strict &&
+    (LAST_SET.test(sentence) || PAST_STATEMENT.test(sentence) || STRICT_PAST_REPORT.test(sentence) || THATS_A_COUNT.test(sentence)));
+
+const isWeaklyFramed = (sentence: string): boolean =>
+  (PAST_STATEMENT.test(sentence) || THATS_A_COUNT.test(sentence)) &&
+  !STRICT_PAST_REPORT.test(sentence) &&
+  !COMPLETION.test(sentence) &&
+  !PAST_REPORT.test(sentence) &&
+  !SET_ORDINAL.test(sentence) &&
+  !LAST_SET.test(sentence);
 
 const PRONOUN_ONE =
   /\b(?:that|this|the|last|next|each|every|another|which|no|any|some|a\s+good|a\s+hard|an\s+easy)\s+one\b|\bone\s+(?:more|of\s+(?:them|those|these))\b/gi;
 
-const extractReportedSet = (raw: string, units: SetReportUnits): ParsedSet | null => {
-  const candidates = splitSentences(normalizeSpokenNumbers(raw.replace(PRONOUN_ONE, ' '))).filter(
+const extractReportedSet = (
+  raw: string,
+  units: SetReportUnits,
+  strict = false,
+): (ParsedSet & { weak?: boolean }) | null => {
+  const source = strict
+    ? raw.replace(LAST_SET, (m) => m.replace(/\bone\b/i, 'set')).replace(/\b(last|final)\s+set\s*[:,-]?\s*(?=\d)/gi, '$1 set: ')
+    : raw;
+  const candidates = splitSentences(normalizeSpokenNumbers(source.replace(PRONOUN_ONE, ' '))).filter(
     (sentence) =>
       !sentence.endsWith('?') &&
-      isReportFramed(sentence) &&
+      isReportFramed(sentence, strict) &&
       !NEGATED.test(sentence) &&
       !PAST_CONTEXT.test(sentence) &&
-      !(FUTURE_INTENT.test(sentence) && !COMPLETION.test(sentence)),
+      !((FUTURE_INTENT.test(sentence) || (strict && STRICT_FUTURE_INTENT.test(sentence))) && !COMPLETION.test(sentence)),
   );
 
   for (const sentence of candidates.reverse()) {
-    const weightMatch = sentence.match(WEIGHT_WITH_UNIT);
-    const plural = sentence.match(/\bthe\s+(\d+)s\b/i);
-    const bareMatch = !weightMatch && !plural ? sentence.match(BARE_WEIGHT) : null;
-    const weight = weightMatch
-      ? toKg(Number(weightMatch[1]), weightMatch[2], units)
-      : plural
-        ? toKg(Number(plural[1]), null, units)
-        : bareMatch
-          ? toKg(Number(bareMatch[1]), null, units)
-          : null;
+    const moved = strict ? sentence.match(MOVED_WEIGHT) : null;
+    const weightMatch = moved ? null : sentence.match(WEIGHT_WITH_UNIT);
+    const plural = moved || weightMatch ? null : sentence.match(/\bthe\s+(\d+)s\b/i);
+    const bareMatch = !moved && !weightMatch && !plural ? sentence.match(strict ? BARE_WEIGHT_STRICT : BARE_WEIGHT) : null;
+    const weight = moved
+      ? toKg(Number(moved[1]), moved[2] ?? null, units)
+      : weightMatch
+        ? toKg(Number(weightMatch[1]), weightMatch[2], units)
+        : plural
+          ? toKg(Number(plural[1]), null, units)
+          : bareMatch
+            ? toKg(Number(bareMatch[1]), null, units)
+            : null;
 
-    const numbers = (bareMatch ? sentence.replace(bareMatch[0], ' ') : sentence)
+    const numbers = (bareMatch || moved ? sentence.replace((bareMatch ?? moved)![0], ' ') : sentence)
       .replace(WEIGHT_WITH_UNIT, ' ')
       .replace(/\b\d+s\b/gi, ' ')
       .replace(SET_ORDINAL_PATTERN, ' ')
@@ -345,7 +464,7 @@ const extractReportedSet = (raw: string, units: SetReportUnits): ParsedSet | nul
     if (!numbers || numbers.length !== 1) continue;
     const reps = Number(numbers[0]);
     if (!Number.isInteger(reps) || reps < 2 || reps > 100) continue;
-    return { weight, reps };
+    return strict && isWeaklyFramed(sentence) ? { weight, reps, weak: true } : { weight, reps };
   }
   return null;
 };
@@ -362,18 +481,38 @@ export const classifySpokenSet = (
     const reps = answer ? Number(answer[1]) : NaN;
     if (reps >= 1 && reps <= 100) return { kind: 'log', set: { weight: null, reps } };
   }
-  if (!context.typed && isCounting(text)) return { kind: 'ignore' };
+  if (!context.typed && isCounting(text)) {
+    const single = isBareRepCount(text);
+    const bareCountAsks =
+      !context.legacy && isStrict(context.version) && !!context.confirmsBareReps && !context.resting && !context.timedExercise;
+    return single !== null && single >= 2 && bareCountAsks
+      ? { kind: 'unconfirmed', set: { weight: null, reps: single } }
+      : { kind: 'ignore' };
+  }
 
   const legacy = !!context.legacy;
+  const strict = !legacy && isStrict(context.version);
   const completed = legacy ? LEGACY_COMPLETION.test(text) : COMPLETION.test(withoutNegatedCompletion(text));
-  const reported = completed || PAST_REPORT.test(text) || SET_ORDINAL.test(text);
-  const intended = !completed && (legacy ? LEGACY_FUTURE_INTENT : FUTURE_INTENT).test(text);
+  const reported =
+    !!context.confirmed ||
+    completed ||
+    PAST_REPORT.test(text) ||
+    SET_ORDINAL.test(text) ||
+    (strict &&
+      (PAST_STATEMENT.test(text) ||
+        LAST_SET.test(text) ||
+        STRICT_PAST_REPORT.test(text) ||
+        SET_ORDINAL.test(normalizeSpokenNumbers(text))));
+  const intended =
+    !completed && ((legacy ? LEGACY_FUTURE_INTENT : FUTURE_INTENT).test(text) || (strict && STRICT_FUTURE_INTENT.test(text)));
+  if (strict && !completed && PAST_CONTEXT.test(text)) return { kind: 'ignore' };
   const asked = !legacy && text.endsWith('?');
 
   const parsed = parseSetReport(text, units, {
     allowPositional: context.typed ?? false,
     timedExercise: context.timedExercise,
     bareWeight: !legacy,
+    version: context.version,
   });
 
   const holdsDuringRest = !!context.confirmsBareReps && !!context.resting && !context.typed && !context.awaitingDetails;
@@ -381,11 +520,27 @@ export const classifySpokenSet = (
     holdsDuringRest ? { kind: 'unconfirmed', set } : { kind: 'log', set };
 
   if (parsed) {
+    if (
+      parsed.unit === 'seconds' &&
+      !context.confirmed &&
+      !reported &&
+      (context.version ?? SET_PARSER_VERSION) >= DURATION_INSTRUCTIONS_FROM_VERSION &&
+      (DURATION_INSTRUCTION.test(text) || REST_WORD.test(text) || /\b(?:more|extra|another|longer|shorter)\b/i.test(text))
+    ) {
+      return { kind: 'ignore' };
+    }
     if (intended && !context.awaitingDetails) {
-      const weight = parseStatedWeight(text, units);
+      const weight = parseStatedWeight(text, units, context.version);
       return weight != null ? { kind: 'stated_weight', weight } : { kind: 'ignore' };
     }
     if (asked && !context.awaitingDetails) return { kind: 'ignore' };
+    if (strict && parsed.inferredWeight && !context.confirmed) {
+      const { inferredWeight: _inferred, ...set } = parsed;
+      return { kind: 'unconfirmed', set };
+    }
+    if (strict && !context.awaitingDetails && !reported && parsed.unit !== 'seconds') {
+      return { kind: 'unconfirmed', set: parsed };
+    }
     const explicitPair = parsed.weight !== null && parsed.unit !== 'seconds';
     if (reported || context.awaitingDetails || explicitPair || parsed.unit === 'seconds' || context.typed) {
       return logOrHold(parsed);
@@ -395,13 +550,20 @@ export const classifySpokenSet = (
   }
 
   if (!legacy && !context.timedExercise) {
-    const loose = extractReportedSet(text, units);
-    if (loose) return logOrHold(loose);
+    const loose = extractReportedSet(text, units, strict);
+    if (loose) {
+      const { weak, ...set } = loose;
+      return weak && !context.confirmed && !context.awaitingDetails ? { kind: 'unconfirmed', set } : logOrHold(set);
+    }
+    if (strict && completed) {
+      const joined = extractReportedSet(text.replace(/[.!]+\s+(?=\S)/g, ', '), units, strict);
+      if (joined && !joined.weak) return logOrHold({ weight: joined.weight, reps: joined.reps });
+    }
   }
 
   if (completed) return { kind: 'needs_details' };
 
-  const weight = parseStatedWeight(text, units);
+  const weight = parseStatedWeight(text, units, context.version);
   if (weight != null) return { kind: 'stated_weight', weight };
   return { kind: 'ignore' };
 };
@@ -480,4 +642,294 @@ export const isImplausibleWeightJump = (
   if (next <= 0 || reference <= 0) return false;
   const ratio = next / reference;
   return ratio < LOW_RATIO || ratio > HIGH_RATIO;
+};
+
+const LOAD_RANGE = /\d+(?:\.\d+)?\s*(?:-|–|to)\s*\d+(?:\.\d+)?\s*(?:kgs?|kilos?|kilogrammes?|kilograms?|lbs?|pounds?)\b|%|\brpe\b|\brir\b/i;
+
+export const plannedWeightKg = (scheme: string | null | undefined): number | null => {
+  if (!scheme || LOAD_RANGE.test(scheme)) return null;
+  return parseLoadSchemeKg(scheme);
+};
+
+export const resolveReportedWeight = (
+  set: ParsedSet,
+  known: { lastLogged: number | null; stated: number | null; planned: number | null },
+): number | null => {
+  if (set.unit === 'seconds' || set.weight !== null) return set.weight;
+  return known.lastLogged ?? known.stated ?? known.planned ?? null;
+};
+
+export interface CorrectionTarget {
+  weight: number | null;
+  reps: number;
+  unit?: 'seconds';
+}
+
+export type SetCorrection =
+  | { kind: 'correction'; weight?: number | null; reps?: number }
+  | { kind: 'unclear' };
+
+const STRONG_CORRECTION_CUE =
+  /\b(?:meant|should\s+(?:be|have\s+been|'?ve\s+been|read|say)|supposed\s+to\s+be|wrong|incorrect|correct(?:ion|ed)?|fix|typo|instead\s+of|change\s+(?:it|that|this|the\s+(?:last\s+)?(?:set|weight|reps?|one)|set|my\s+last\s+set|last\s+set)\s+to|make\s+(?:it|that|this|the\s+last\s+set|last\s+set)\s+\d+|mis(?:heard|typed|logged|read))\b|\bnot\s+(?:\w+\s+){0,2}\d/i;
+
+const WEAK_CORRECTION_CUE = /\bactually\b/i;
+
+const NOT_ABOUT_A_SET =
+  /\b(?:rest|rests|resting|timer|break)\b|(?<![\d.])\d+(?:\.\d+)?\s*(?:seconds?|secs?|minutes?|mins?|hours?|sets?|more|left|to\s+go)\b|\b\d{1,2}:\d{2}\b|\b(?:next|last)\s+(?:time|week|session|workout)\b/i;
+
+const RESTING_CORRECTION_CUE =
+  /\b(?:wait|oops|sorry|hold\s+on|hang\s+on|whoops)\b|\b(?:that|it)\s+was\s+only\b|\bonly\s+(?:got|did|managed|hit)\b/i;
+
+const hasCorrectionCue = (text: string, resting: boolean): boolean =>
+  STRONG_CORRECTION_CUE.test(text) ||
+  (WEAK_CORRECTION_CUE.test(text) && !COMPLETION.test(withoutNegatedCompletion(text)) && !PAST_REPORT.test(text)) ||
+  (resting && RESTING_CORRECTION_CUE.test(text) && !COMPLETION.test(withoutNegatedCompletion(text)) && !text.endsWith('?'));
+
+const CORRECTION_SUBJECT = /\b(?:set|weight|reps?|lbs?|pounds?|kgs?|kilos?|logged|says|shows|saved|recorded)\b/i;
+
+const SET_REFERENCE = /\bsets?\s*#?\s*\d+\b|\b(?:first|second|third|fourth|fifth|\d+(?:st|nd|rd|th))\s+set\b/i;
+
+const CORRECTION_NUMBER = /(?<![\d.])(\d+(?:\.\d+)?)(?![\d.])\s*(kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?|reps?)?/gi;
+
+const WRONG_MARKER = /\b(?:not|instead\s+of)\b/i;
+
+interface NumberToken {
+  value: number;
+  unit: string | null;
+  index: number;
+}
+
+const displayWeight = (kg: number, units: SetReportUnits): number =>
+  units === 'imperial' ? kgToLb(kg) : Math.round(kg * 10) / 10;
+
+const closeTo = (a: number, b: number): boolean => Math.abs(a - b) <= Math.max(0.6, Math.abs(b) * 0.02);
+
+export const detectSetCorrection = (
+  raw: string,
+  units: SetReportUnits,
+  last: CorrectionTarget | null,
+  version?: number,
+  options: { resting?: boolean } = {},
+): SetCorrection | null => {
+  if (!last || !isStrict(version) || last.unit === 'seconds') return null;
+  const text = normalizeSpokenNumbers(straightenQuotes(raw)).trim();
+  if (!hasCorrectionCue(text, !!options.resting)) return null;
+  if (NOT_ABOUT_A_SET.test(text)) return null;
+  if (SET_REFERENCE.test(text) || NEGATED_COMPLETION.test(text)) {
+    NEGATED_COMPLETION.lastIndex = 0;
+    return null;
+  }
+  NEGATED_COMPLETION.lastIndex = 0;
+  if (FUTURE_INTENT.test(text) && !/\b(?:said|meant|typed|was|logged|says|shows)\b/i.test(text)) return null;
+
+  const tokens: NumberToken[] = [...text.matchAll(CORRECTION_NUMBER)].map((m) => ({
+    value: Number(m[1]),
+    unit: m[2] ? m[2].toLowerCase() : null,
+    index: m.index ?? 0,
+  }));
+  const bodyweight = /\b(?:body\s*weight|no\s+weight|unweighted)\b/i.exec(text);
+
+  const wrongAt = text.search(WRONG_MARKER);
+  let right: NumberToken[] = tokens;
+  let wrong: NumberToken | null = null;
+  let rightBodyweight = !!bodyweight;
+  if (wrongAt >= 0) {
+    const before = tokens.filter((t) => t.index < wrongAt);
+    const after = tokens.filter((t) => t.index > wrongAt);
+    if (before.length > 0 || (bodyweight && bodyweight.index < wrongAt)) {
+      right = before;
+      wrong = after[0] ?? null;
+      rightBodyweight = !!bodyweight && bodyweight.index < wrongAt;
+    } else {
+      wrong = after[0] ?? null;
+      right = after.slice(1);
+      rightBodyweight = !!bodyweight && bodyweight.index > wrongAt;
+    }
+  }
+
+  const lastWeightShown = last.weight != null ? displayWeight(last.weight, units) : null;
+  const isRepsUnit = (unit: string | null) => !!unit && /^reps?$/.test(unit);
+  const isWeightUnit = (unit: string | null) => !!unit && !isRepsUnit(unit);
+
+  const kindOf = (token: NumberToken): 'weight' | 'reps' | null => {
+    if (isRepsUnit(token.unit)) return 'reps';
+    if (isWeightUnit(token.unit)) return 'weight';
+    if (wrong) {
+      if (isRepsUnit(wrong.unit)) return 'reps';
+      if (isWeightUnit(wrong.unit)) return 'weight';
+      if (lastWeightShown != null && closeTo(wrong.value, lastWeightShown)) return 'weight';
+      if (wrong.value === last.reps) return 'reps';
+    }
+    if (!Number.isInteger(token.value)) return 'weight';
+    if (lastWeightShown == null) return 'reps';
+    const toWeight = Math.abs(token.value - lastWeightShown) / lastWeightShown;
+    const toReps = Math.abs(token.value - last.reps) / Math.max(1, last.reps);
+    return toWeight <= toReps ? 'weight' : 'reps';
+  };
+
+  const correction: { weight?: number | null; reps?: number } = {};
+  if (rightBodyweight) correction.weight = null;
+  for (const token of right) {
+    const kind = kindOf(token);
+    if (kind === 'reps' && correction.reps === undefined && Number.isInteger(token.value) && token.value >= 1 && token.value <= 100) {
+      correction.reps = token.value;
+    } else if (kind === 'weight' && correction.weight === undefined && token.value > 0 && token.value <= 1000) {
+      correction.weight = toKg(token.value, isWeightUnit(token.unit) ? token.unit : null, units);
+    }
+  }
+
+  if (correction.weight !== undefined || correction.reps !== undefined) return { kind: 'correction', ...correction };
+  return CORRECTION_SUBJECT.test(text) ? { kind: 'unclear' } : null;
+};
+
+const REST_REQUEST =
+  /^(?:(?:ok(?:ay)?|alright|now|and|so)[\s,]+)?(?:(?:i'?m\s+)?resting(?:\s+now)?|(?:(?:start|begin|starting)\s+(?:the\s+|my\s+|a\s+)?)?(?:rest|rest\s+timer|timer)(?:\s+(?:now|please|time|period|up))?|time\s+(?:to|for)\s+(?:a\s+)?rest|(?:take|taking)\s+(?:a\s+|my\s+)?rest)[\s.!]*$/i;
+
+export const looksLikeRestRequest = (raw: string): boolean => REST_REQUEST.test(straightenQuotes(raw).trim());
+
+const REST_QUERY =
+  /^(?:(?:ok(?:ay)?|so|and|hey)[\s,]+)?(?:how\s+(?:long|much\s+(?:time|rest|longer))(?:\s+(?:is|do\s+i\s+have|have\s+i\s+got|'?s|was))?(?:\s+(?:left|remaining|to\s+go))?(?:\s+(?:on\s+(?:the\s+|my\s+)?)?(?:rest|timer|break))?(?:\s+(?:left|remaining))?|(?:rest\s+|time\s+)?(?:time\s+)?(?:left|remaining)|how\s+long\s+(?:until|till|before)\s+(?:the\s+)?next\s+set)[\s?.!]*$/i;
+
+export const looksLikeRestQuery = (raw: string): boolean => REST_QUERY.test(straightenQuotes(raw).trim());
+
+const UNDO_REQUEST =
+  /^(?:please\s+)?(?:undo|remove|delete|scratch|cancel|take\s+(?:off|out))(?:\s+(?:that|the\s+last|last|my\s+last|this|the\s+previous))?(?:\s+(?:set|one|entry|log))?(?:\s+please)?[\s.!]*$/i;
+
+export const looksLikeUndoRequest = (raw: string): boolean => UNDO_REQUEST.test(straightenQuotes(raw).trim());
+
+export const REST_WORD = /\b(?:rest|rests|resting\s+time|rest\s+time|rest\s+period|timer|break)\b/i;
+const REST_CHANGE_BY = /\b(?:extend|add|more|another|extra|longer|shorter|less|by|skip|pause|resume|stop|end)\b/i;
+const REST_DESIRE =
+  /\b(?:supposed\s+to\s+be|should\s+be|should\s+have\s+been|meant\s+to\s+be|want(?:ed)?(?:\s+it)?|make\s+(?:it|my\s+rests?|the\s+rests?|rests?|all\s+rests?)|set\s+(?:it|my\s+rests?|the\s+rests?|rests?|the\s+timer|timer)\s+(?:to|at|for)|change\s+(?:it|my\s+rests?|the\s+rests?|rests?)\s+to|(?:rest|rests|timer|rest\s+time|rest\s+period)\s+(?:to|at|of|for|=|is|should\s+be)|give\s+me|i\s+(?:want|need|like))\s*$/i;
+
+const REST_DESIRE_ANYWHERE =
+  /\b(?:supposed\s+to\s+be|should\s+be|should\s+have\s+been|meant\s+to\s+be|want|make\s+(?:it|my\s+rests?|the\s+rests?|rests?)|set\s+(?:it|my\s+rests?|the\s+rests?|rests?|the\s+timer|timer)|change\s+(?:it|my\s+rests?|the\s+rests?|rests?)|give\s+me|i\s+need)\b/i;
+
+const DURATION_PATTERN =
+  /(?<![\d.:])(\d{1,2}):(\d{2})(?![\d:])|(?<![\d.])(\d+(?:\.\d+)?)\s*(minutes?|mins?|m\b|seconds?|secs?|s\b)(?:\s*(?:and\s+)?(\d{1,2})\s*(?:seconds?|secs?|s\b))?|\b(a|one)\s+(minute|min)\b(?:\s*(?:and\s+)?(?:a\s+)?(half))?/gi;
+
+interface DurationToken {
+  seconds: number;
+  index: number;
+}
+
+const durationsIn = (text: string): DurationToken[] =>
+  [...text.matchAll(DURATION_PATTERN)].map((m) => {
+    const index = m.index ?? 0;
+    if (m[1] !== undefined) return { seconds: Number(m[1]) * 60 + Number(m[2]), index };
+    if (m[3] !== undefined) {
+      const value = Number(m[3]);
+      const minutes = /^m/i.test(m[4]);
+      return { seconds: Math.round(minutes ? value * 60 + Number(m[5] ?? 0) : value), index };
+    }
+    return { seconds: m[8] ? 90 : 60, index };
+  });
+
+export const REST_REQUEST_MIN_SEC = 15;
+export const REST_REQUEST_MAX_SEC = 600;
+
+export const REST_EXTEND_MAX_SEC = 300;
+
+export const parseRestLengthRequest = (raw: string): number | null => {
+  const text = normalizeSpokenNumbers(straightenQuotes(raw)).trim();
+  const newTotal = /\b(?:longer|shorter)\s+(?:rests?|break|timer)\b,?\s+(?:like|of|to|at|around|about|say)\s/i.test(text);
+  if (!REST_WORD.test(text) || (REST_CHANGE_BY.test(text) && !(newTotal && !/\b(?:by|more|another|extra|add|extend)\b/i.test(text)))) return null;
+  if (/\bonly\b/i.test(text) && !REST_DESIRE_ANYWHERE.test(text)) return null;
+  if (/\?\s*$/.test(text) && !/\b(?:can|could)\s+(?:you\s+(?:make|set|change)|i\s+(?:get|have|do|take))\b/i.test(text)) return null;
+  const durations = durationsIn(text);
+  if (durations.length === 0) return null;
+  const desired = durations.find((d) => REST_DESIRE.test(text.slice(0, d.index)));
+  const chosen = desired ?? (durations.length === 1 ? durations[0] : null);
+  if (!chosen) return null;
+  return chosen.seconds >= REST_REQUEST_MIN_SEC && chosen.seconds <= REST_REQUEST_MAX_SEC ? chosen.seconds : null;
+};
+
+export type RestChangeRequest =
+  | { kind: 'set'; seconds: number; scope: RestLengthScope }
+  | { kind: 'extend'; seconds: number };
+
+const REST_SCOPE_ALWAYS =
+  /\b(?:always|every\s+time|each\s+time|(?:in|for)\s+(?:the\s+)?future|future\s+workouts?|next\s+time|every\s+(?:single\s+)?workout|all\s+(?:my\s+)?(?:future\s+)?workouts|save\s+(?:it|that|this)|remember\s+(?:it|that|this)|by\s+default|as\s+(?:my|the)\s+default)\b/i;
+const REST_SCOPE_WORKOUT =
+  /\b(?:(?:all|every|each)\s+(?:of\s+)?(?:my\s+|the\s+)?(?:rests?|breaks?|exercises?|movements?|lifts?)|(?:for|across|in)\s+(?:the\s+)?(?:rest\s+of\s+)?(?:the|this|my|today'?s)\s+(?:whole\s+|entire\s+)?(?:workout|session)|(?:whole|entire)\s+(?:workout|session)|everything|across\s+the\s+board)\b/i;
+const REST_SCOPE_CURRENT =
+  /\b(?:(?:just|only)\s+(?:for\s+)?(?:this|the\s+current)\s+(?:rest|break|one|time)|(?:this|the\s+current)\s+(?:rest|break|one|time)\s+only|just\s+(?:this\s+once|once|for\s+now)|(?:make|set|change)\s+(?:this|the\s+current)\s+(?:rest|break)|this\s+rest\s+(?:to|at|for|should|is)|only\s+this\s+(?:rest|break|one|time))\b/i;
+const REST_SET_WITHOUT_REST_WORD =
+  /^(?:(?:ok(?:ay)?|actually|hey|coach|um+|uh+|so|and|alright|yeah|yes|no)[\s,]+)*(?:(?:can|could)\s+you\s+|please\s+|let'?s\s+)?(?:always\s+|from\s+now\s+on\s+)?(?:(?:make|set|change|put|bump|drop)\s+(?:it|that|this|this\s+one|the\s+timer|timer)|use|go\s+with|keep\s+(?:it|that)(?:\s+at)?)\s+(?:to\s+|at\s+|for\s+|up\s+to\s+|down\s+to\s+)?(?:like\s+|about\s+|around\s+)?$/i;
+const REST_EXTEND_MARKER = /\b(?:add|adding|extend|another|extra)\b|\bmore\s+(?:rest|time)\b|\b(?:seconds?|secs?|minutes?|mins?)\s+more\b/i;
+const REST_NOT_EXTEND =
+  /\b(?:don'?t|do\s+not|no\s+need|never|shorter|less|reduce|cut|take\s+(?:off|away)|remove|minus)\b|\bi\s+(?:did|held|got|managed|went|hit|lasted|was)\b|\bheld\b|\bholding\b/i;
+
+const normalizeRestDurations = (text: string): string =>
+  text
+    .replace(/(\d+(?:\.\d+)?)\s+(?:more|extra)\s+(seconds?|secs?|minutes?|mins?)\b/gi, '$1 $2 more')
+    .replace(/\b(?:another|an\s+extra|one\s+more|one\s+extra|extra)\s+(minute|min)\b/gi, 'a $1 more');
+
+const isRestQuestion = (text: string): boolean =>
+  /\?\s*$/.test(text) && !/\b(?:can|could)\s+(?:you\s+(?:make|set|change|add|give|extend)|i\s+(?:get|have|do|take))\b/i.test(text);
+
+const restScopeOf = (text: string): RestLengthScope | null => {
+  const always = REST_SCOPE_ALWAYS.test(text);
+  const workout = REST_SCOPE_WORKOUT.test(text);
+  const current = REST_SCOPE_CURRENT.test(text);
+  if ([always, workout, current].filter(Boolean).length > 1) return null;
+  if (always) return 'always';
+  if (workout) return 'workout';
+  if (current) return 'current';
+  return 'exercise';
+};
+
+export const HOLD_TARGET_MIN_SEC = 5;
+export const HOLD_TARGET_MAX_SEC = 600;
+
+export const parseHoldTargetRequest = (raw: string): number | null => {
+  const text = normalizeRestDurations(normalizeSpokenNumbers(straightenQuotes(raw)).trim());
+  if (!text || isRestQuestion(text) || REST_WORD.test(text)) return null;
+  if (!DURATION_INSTRUCTION.test(text) || REST_EXTEND_MARKER.test(text)) return null;
+  const durations = durationsIn(text);
+  if (durations.length !== 1) return null;
+  const seconds = durations[0].seconds;
+  return seconds >= HOLD_TARGET_MIN_SEC && seconds <= HOLD_TARGET_MAX_SEC ? seconds : null;
+};
+
+export const parseRestChangeRequest = (
+  raw: string,
+  context: { resting: boolean; timedExercise?: boolean },
+): RestChangeRequest | null => {
+  const text = normalizeRestDurations(normalizeSpokenNumbers(straightenQuotes(raw)).trim());
+  if (!text || isRestQuestion(text)) return null;
+  const mentionsRest = REST_WORD.test(text);
+
+  if (REST_EXTEND_MARKER.test(text) && !REST_NOT_EXTEND.test(text) && (context.resting || mentionsRest)) {
+    const durations = durationsIn(text);
+    if (durations.length !== 1) return null;
+    const seconds = durations[0].seconds;
+    return seconds >= 5 && seconds <= REST_EXTEND_MAX_SEC ? { kind: 'extend', seconds } : null;
+  }
+
+  const withoutDefault = (value: string) => value.replace(/\bby\s+default\b/gi, ' ');
+  let seconds = parseRestLengthRequest(withoutDefault(raw));
+  if (
+    seconds === null &&
+    !mentionsRest &&
+    !REST_CHANGE_BY.test(withoutDefault(text)) &&
+    (context.resting || REST_SCOPE_ALWAYS.test(text) || context.timedExercise === false)
+  ) {
+    const durations = durationsIn(text);
+    if (durations.length === 1 && REST_SET_WITHOUT_REST_WORD.test(text.slice(0, durations[0].index))) {
+      const value = durations[0].seconds;
+      seconds = value >= REST_REQUEST_MIN_SEC && value <= REST_REQUEST_MAX_SEC ? value : null;
+    }
+  }
+  if (seconds === null) return null;
+  const scope = restScopeOf(text);
+  return scope ? { kind: 'set', seconds, scope } : null;
+};
+
+export const isBareRepCount = (raw: string): number | null => {
+  const text = normalizeSpokenNumbers(straightenQuotes(raw)).trim().replace(/[.!]+$/g, '').trim();
+  const match = text.match(/^(\d{1,3})$/);
+  if (!match) return null;
+  const reps = Number(match[1]);
+  return reps >= 1 && reps <= 100 ? reps : null;
 };

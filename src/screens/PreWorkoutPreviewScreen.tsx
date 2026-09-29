@@ -26,11 +26,12 @@ import {
 import { useSharedVoiceSession } from "../session/VoiceSessionProvider";
 import { getSwapCandidates, type SwapCandidate } from "../session/exerciseSwap";
 import { chooseRestDay } from "../lib/restDay";
+import { resumeElapsedSec } from "../lib/sessionTime";
 import { titleCase } from "../lib/textFormat";
 import { callBrain, COACH_UNREACHABLE_MESSAGE } from "../lib/brain";
 import { supabase } from "../lib/supabase";
 import { dispatchQuery } from "../lib/dispatchQuery";
-import { kgToDisplayWeight, type Units } from "../lib/units";
+import { formatLoggedLoads, type Units } from "../lib/units";
 import { useUnitPrefsState } from "../hooks/useUnitPrefs";
 import { convertLoadScheme } from "../lib/loadScheme";
 import { uploadChatFile, uploadChatImage } from "../lib/chatAttachments";
@@ -71,10 +72,7 @@ type ChipsState =
 const INTRO_DELAY_MS = 400;
 const INTRO_GAP_MS = 900;
 
-const formatLoad = (load: string, units: Units): string => {
-  const kg = Number(load);
-  return Number.isFinite(kg) && kg > 0 ? kgToDisplayWeight(kg, units) : load;
-};
+const formatLoad = (load: string, units: Units): string => formatLoggedLoads(load, units);
 
 export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
   const { planSessionId } = route.params;
@@ -83,7 +81,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
   const session = useActiveSessionContext();
   const {
     orbState, isActive, toggle, connect, release, status: voiceStatus, reconnecting,
-    isMuted, toggleMute, setMuteState, setMessageHandler, setSessionConfig, endWhenAnswered,
+    isMuted, toggleMute, setKeyboardMode, setMessageHandler, setSessionConfig, endWhenAnswered,
   } = useSharedVoiceSession();
   const { alternatives: switchAlternatives } = usePlanAlternatives(planSessionId);
 
@@ -95,20 +93,9 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
   // keyboard glyph swaps in the input pill.
   const { units, ready: unitsReady } = useUnitPrefsState();
   const [inputMode, setInputMode] = useState<"mic" | "keyboard">("mic");
-  const autoMutedRef = useRef(false);
   useEffect(() => {
-    if (inputMode === "keyboard") {
-      if (!isMuted) {
-        autoMutedRef.current = true;
-        setMuteState(true);
-      }
-      return;
-    }
-    if (autoMutedRef.current) {
-      autoMutedRef.current = false;
-      setMuteState(false);
-    }
-  }, [inputMode, isMuted, setMuteState]);
+    setKeyboardMode(inputMode === "keyboard");
+  }, [inputMode, isMuted, voiceStatus, setKeyboardMode]);
 
   const [chips, setChips] = useState<ChipsState>({ kind: "none" });
   const [cardCollapsed, setCardCollapsed] = useState(true);
@@ -149,7 +136,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
   }, []);
 
   const isEmpty = !loading && !error && exercises.length === 0;
-  const canResume = lastTime?.status === "partial" && lastTime.exercises.length > 0;
+  const canResume = !!lastTime?.canContinue;
   const focusLabel = titleCase(focus) === "—" ? "Training" : titleCase(focus);
 
   const appendMessage = React.useCallback((role: "coach" | "user", text: string, imageUrl?: string) => {
@@ -207,7 +194,7 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
       const recap = lastTime.exercises
         .map(
           (done) =>
-            `${done.name} — ${done.sets} sets · ${done.reps} reps${
+            `${done.name} — ${done.sets} ${done.sets === 1 ? "set" : "sets"} · ${done.reps} reps${
               done.load && done.load !== "bodyweight" ? ` · ${formatLoad(done.load, units)}` : ""
             }`,
         )
@@ -278,7 +265,9 @@ export function PreWorkoutPreviewScreen({ route, navigation }: Props) {
             exercisesDone: lastTime.exercises,
             sessionPlan: lastTime.sessionPlan,
             workoutLogId: lastTime.id,
-            elapsedSec: lastTime.durationSec,
+            elapsedSec: resumeElapsedSec(lastTime.durationSec, lastTime.at, Date.now()),
+            restOverrideSec: lastTime.restOverrideSec,
+            restByExercise: lastTime.restByExercise,
           }
         : undefined,
       isThisSession ? { focus, exercises } : undefined,

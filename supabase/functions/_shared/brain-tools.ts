@@ -393,13 +393,13 @@ export const BRAIN_TOOLS = [
   {
     name: 'resolve_interrupted_workout',
     description:
-      'Resolves a workout that was interrupted and never formally finished (see the context note ' +
-      'about it, which gives the workout_log_id). Use this the first time it comes up in a genuinely ' +
-      'new conversation — ask what happened (finished it without the app, ended early, or want to ' +
-      'discard it — "lost connection/battery" or "left the gym" also map to whichever of those it ' +
-      'ends up being) before choosing an outcome. Call once WITHOUT confirm to preview, state plainly ' +
-      'what will happen, wait for explicit agreement, then call again with confirm:true and the exact ' +
-      'confirm_token.',
+      'Settles an unfinished workout the context tells you about (it gives the workout_log_id): one they left ' +
+      'partway and that closed after 24 hours, or one they tell you about themselves. Ask how the rest of it went ' +
+      'first and wait for their answer before choosing an outcome. ended_early applies straight away and needs no ' +
+      'confirmation: it changes nothing except closing the record, so call it once, say in a few words that their ' +
+      'sets are kept, and move on. completed_independent and discard change what is on the record, so call once ' +
+      'WITHOUT confirm to preview, state plainly what will happen, wait for explicit agreement, then call again ' +
+      'with confirm:true and the exact confirm_token from that same reply.',
     input_schema: {
       type: 'object',
       properties: {
@@ -408,10 +408,14 @@ export const BRAIN_TOOLS = [
           type: 'string',
           enum: ['completed_independent', 'ended_early', 'discard'],
           description:
-            'completed_independent: they finished it without the app — pair with additional_exercises_done ' +
-            'for anything not already tracked live. ended_early: they stopped partway and did not finish ' +
-            'the rest — keeps whatever was already tracked live, adds nothing. discard: drop it entirely, ' +
-            'as if it never happened.',
+            'completed_independent: they finished it without the app. Requires additional_exercises_done with ' +
+            'the sets they actually did after what was logged; never assume the planned sets. ended_early: they ' +
+            'stopped partway (out of time, discomfort, an app problem) and did not do the rest; keeps only what ' +
+            'was logged. discard: drop it entirely; it does not count and the same session stays next.',
+        },
+        reason: {
+          type: 'string',
+          description: 'For ended_early: why they stopped, in a few words ("ran out of time", "shoulder pain").',
         },
         additional_exercises_done: {
           type: 'array',
@@ -691,8 +695,17 @@ export const BRAIN_TOOLS = [
   {
     name: 'show_daily_workout',
     description:
-      "Show today's (or the next due) scheduled session as a structured card — session title, estimated duration, and each exercise with its sets/reps/rest — instead of listing it out in text. Use this for \"what's today's workout\", \"what's my next session\", or similar single-day requests (not \"show my whole plan\", which is show_plan_breakdown). Returns no_session if today is a rest day or there's no active plan — tell the user that instead of inventing a workout. Pair the card with one short natural sentence, not a text description of the exercises.",
-    input_schema: { type: 'object', properties: {} },
+      "Show the scheduled session for ONE day as a structured card — session title, estimated duration, and each exercise with its sets/reps/rest — instead of listing it out in text. Use this for \"what's today's workout\", \"what's my next session\", \"what am I doing tomorrow\", \"what's on next Sunday\", \"what's my workout on Oct 15\" and similar single-day requests (not \"show my whole plan\", which is show_plan_breakdown). Pass the day exactly as the user said it in `day`; leave it out for today. The app works out the date and the session from the same schedule Home and Calendar use, so never pick the date or the session yourself. Returns no_session for a rest day (with the next training day), past_day for a day that is over, not_understood if the day is unclear (ask which day they mean), or no_active_plan — say that instead of inventing a workout. The result's `day` names the exact date: use it in your one short sentence, and never describe a different day's session as the one they asked about.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        day: {
+          type: 'string',
+          description:
+            'The day in the user\'s own words: "tomorrow", "Friday", "next Sunday", "Oct 15", "the 15th", "in 3 days". Omit for today.',
+        },
+      },
+    },
   },
   {
     name: 'show_nutrition_summary',
@@ -871,15 +884,15 @@ export const BRAIN_TOOLS = [
   {
     name: 'adjust_rest_timer',
     description:
-      "Adjust the rest timer currently running on the user's active in-app workout session — the same " +
-      'timer the screen shows. Only works while a real rest period is actually counting down (the live ' +
-      "session state block tells you the current remaining/target seconds); if it doesn't show one, ask " +
-      "before calling this. This only requests the change — the app applies it, so don't say a new time " +
-      'or that rest was skipped/paused/resumed as settled fact until the next live session state block ' +
-      'confirms it; say what you just asked for, not that it already happened. To make a rest a ' +
-      'specific length ("make my rest 90 seconds", "give me two minutes between sets"), use action ' +
-      '"set" with the total length in seconds, never "extend". "set" also works between rests, for ' +
-      'the rests still to come, and only then may you say the new length once it returns "set".',
+      "Change the rest timer on the user's active in-app workout, the same timer the screen shows. Match what they " +
+      'asked for exactly. "Add 20 seconds" / "30 more seconds" / "another minute": action "extend" with the seconds ' +
+      'to add, which lengthens only the rest running now. "Make it 90 seconds" / "rest 2 minutes": action "set" with ' +
+      'scope "exercise", which is the current exercise for the rest of this workout, including its later sets. Use ' +
+      'scope "workout" (every exercise) ONLY when they explicitly say all exercises, every rest, the whole workout or ' +
+      'the rest of the workout. Use scope "always" only when they say always, every time, next time or future ' +
+      'workouts: it saves the length for this exercise in future workouts too. Scope "current" is for "just this ' +
+      'rest". After it returns, say the scope back in one short line ("90 seconds for the rest of your bench press"). ' +
+      'If the "What the app did with THIS message" note says the app already changed the rest, do not call this.',
     input_schema: {
       type: 'object',
       properties: {
@@ -890,11 +903,11 @@ export const BRAIN_TOOLS = [
         },
         scope: {
           type: 'string',
-          enum: ['current', 'upcoming', 'both'],
+          enum: ['current', 'exercise', 'workout', 'always'],
           description:
-            'Only for "set". "current": just the rest running now. "upcoming": every rest after this one, for ' +
-            'the rest of the workout ("make my next rest 90 seconds"). "both": the one running now and every ' +
-            'later one ("make my rests 90 seconds").',
+            'Only for "set". "current": just the rest running now. "exercise": the current exercise for the rest of ' +
+            'this workout (the default for "make it N"). "workout": every exercise, only when they said so. ' +
+            '"always": this exercise now and in future workouts.',
         },
       },
       required: ['action'],
@@ -925,4 +938,9 @@ const CARD_ONLY_TOOLS = new Set([
   'show_top_lifts',
   'show_previous_workout',
 ]);
-export const VOICE_TOOLS = BRAIN_TOOLS.filter((tool) => !CARD_ONLY_TOOLS.has(tool.name));
+const VOICE_DAY_WORKOUT_DESCRIPTION =
+  "Look up the scheduled session for ONE day: today, tomorrow, a weekday, or a date (\"what am I doing tomorrow\", \"what's on next Sunday\", \"what's my workout on Oct 15\"). Pass the day exactly as the user said it in `day`; leave it out for today. The app works out the date and the session from the same schedule Home and Calendar use, so never work out the date or the session yourself. Nothing is shown on screen during a voice turn: say the date from the result's `day`, the session name, and the exercises in one or two short spoken sentences. Returns no_session for a rest day (with the next training day), past_day for a day that is over, not_understood if the day is unclear (ask which day they mean), or no_active_plan.";
+
+export const VOICE_TOOLS = BRAIN_TOOLS.filter((tool) => tool.name === 'show_daily_workout' || !CARD_ONLY_TOOLS.has(tool.name)).map(
+  (tool) => (tool.name === 'show_daily_workout' ? { ...tool, description: VOICE_DAY_WORKOUT_DESCRIPTION } : tool),
+);

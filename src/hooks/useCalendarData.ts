@@ -86,7 +86,7 @@ const fetchPlanAndLogs = async (userId: string) => {
       .maybeSingle(),
     supabase
       .from("workout_log")
-      .select("id, at, plan_session_id, status, plan_session!workout_log_plan_session_id_fkey(focus)")
+      .select("id, at, plan_session_id, status, last_activity_at, ended_at, ended_by, plan_session!workout_log_plan_session_id_fkey(focus)")
       .eq("user_id", userId)
       .order("at", { ascending: false })
       .limit(30),
@@ -288,6 +288,7 @@ export interface WeekDay {
   focus: string | null;
   isPinnedRest: boolean;
   status: "completed" | "partial" | "missed" | "upcoming" | "rest";
+  alsoLogged: { focus: string; unfinished: boolean }[];
   /** Real logged meal count for the day — no sleep-hours companion (the reference shows
    *  "N meals · Xh sleep"), since that would need a per-day historical HealthKit query, more
    *  work than this pass covers; a real meal count alone beats a fabricated sleep figure. */
@@ -330,7 +331,7 @@ export const useWeekCalendar = (weekStart: Date): WeekCalendarData => {
         fetchPlanAndLogs(userId),
         supabase
           .from("workout_log")
-          .select("id, at, plan_session_id, status, plan_session!workout_log_plan_session_id_fkey(focus)")
+          .select("id, at, plan_session_id, status, last_activity_at, ended_at, ended_by, plan_session!workout_log_plan_session_id_fkey(focus)")
           .eq("user_id", userId)
           .gte("at", start.toISOString())
           .lt("at", end.toISOString()),
@@ -343,26 +344,41 @@ export const useWeekCalendar = (weekStart: Date): WeekCalendarData => {
       ]);
       if (cancelled) return;
 
+      const weekLogs = (workoutRes.data ?? []) as WorkoutLogRow[];
+      const logsByDate = new Map<string, WorkoutLogRow[]>();
+      for (const row of weekLogs) {
+        const key = localDateKey(new Date(row.at));
+        logsByDate.set(key, [...(logsByDate.get(key) ?? []), row]);
+      }
+      const joinedFocus = (row: WorkoutLogRow): string | null => {
+        const joined = (row as any).plan_session;
+        return (Array.isArray(joined) ? joined[0]?.focus : joined?.focus) ?? null;
+      };
+
       const mealsCountByDate = new Map<string, number>();
       for (const row of foodRes.data ?? []) {
         const key = localDateKey(new Date((row as { at: string }).at));
         mealsCountByDate.set(key, (mealsCountByDate.get(key) ?? 0) + 1);
       }
 
-      const result: WeekDay[] = scheduleFor(
-        data,
-        weekStartKey,
-        localDateKey(addDays(start, 6)),
-        (workoutRes.data ?? []) as WorkoutLogRow[],
-      ).map((day) => ({
-        date: startOfLocalDay(day.dateKey),
-        dateKey: day.dateKey,
-        weekdayLabel: WEEKDAY_LABELS[day.weekday],
-        focus: focusOfDay(day),
-        isPinnedRest: day.kind === "rest",
-        status: day.status === "due" ? "upcoming" : day.status,
-        mealsCount: mealsCountByDate.get(day.dateKey) ?? 0,
-      }));
+      const result: WeekDay[] = scheduleFor(data, weekStartKey, localDateKey(addDays(start, 6)), weekLogs).map((day) => {
+        const focus = focusOfDay(day);
+        const shownLogId = (day.log as any)?.id ?? null;
+        const alsoLogged = (logsByDate.get(day.dateKey) ?? [])
+          .filter((row) => row.id !== shownLogId)
+          .map((row) => ({ focus: joinedFocus(row), unfinished: isUnfinishedWorkout(row.status) }))
+          .filter((other): other is { focus: string; unfinished: boolean } => !!other.focus && other.focus !== focus);
+        return {
+          date: startOfLocalDay(day.dateKey),
+          dateKey: day.dateKey,
+          weekdayLabel: WEEKDAY_LABELS[day.weekday],
+          focus,
+          isPinnedRest: day.kind === "rest",
+          status: day.status === "due" ? "upcoming" : day.status,
+          alsoLogged,
+          mealsCount: mealsCountByDate.get(day.dateKey) ?? 0,
+        };
+      });
 
       setDays(result);
       setLoading(false);

@@ -47,3 +47,13 @@ export const kgToDisplayWeightValue = (kg: number, units: Units): number =>
 
 export const kgToDisplayWeight = (kg: number, units: Units): string =>
   `${kgToDisplayWeightValue(kg, units)} ${units === 'metric' ? 'kg' : 'lb'}`;
+
+export const formatLoggedLoads = (load: string, units: Units): string => {
+  const parts = load.split(",").map((part) => part.trim()).filter(Boolean);
+  if (parts.length === 0) return load;
+  const shown = parts.map((part) => {
+    const kg = Number(part);
+    return Number.isFinite(kg) && kg > 0 ? kgToDisplayWeight(kg, units) : "bodyweight";
+  });
+  return shown.every((label) => label === shown[0]) ? shown[0] : shown.join(", ");
+};

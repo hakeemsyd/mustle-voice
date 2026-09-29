@@ -52,6 +52,14 @@ const SYSTEM_CUE_INSTRUCTIONS: Record<string, string> = {
     'If your previous message already announced this transition, do not announce it again — give ' +
     'one short go-ahead for the new exercise and its real target sets/reps/load instead. There is ' +
     'no rest timer between exercises, so do not say rest has started or tell them to wait.]',
+  exercise_advanced_rest:
+    '[System note: the previous exercise is finished and the app has ALREADY moved on. The exercise ' +
+    'named as "Current exercise" in the live session state block is the NEW one, and its "Sets ' +
+    'COMPLETED" reads 0: never say it is done and never skip past it to the one after. A rest timer ' +
+    'is running on screen before it starts. In one or two short sentences: say the last exercise is ' +
+    'done, name the new exercise with its real sets, reps and load from the block, and give one ' +
+    'short setup cue for it, like where to set the bench, cable or grip. Tell them to go when the ' +
+    'rest ends. Never say how many seconds are left and do not ask them anything.]',
   rest_final_countdown:
     '[System note: rest is nearly over. Say so in a couple of words — "almost up", "nearly there". ' +
     'Do NOT state a number of seconds. You have no clock and no idea how long this reply will take ' +

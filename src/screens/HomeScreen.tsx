@@ -30,11 +30,10 @@ import { subscribeToHomeRefresh } from "../lib/homeRefreshBridge";
 import { titleCase } from "../lib/textFormat";
 import { startOfLocalDay } from "../lib/calendarDate";
 
-function getGreeting(band: TimeBand, name: string | null): string {
-  return name ? `${band}, ${name}.` : `${band}.`;
-}
+const getGreeting = (band: TimeBand, name: string | null): string =>
+  name ? `${band}, ${name}.` : `${band}.`;
 
-export function HomeScreen() {
+export const HomeScreen = () => {
   const [nutritionOpen, setNutritionOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [draftText, setDraftText] = useState("");
@@ -118,8 +117,15 @@ export function HomeScreen() {
     Keyboard.dismiss();
   };
 
-  const handleOpenHistoryEntry = (messageId: string) => {
-    navigation.navigate("GlobalChat", { initialMode: "keyboard", jumpToMessageId: messageId });
+  const resumable = activeSession.target ? null : todaySession?.resumable ?? null;
+  const handleContinue = () => {
+    if (!resumable) return;
+    activeSession.start({ type: "strength", planSessionId: resumable.planSessionId }, resumable.resume);
+    navigation.navigate("ActiveSession");
+  };
+
+  const handleOpenHistoryEntry = (conversationId: string) => {
+    navigation.navigate("GlobalChat", { initialMode: "keyboard", conversationId });
   };
 
   // The orb's own label promises "tap to stop" once a call is live, so it has to actually end it
@@ -199,6 +205,15 @@ export function HomeScreen() {
                   {loading ? "" : getMomentumLine(streakDays)}
                 </Text>
 
+                {!loading && !loadError && resumable && (
+                  <Pressable style={styles.continueBtn} onPress={handleContinue}>
+                    <Text style={styles.continueBtnText}>Continue Session</Text>
+                    <Text style={styles.continueBtnSub}>
+                      {resumable.focus ? titleCase(resumable.focus) : "Workout"} · {resumable.label}
+                    </Text>
+                  </Pressable>
+                )}
+
                 {!loading && (
                   <View style={styles.metaRow}>
                     {loadError ? (
@@ -242,9 +257,11 @@ export function HomeScreen() {
                             ? titleCase(todaySession.completedWorkout.focus)
                             : "Workout"}
                         </Text>
-                        <Text style={styles.slimSessionTime}>Done today</Text>
+                        <Text style={styles.slimSessionTime}>
+                          {todaySession.completedWorkout.endedEarly ? "Ended early" : "Done today"}
+                        </Text>
                       </Pressable>
-                    ) : todaySession.hasSession ? (
+                    ) : todaySession.hasSession && todaySession.planSessionId !== resumable?.planSessionId ? (
                       <Pressable
                         style={styles.slimSession}
                         onPress={() =>
@@ -262,7 +279,7 @@ export function HomeScreen() {
                         </Text>
                         <Text style={styles.slimSessionArrow}>→</Text>
                       </Pressable>
-                    ) : (
+                    ) : todaySession.hasSession || resumable ? null : (
                       <View style={styles.restLine}>
                         <View style={styles.restLineDot} />
                         <Text style={styles.restLineText}>
@@ -388,7 +405,7 @@ export function HomeScreen() {
       />
     </SafeAreaView>
   );
-}
+};
 
 const styles = StyleSheet.create({
   screen: {
@@ -526,6 +543,27 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     gap: 8,
     marginTop: 10,
+  },
+
+  continueBtn: {
+    alignItems: "center",
+    marginTop: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 22,
+    backgroundColor: colors.accent,
+    borderRadius: 100,
+  },
+  continueBtnText: {
+    fontFamily: fonts.bodyBold,
+    fontSize: 13,
+    letterSpacing: 0.25,
+    color: colors.accentOn,
+  },
+  continueBtnSub: {
+    fontFamily: fonts.body,
+    fontSize: 11,
+    marginTop: 1,
+    color: "rgba(0,0,0,0.6)",
   },
 
   slimSession: {

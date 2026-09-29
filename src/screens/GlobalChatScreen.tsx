@@ -8,15 +8,19 @@ import * as DocumentPicker from "expo-document-picker";
 import { ActiveWorkoutBanner } from "../components/ActiveWorkoutBanner";
 import { AttachSheet } from "../components/AttachSheet";
 import { ChatTranscript, type ChatTranscriptHandle } from "../components/ChatTranscript";
+import { RecentChatsMenu } from "../components/RecentChatsMenu";
 import { GLOBAL_CHAT_PROMPT_OPTIONS, QuickPromptChips } from "../components/QuickPromptChips";
 import { SessionVoiceInputDock } from "../components/session-chat/SessionVoiceInputDock";
 import { useHomeChat } from "../hooks/useHomeChat";
+import { useConversations } from "../hooks/useConversations";
 import { useKeyboardOpen } from "../hooks/useKeyboardOpen";
 import { useScreenInsets } from "../hooks/useScreenInsets";
 import { useActiveSessionContext } from "../session/ActiveSessionContext";
 import { useSharedVoiceSession } from "../session/VoiceSessionProvider";
 import { colors, fonts } from "../constants/theme";
 import { BackIcon } from "../icons/BackIcon";
+import { HistoryIcon } from "../icons";
+import { enterConversation, leaveConversation } from "../lib/conversations";
 import type { RootStackParamList } from "../navigation/types";
 
 type Props = NativeStackScreenProps<RootStackParamList, "GlobalChat">;
@@ -25,8 +29,13 @@ export const GlobalChatScreen = ({ route, navigation }: Props) => {
   const insets = useScreenInsets();
   const session = useActiveSessionContext();
   const userId = session.userId;
-  const { transcript, coachTyping, loaded, sendMessage, appendLocal, loadMessageContext, attachImage, attachFile } =
-    useHomeChat(userId);
+  const requestedConversationId = route.params?.conversationId ?? null;
+  const {
+    transcript, coachTyping, loaded, conversationId, sendMessage, appendLocal, keepConversationOpen, attachImage, attachFile,
+  } = useHomeChat(userId, requestedConversationId);
+  const { conversations, refetch: refetchConversations } = useConversations(userId, 11);
+  const recentConversations = conversations.filter((c) => c.id !== conversationId).slice(0, 10);
+  const [recentOpen, setRecentOpen] = useState(false);
   const {
     orbState, isActive, toggle, connect, release, status: voiceStatus, reconnecting,
     isMuted, toggleMute, setMessageHandler, setSessionConfig,
@@ -38,11 +47,23 @@ export const GlobalChatScreen = ({ route, navigation }: Props) => {
   const keyboardOpen = useKeyboardOpen();
 
   const transcriptRef = useRef<ChatTranscriptHandle>(null);
-  const jumpedRef = useRef(false);
 
   useFocusEffect(
     React.useCallback(() => {
-      setMessageHandler(({ role, text }) => appendLocal(role === "user" ? "user" : "assistant", text));
+      if (!requestedConversationId) return;
+      void enterConversation(requestedConversationId);
+      return () => {
+        void leaveConversation();
+      };
+    }, [requestedConversationId]),
+  );
+
+  useFocusEffect(
+    React.useCallback(() => {
+      setMessageHandler(({ role, text }) => {
+        if (role === "user") void keepConversationOpen();
+        appendLocal(role === "user" ? "user" : "assistant", text);
+      });
       setSessionConfig({
         userId,
         dynamicVariables: {
@@ -51,7 +72,7 @@ export const GlobalChatScreen = ({ route, navigation }: Props) => {
           user_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         },
       });
-    }, [userId, session.userName, appendLocal, setMessageHandler, setSessionConfig]),
+    }, [userId, session.userName, appendLocal, keepConversationOpen, setMessageHandler, setSessionConfig]),
   );
 
   // Mic open whenever this screen is focused in mic mode, released when it isn't — replaces a
@@ -63,17 +84,6 @@ export const GlobalChatScreen = ({ route, navigation }: Props) => {
       return release;
     }, [inputMode, connect, release]),
   );
-
-  useEffect(() => {
-    const target = route.params?.jumpToMessageId;
-    if (!target || jumpedRef.current) return;
-    jumpedRef.current = true;
-    (async () => {
-      const found = await loadMessageContext(target);
-      if (!found) return;
-      setTimeout(() => transcriptRef.current?.scrollToMessageId(target), 150);
-    })();
-  }, [route.params?.jumpToMessageId, loadMessageContext]);
 
   // "Update with your coach" (Body/Profile) and similar entry points hand off straight into a
   // real turn instead of just opening an empty composer — feels like tapping a quick-prompt chip
@@ -138,7 +148,20 @@ export const GlobalChatScreen = ({ route, navigation }: Props) => {
           </Pressable>
         </View>
         <Text style={styles.headerTitle}>MUSTLE COACH</Text>
-        <View style={styles.headerSide} />
+        <View style={[styles.headerSide, styles.headerSideEnd]}>
+          {recentConversations.length > 0 && (
+            <Pressable
+              style={styles.iconBtn}
+              onPress={() => {
+                refetchConversations();
+                setRecentOpen(true);
+              }}
+              hitSlop={6}
+            >
+              <HistoryIcon size={16} color={colors.text} />
+            </Pressable>
+          )}
+        </View>
       </View>
 
       <ActiveWorkoutBanner />
@@ -179,6 +202,16 @@ export const GlobalChatScreen = ({ route, navigation }: Props) => {
       </View>
       </KeyboardAvoidingView>
 
+      <RecentChatsMenu
+        open={recentOpen}
+        conversations={recentConversations}
+        onClose={() => setRecentOpen(false)}
+        onPick={(id) => {
+          setRecentOpen(false);
+          navigation.setParams({ conversationId: id });
+        }}
+      />
+
       <AttachSheet
         open={attachOpen}
         onClose={() => setAttachOpen(false)}
@@ -209,6 +242,19 @@ const styles = StyleSheet.create({
   },
   headerSide: {
     width: 74,
+    justifyContent: "center",
+  },
+  headerSideEnd: {
+    alignItems: "flex-end",
+  },
+  iconBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: "center",
     justifyContent: "center",
   },
   headerTitle: {

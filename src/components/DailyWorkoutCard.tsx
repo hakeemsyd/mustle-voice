@@ -48,7 +48,7 @@ export const DailyWorkoutCard = ({ card, onStartSession, variant = "dark" }: Dai
 
       <Pressable style={styles.ctaBtn} onPress={() => onStartSession(card.plan_session_id)}>
         <PlayIcon size={13} color={colors.accentOn} />
-        <Text style={styles.ctaBtnText}>Start Session</Text>
+        <Text style={styles.ctaBtnText}>{card.is_today === false ? "Preview Session" : "Start Session"}</Text>
       </Pressable>
     </View>
   );

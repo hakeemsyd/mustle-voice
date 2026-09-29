@@ -147,14 +147,14 @@ test('repeating the set just logged is a restatement, not a second set', () => {
   assert.equal(said('10 reps', { now: T0 + 5_000, typed: true })?.kind, 'logged');
 });
 
-test('mid-set, a bare "Eight reps." is a finished set and logs; the coach never asks for the reps again', () => {
+test('up to build 29 (parser v5), mid-set, a bare "Eight reps." is a finished set and logs', () => {
   const training = buildLiveSessionSnapshot({
     ...shoulders([]),
     resting: false,
     restEndAt: null,
     statedWeight: { exerciseIndex: 2, weight: 11.3 },
   } as any);
-  assert.equal(classifySpokenSet('Eight reps.', 'imperial', { awaitingDetails: false, confirmsBareReps: true }).kind, 'log');
+  assert.equal(classifySpokenSet('Eight reps.', 'imperial', { awaitingDetails: false, confirmsBareReps: true, version: 5 }).kind, 'log');
   const outcome = resolveTurnSetOutcome({
     userText: 'Eight reps.',
     snapshot: training,
@@ -193,7 +193,8 @@ test('while the rest card is up, no spoken report counts another set until they 
   assert.notEqual(resolveTurnSetOutcome({ ...base, userText: 'Yes.', recentUserMessages: afterStart })?.kind, 'logged');
   const newNumbers = resolveTurnSetOutcome({ ...base, userText: 'Yeah, done, ten reps.', recentUserMessages: earlier });
   assert.notDeepEqual(newNumbers?.set, { weight: 11.3, reps: 8 });
-  assert.equal(classifySpokenSet('8 reps', 'imperial', { awaitingDetails: false, confirmsBareReps: true, resting: true, typed: true }).kind, 'log');
+  assert.equal(classifySpokenSet('8 reps', 'imperial', { awaitingDetails: false, confirmsBareReps: true, resting: true, typed: true, version: 5 }).kind, 'log');
+  assert.equal(classifySpokenSet('Done, 8 reps', 'imperial', { awaitingDetails: false, confirmsBareReps: true, resting: true, typed: true }).kind, 'log');
   assert.equal(classifySpokenSet('Eight.', 'imperial', { awaitingDetails: true, confirmsBareReps: true, resting: true }).kind, 'log');
   const training = buildLiveSessionSnapshot({ ...shoulders([{ ...coachSet, at: T0 - 60_000 }]), resting: false, restEndAt: null } as any);
   assert.equal(resolveTurnSetOutcome({ ...base, snapshot: training, userText: 'Done, eight reps.' })?.kind, 'logged');
@@ -381,6 +382,7 @@ test('an abandoned workout updates its own record instead of adding a second cop
   const result = await finalizeStaleLiveSession(db.client, 'damion', 60 * 60 * 1000);
   assert.deepEqual(result, { finalized: true, workoutLogId: 'a2d8fc86' });
   assert.equal(db.updates[0].table, 'workout_log');
-  assert.equal(db.updates[0].values.status, 'interrupted');
+  assert.equal(db.updates[0].values.status, undefined, 'it stays an open partial the user can continue');
+  assert.ok(db.updates[0].values.last_activity_at);
   assert.equal(db.inserts.filter((i) => i.table === 'workout_log').length, 0);
 });

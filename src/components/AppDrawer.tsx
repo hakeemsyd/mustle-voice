@@ -17,7 +17,8 @@ import {
 import * as Linking from "expo-linking";
 import type { User } from "@supabase/supabase-js";
 import { useProfileName } from "../hooks/useProfileName";
-import { useMessageHistory, type HistoryTag } from "../hooks/useMessageHistory";
+import { useConversations } from "../hooks/useConversations";
+import { CONVERSATION_TAGS, type ConversationSummary, type ConversationTag } from "../lib/conversations";
 import { useScreenInsets } from "../hooks/useScreenInsets";
 import {
   useTodayCalendar,
@@ -66,9 +67,7 @@ interface AppDrawerProps {
   onClose: () => void;
   onOpenCalendar: () => void;
   userId: string | null;
-  /** Jumps back into the chat transcript at a specific message — passed through from Home,
-   *  which owns the transcript this drawer's History entries point into. */
-  onOpenHistoryEntry?: (messageId: string) => void;
+  onOpenHistoryEntry?: (conversationId: string) => void;
   /** Opens a past workout's session summary — passed through from Home, which owns the navigator
    *  this drawer sits over. */
   onOpenSessionReport?: (workoutLogId: string) => void;
@@ -84,7 +83,7 @@ const SECTION_TITLES: Record<Exclude<DrawerView, "index">, string> = {
   profile: "Profile",
 };
 
-const TAG_ICON: Record<HistoryTag, typeof UtensilsIcon> = {
+const TAG_ICON: Record<ConversationTag, typeof UtensilsIcon> = {
   meal: UtensilsIcon,
   workout: DumbbellIcon,
   recovery: HeartPulseIcon,
@@ -92,15 +91,13 @@ const TAG_ICON: Record<HistoryTag, typeof UtensilsIcon> = {
   general: MessageCircleIcon,
 };
 
-const TAG_LABEL: Record<HistoryTag, string> = {
+const TAG_LABEL: Record<ConversationTag, string> = {
   meal: "Meal",
   workout: "Workout",
   recovery: "Recovery",
   profile: "Profile",
   general: "General",
 };
-
-const TAGS: HistoryTag[] = ["meal", "workout", "recovery", "profile", "general"];
 
 const dateGroupLabel = (dateKey: string): string => {
   const today = localDateKey(new Date());
@@ -190,7 +187,7 @@ const HistoryEntryRow = ({
   at,
   onPress,
 }: {
-  tag: HistoryTag;
+  tag: ConversationTag;
   title: string;
   at: string;
   onPress: () => void;
@@ -218,18 +215,20 @@ const HistoryEntryRow = ({
 };
 
 const HistoryDetail = ({
+  loading,
+  conversations: flat,
   onOpenEntry,
 }: {
+  loading: boolean;
+  conversations: ConversationSummary[];
   onOpenEntry: (id: string) => void;
 }) => {
-  const { loading, groups } = useMessageHistory();
   const [search, setSearch] = useState("");
   const [listView, setListView] = useState<"topic" | "recent">("recent");
-  const [activeTag, setActiveTag] = useState<HistoryTag | null>(null);
+  const [activeTag, setActiveTag] = useState<ConversationTag | null>(null);
   const [selectedDateKey, setSelectedDateKey] = useState(localDateKey(new Date()));
 
-  const flat = useMemo(() => groups.flatMap((g) => g.entries), [groups]);
-  const mostRecent = flat[flat.length - 1] ?? null;
+  const mostRecent = flat[0] ?? null;
 
   const searched = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -238,24 +237,24 @@ const HistoryDetail = ({
   }, [flat, search]);
 
   const tagCounts = useMemo(() => {
-    const counts: Record<HistoryTag, number> = { meal: 0, workout: 0, recovery: 0, profile: 0, general: 0 };
-    searched.forEach((e) => counts[e.tag]++);
+    const counts: Record<ConversationTag, number> = { meal: 0, workout: 0, recovery: 0, profile: 0, general: 0 };
+    searched.forEach((e) => e.tags.forEach((t) => counts[t]++));
     return counts;
   }, [searched]);
 
   const topicGroups = useMemo(() => {
-    return TAGS.map((tag) => ({ tag, entries: searched.filter((e) => e.tag === tag) })).filter(
+    return CONVERSATION_TAGS.map((tag) => ({ tag, entries: searched.filter((e) => e.tags.includes(tag)) })).filter(
       (g) => g.entries.length > 0,
     );
   }, [searched]);
 
   const dayEntries = useMemo(
-    () => searched.filter((e) => localDateKey(new Date(e.at)) === selectedDateKey).slice().reverse(),
+    () => searched.filter((e) => localDateKey(new Date(e.at)) === selectedDateKey),
     [searched, selectedDateKey],
   );
 
   const hasAnyHistory = flat.length > 0;
-  const filteredFlat = activeTag ? searched.filter((e) => e.tag === activeTag) : searched;
+  const filteredFlat = activeTag ? searched.filter((e) => e.tags.includes(activeTag)) : searched;
 
   return (
     <View style={styles.flex}>
@@ -288,7 +287,7 @@ const HistoryDetail = ({
             </Text>
             <View style={styles.heroTags}>
               <View style={styles.heroDot} />
-              <Text style={styles.heroTagsText}>{TAG_LABEL[mostRecent.tag]}</Text>
+              <Text style={styles.heroTagsText}>{mostRecent.tags.map((t) => TAG_LABEL[t]).join(" · ")}</Text>
             </View>
           </Pressable>
         )}
@@ -319,7 +318,7 @@ const HistoryDetail = ({
                   All {searched.length > 0 ? `(${searched.length})` : ""}
                 </Text>
               </Pressable>
-              {TAGS.map((tag) => {
+              {CONVERSATION_TAGS.map((tag) => {
                 const Icon = TAG_ICON[tag];
                 const active = activeTag === tag;
                 if (tagCounts[tag] === 0) return null;
@@ -345,12 +344,9 @@ const HistoryDetail = ({
                 <EmptyState title="No matches" subtitle="Try a different search term or tag." />
               ) : (
                 <View style={styles.topicListFlat}>
-                  {filteredFlat
-                    .slice()
-                    .reverse()
-                    .map((e) => (
-                      <HistoryEntryRow key={e.id} tag={e.tag} title={e.title} at={e.at} onPress={() => onOpenEntry(e.id)} />
-                    ))}
+                  {filteredFlat.map((e) => (
+                    <HistoryEntryRow key={e.id} tag={activeTag} title={e.title} at={e.at} onPress={() => onOpenEntry(e.id)} />
+                  ))}
                 </View>
               )
             ) : topicGroups.length === 0 ? (
@@ -365,12 +361,9 @@ const HistoryDetail = ({
                     </Text>
                   </View>
                   <View style={styles.topicList}>
-                    {entries
-                      .slice()
-                      .reverse()
-                      .map((e) => (
-                        <HistoryEntryRow key={e.id} tag={e.tag} title={e.title} at={e.at} onPress={() => onOpenEntry(e.id)} />
-                      ))}
+                    {entries.map((e) => (
+                      <HistoryEntryRow key={e.id} tag={tag} title={e.title} at={e.at} onPress={() => onOpenEntry(e.id)} />
+                    ))}
                   </View>
                 </View>
               ))
@@ -412,7 +405,7 @@ const HistoryDetail = ({
             ) : (
               <View style={styles.topicListFlat}>
                 {dayEntries.map((e) => (
-                  <HistoryEntryRow key={e.id} tag={e.tag} title={e.title} at={e.at} onPress={() => onOpenEntry(e.id)} />
+                  <HistoryEntryRow key={e.id} tag={e.primaryTag} title={e.title} at={e.at} onPress={() => onOpenEntry(e.id)} />
                 ))}
               </View>
             )}
@@ -1173,7 +1166,7 @@ export const AppDrawer = ({
 }: AppDrawerProps) => {
   const insets = useScreenInsets();
   const userName = useProfileName(userId);
-  const { groups: historyGroups } = useMessageHistory();
+  const { loading: historyLoading, conversations, refetch: refetchConversations } = useConversations(userId);
   const today = useTodayCalendar();
 
   const [mounted, setMounted] = useState(false);
@@ -1186,6 +1179,7 @@ export const AppDrawer = ({
 
   useEffect(() => {
     if (visible) {
+      refetchConversations();
       setMounted(true);
       setView("index");
       setDetailView("history");
@@ -1217,9 +1211,8 @@ export const AppDrawer = ({
   const detailTranslateX = stageAnim.interpolate({ inputRange: [0, 1], outputRange: [SCREEN_WIDTH, 0] });
   const detailOpacity = stageAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 1] });
 
-  const historyEntries = historyGroups.flatMap((g) => g.entries);
-  const historyCount = historyEntries.length;
-  const lastEntry = historyEntries[historyEntries.length - 1];
+  const historyCount = conversations.length;
+  const lastEntry = conversations[0];
   const historySummary = historyCount === 0 ? "No conversations yet" : `${historyCount} conversations · last one ${lastEntry ? relativeTime(lastEntry.at) : ""}`;
   const calendarSummary = today.completedWorkout
     ? `${today.completedWorkout.focus ? titleCase(today.completedWorkout.focus) : "Training"} · done today`
@@ -1269,6 +1262,8 @@ export const AppDrawer = ({
           >
             {detailView === "history" && (
               <HistoryDetail
+                loading={historyLoading}
+                conversations={conversations}
                 onOpenEntry={(id) => {
                   if (!onOpenHistoryEntry) return;
                   onClose();

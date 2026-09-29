@@ -19,6 +19,15 @@ import { alignGreetingToTimeBand } from '../lib/greetingTimeOfDay';
 import { useLocalDayRollover } from './useLocalDayRollover';
 import { useActiveSessionContext } from '../session/ActiveSessionContext';
 import { resolveTrainingDays } from '../../supabase/functions/_shared/training-schedule';
+import {
+  describeSetCount,
+  endsTheDay,
+  LIFECYCLE_COLUMNS,
+  followupAskedRecently,
+  needsFollowup,
+} from '../../supabase/functions/_shared/workout-lifecycle';
+import { RESUMABLE_COLUMNS, toResumableWorkout, type ResumableWorkout } from '../lib/resumeWorkout';
+import { dispatchQuery } from '../lib/dispatchQuery';
 
 export interface TodaySession {
   hasSession: boolean;
@@ -28,7 +37,8 @@ export interface TodaySession {
   /** True only when the user explicitly chose today as a rest day (Switch Workout, or asking
    *  the coach) — distinct from hasSession:false as a byproduct of the plan's own rotation. */
   isRestDay?: boolean;
-  completedWorkout?: { workoutLogId: string; focus: string | null } | null;
+  completedWorkout?: { workoutLogId: string; focus: string | null; endedEarly: boolean } | null;
+  resumable?: (ResumableWorkout & { label: string }) | null;
 }
 
 export interface HomeData {
@@ -72,6 +82,8 @@ function settled<T>(label: string, work: PromiseLike<T>): Promise<{ data: any; e
     (err) => ({ data: null, error: err }),
   );
 }
+
+const SCHEDULE_RETRY_MS = 20_000;
 
 const MACRO_COLUMNS: Record<MacroTarget['key'], string> = {
   protein: 'protein_g',
@@ -123,10 +135,16 @@ type HomeDataCache = Omit<HomeData, 'loading' | 'loadError' | 'refetch'>;
 // history. Since this screen already computes the correct due session deterministically for the
 // session chip below the greeting, handing the model that same fact directly removes the failure
 // entirely — there's no tool call, no history, and no other session for it to reach for instead.
+type GreetingFocus =
+  | { kind: 'followup'; focus: string | null }
+  | { kind: 'resume'; focus: string | null; label: string }
+  | null;
+
 function buildGreetingPrompt(
   sessionToday: { focus: string | null; exerciseNames: string[] } | null,
-  completedToday: { focus: string | null } | null,
+  completedToday: { focus: string | null; endedEarly: boolean } | null,
   nutrition: { caloriesLeft: number; proteinLeft: number } | null,
+  unfinished: GreetingFocus = null,
 ): string {
   const nutritionNote = nutrition
     ? ` They have calories and protein still to hit today — feel free to reference nutrition or recovery ` +
@@ -154,6 +172,32 @@ function buildGreetingPrompt(
     'without literally stating the clock time. Never ask for the time and never mention needing ' +
     'it — you have it.';
 
+  if (unfinished?.kind === 'followup') {
+    const named = unfinished.focus ? `"${unfinished.focus}"` : 'last';
+    return (
+      `Say hello for the first time today. Your whole message is about their unfinished ${named} workout: follow the ` +
+      `"Unfinished workout to follow up on" line in the context exactly. Welcome them back and ask how the rest of it ` +
+      `went, or acknowledge the reason they already gave. Two short sentences at most, ending on that one question. ` +
+      `Do not mention today's workout, nutrition or anything else yet: wait for their answer.${timeNote}`
+    );
+  }
+  if (unfinished?.kind === 'resume') {
+    const named = unfinished.focus ? `"${unfinished.focus}"` : 'workout';
+    return (
+      `Say hello for the first time today. They left their ${named} workout partway (${unfinished.label}) and it is ` +
+      `still open: Home shows a Continue Session button that picks up exactly where they stopped. One short line ` +
+      `inviting them to continue it, then one short question. Never call it finished or ended early.${timeNote}`
+    );
+  }
+  if (!sessionToday && completedToday?.endedEarly) {
+    const named = completedToday.focus ? ` ("${completedToday.focus}")` : '';
+    return (
+      `Say hello for the first time today — not a reply to a question, and not generic small talk. They ended ` +
+      `today's session${named} early, and it is saved as a partial workout. One short line acknowledging that ` +
+      `without judgement — never call it complete, never call it a rest day, and don't offer another session ` +
+      `as due today.${nutritionNote}${questionNote}${timeNote}`
+    );
+  }
   if (!sessionToday && completedToday) {
     const named = completedToday.focus ? ` ("${completedToday.focus}")` : '';
     return (
@@ -182,7 +226,7 @@ function buildGreetingPrompt(
   );
 }
 
-const CAPTION_MAX_CHARS = 140;
+const CAPTION_MAX_CHARS = 160;
 
 // The brain's replies are full conversational turns (and sometimes carry markdown emphasis) —
 // Home's caption is a compact teaser, not a chat transcript, so strip formatting and keep only
@@ -229,6 +273,9 @@ function sanitizeCoachMessage(raw: string): string {
   );
 
   const sentences = stripped.split(/(?<=[.!?])\s+/);
+
+  const threeSentences = sentences.slice(0, 3).join(' ');
+  if (sentences.length === 3 && threeSentences.length <= CAPTION_MAX_CHARS) return threeSentences;
 
   const twoSentences = sentences.slice(0, 2).join(' ');
   if (twoSentences.length <= CAPTION_MAX_CHARS) return twoSentences;
@@ -296,6 +343,7 @@ export function useHomeData(): HomeData {
 
   useEffect(() => {
     let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
     (async () => {
       const overallStarted = Date.now();
@@ -320,7 +368,7 @@ export function useHomeData(): HomeData {
 
       const ninetyDaysAgo = new Date(Date.now() - 90 * 86_400_000);
 
-      const [profileRes, planRes, nutritionRes, foodRes, messageRes, workoutRes, restDayRes, overrideRes] =
+      const [profileRes, planRes, nutritionRes, foodRes, messageRes, workoutRes, restDayRes, overrideRes, unfinishedRes] =
         await Promise.all([
         settled('profile', supabase.from('profile').select('display_name').eq('user_id', userId).maybeSingle()),
         settled(
@@ -363,7 +411,7 @@ export function useHomeData(): HomeData {
           'workout',
           supabase
             .from('workout_log')
-            .select('id, at, plan_session_id, status')
+            .select(`id, at, plan_session_id, status, ${LIFECYCLE_COLUMNS}`)
             .eq('user_id', userId)
             .order('at', { ascending: false })
             .limit(60),
@@ -381,6 +429,17 @@ export function useHomeData(): HomeData {
             .eq('date', localDateKey(new Date()))
             .maybeSingle(),
         ),
+        settled(
+          'unfinished',
+          supabase
+            .from('workout_log')
+            .select(RESUMABLE_COLUMNS)
+            .eq('user_id', userId)
+            .in('status', ['partial', 'interrupted'])
+            .order('last_activity_at', { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+        ),
       ]);
       if (cancelled) return;
 
@@ -391,6 +450,12 @@ export function useHomeData(): HomeData {
         ['day_override', overrideRes],
       ] as const) {
         if (res.error) console.warn(`[home] ${label} error:`, res.error.message ?? res.error);
+      }
+
+      if (!planRes.error && (workoutRes.error || restDayRes.error || overrideRes.error)) {
+        setState((prev) => ({ ...prev, loading: false }));
+        retryTimer = setTimeout(refetch, SCHEDULE_RETRY_MS);
+        return;
       }
 
       const restDayDates = new Set(((restDayRes.data ?? []) as any[]).map((r) => r.date as string));
@@ -409,16 +474,39 @@ export function useHomeData(): HomeData {
         return (Array.isArray(row) ? row[0] : row) ?? null;
       })();
 
+      if (!workoutRunningRef.current) {
+        dispatchQuery(supabase.from('live_session_state').delete().eq('user_id', userId), 'live-state clear (home)');
+      }
+
+      const unfinishedRow = unfinishedRes.data as any;
+      const resumableWorkout = unfinishedRow ? toResumableWorkout(unfinishedRow) : null;
+      const resumable = resumableWorkout ? { ...resumableWorkout, label: describeSetCount(resumableWorkout.sets) } : null;
+      const followupRow =
+        unfinishedRow &&
+        !resumable &&
+        needsFollowup(unfinishedRow) &&
+        (!unfinishedRow.followup_asked_at || followupAskedRecently(unfinishedRow))
+          ? unfinishedRow
+          : null;
+      const unfinishedFocus = (row: any): string | null => {
+        const planSession = Array.isArray(row?.plan_session) ? row.plan_session[0] : row?.plan_session;
+        return planSession?.focus ? titleCase(planSession.focus) : null;
+      };
+
       const completedLog = ((workoutRes.data ?? []) as any[])
         .slice()
         .sort(byMostRecentFinishedFirst)
-        .find((log) => !isUnfinishedWorkout(log.status) && localDateKey(new Date(log.at)) === todayKey);
+        .find((log) => endsTheDay(log) && localDateKey(new Date(log.at)) === todayKey);
       const completedSession = completedLog?.plan_session_id
         ? ((plan?.plan_session ?? []) as any[]).find((s) => s.id === completedLog.plan_session_id) ??
           (overrideSession?.id === completedLog.plan_session_id ? overrideSession : undefined)
         : undefined;
       const completedWorkout = completedLog?.id
-        ? { workoutLogId: completedLog.id as string, focus: completedSession?.focus ?? null }
+        ? {
+            workoutLogId: completedLog.id as string,
+            focus: completedSession?.focus ?? null,
+            endedEarly: isUnfinishedWorkout(completedLog.status),
+          }
         : null;
 
       let todaySession: TodaySession | null = null;
@@ -441,8 +529,9 @@ export function useHomeData(): HomeData {
               planSessionId: sessionToday.id,
               name: titleCase(sessionToday.focus) === '—' ? 'Training' : titleCase(sessionToday.focus),
               exerciseCountLabel: `${sessionToday.plan_exercise?.length ?? 0} exercises`,
+              resumable,
             }
-          : { hasSession: false, isRestDay: !completedWorkout && restDayDates.has(todayKey), completedWorkout };
+          : { hasSession: false, isRestDay: !completedWorkout && restDayDates.has(todayKey), completedWorkout, resumable };
         greetingSession = sessionToday
           ? {
               // Humanized before it reaches the prompt, not just before it reaches a label. The
@@ -457,7 +546,9 @@ export function useHomeData(): HomeData {
             }
           : null;
       } else if (completedWorkout) {
-        todaySession = { hasSession: false, isRestDay: false, completedWorkout };
+        todaySession = { hasSession: false, isRestDay: false, completedWorkout, resumable };
+      } else if (resumable) {
+        todaySession = { hasSession: false, isRestDay: false, completedWorkout: null, resumable };
       }
 
       const nutrition = nutritionRes.data;
@@ -493,11 +584,22 @@ export function useHomeData(): HomeData {
       // — Deadlift, Lat Pulldown, Seated Row, Face Pull" directly above a session chip reading
       // "LOWER, 4 exercises". A cached greeting with no key at all predates this column, so it is
       // treated as unverifiable and regenerated once rather than trusted.
-      const greetingKey = todaySession?.hasSession
-        ? todaySession.planSessionId
-        : todaySession?.completedWorkout
-          ? `done:${todaySession.completedWorkout.workoutLogId}`
-          : 'rest';
+      const greetingFocus: GreetingFocus = followupRow
+        ? followupRow.followup_asked_at
+          ? null
+          : { kind: 'followup', focus: unfinishedFocus(followupRow) }
+        : resumable
+          ? { kind: 'resume', focus: resumable.focus ? titleCase(resumable.focus) : null, label: resumable.label }
+          : null;
+      const greetingKey = followupRow
+        ? `followup:${followupRow.id}`
+        : resumable
+          ? `resume:${resumable.workoutLogId}:${resumable.sets.logged}`
+          : todaySession?.hasSession
+            ? todaySession.planSessionId
+            : todaySession?.completedWorkout
+              ? `${todaySession.completedWorkout.endedEarly ? 'ended' : 'done'}:${todaySession.completedWorkout.workoutLogId}`
+              : 'rest';
       const greetingIsFreshToday = isGreetingFreshToday({
         lastGreeting,
         greetingKey,
@@ -534,11 +636,12 @@ export function useHomeData(): HomeData {
           const completedTodayForGreeting = todaySession?.completedWorkout
             ? {
                 focus: todaySession.completedWorkout.focus ? titleCase(todaySession.completedWorkout.focus) : null,
+                endedEarly: todaySession.completedWorkout.endedEarly,
               }
             : null;
           const generated = await callBrain({
             userId,
-            message: buildGreetingPrompt(greetingSession, completedTodayForGreeting, nutritionForGreeting),
+            message: buildGreetingPrompt(greetingSession, completedTodayForGreeting, nutritionForGreeting, greetingFocus),
             hidden: true,
             isDailyGreeting: true,
             greetingKey,
@@ -599,8 +702,9 @@ export function useHomeData(): HomeData {
 
     return () => {
       cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
     };
-  }, [refetchSignal]);
+  }, [refetchSignal, refetch]);
 
   return { ...state, refetch };
 }

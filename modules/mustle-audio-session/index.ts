@@ -67,6 +67,11 @@ export async function reassertSessionActive(): Promise<void> {
   if (result !== 'ok') console.warn(`[MustleAudioSession] reassert session active: ${result}`);
 }
 
+export async function describeAudioSessionState(): Promise<string | null> {
+  if (!native || typeof native.describeAudioSessionState !== 'function') return null;
+  return native.describeAudioSessionState().catch(() => null);
+}
+
 export async function logAudioSessionState(label: string): Promise<void> {
   if (!native || typeof native.describeAudioSessionState !== 'function') {
     console.warn(`[MustleAudioSession] ${label}: describeAudioSessionState not available on this binary`);

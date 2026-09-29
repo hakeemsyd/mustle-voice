@@ -5,6 +5,8 @@ import { colors, fonts } from "../constants/theme";
 import { useScreenInsets } from "../hooks/useScreenInsets";
 import { useExerciseGuide } from "../hooks/useExerciseGuide";
 import { getExerciseReference } from "../lib/exerciseGuides";
+import { formatLoggedLoads } from "../lib/units";
+import { useUnitPrefs } from "../hooks/useUnitPrefs";
 import { ExerciseMotionIllustration } from "./ExerciseMotionIllustration";
 import { XIcon } from "../icons/XIcon";
 
@@ -37,6 +39,7 @@ function whenLabel(iso: string): string {
  */
 export function GuideSheet({ open, onClose, exerciseId, exerciseName, repScheme, loadScheme }: Props) {
   const insets = useScreenInsets();
+  const units = useUnitPrefs();
   const { loading, notes, lastTime } = useExerciseGuide(open ? exerciseId : null, open ? exerciseName : null);
   const reference = getExerciseReference(exerciseName);
 
@@ -117,7 +120,7 @@ export function GuideSheet({ open, onClose, exerciseId, exerciseName, repScheme,
                   <Text style={styles.stepLabel}>LAST TIME</Text>
                   <Text style={styles.cardText}>
                     {whenLabel(lastTime.at)} — {lastTime.sets} sets · {lastTime.reps} reps
-                    {lastTime.load && lastTime.load !== "bodyweight" ? ` · ${lastTime.load}` : ""}
+                    {lastTime.load && lastTime.load !== "bodyweight" ? ` · ${formatLoggedLoads(lastTime.load, units)}` : ""}
                   </Text>
                 </View>
               )}

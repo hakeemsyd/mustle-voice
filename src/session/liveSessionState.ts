@@ -1,4 +1,5 @@
 import type { LoggedSet, SessionExercise, SessionTarget } from './ActiveSessionContext';
+import { describeRestRules } from '../../supabase/functions/_shared/rest-length';
 import { kgToDisplayWeight, type Units } from '../lib/units';
 import { convertLoadScheme } from '../lib/loadScheme';
 import { normalizeLoadScheme } from '../../supabase/functions/_shared/load-intent';
@@ -8,6 +9,31 @@ import { describeSetProvenance } from '../../supabase/functions/_shared/set-disp
 
 const formatDuration = (seconds: number): string =>
   seconds >= 60 && seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds}s held`;
+
+const describeSavedSet = (s: LoggedSet, units: Units): string =>
+  s.unit === 'seconds' ? formatDuration(s.reps) : `${s.weight != null ? kgToDisplayWeight(s.weight, units) : 'bodyweight'}×${s.reps}`;
+
+const describeEarlierExercises = (snapshot: LiveSessionSnapshot, units: Units): string | null => {
+  const earlier = snapshot.earlierExercises ?? [];
+  const record =
+    earlier.length > 0
+      ? `- Already done in this session, as saved (corrections included): ` +
+        earlier
+          .map((e) => `${e.name}, ${e.loggedSets.length} of ${e.totalSets} sets: ${e.loggedSets.map((s) => describeSavedSet(s, units)).join(', ')}`)
+          .join('; ') +
+        '.'
+      : null;
+  if (!snapshot.currentExercise && !record) return null;
+  return [
+    record,
+    "- The user's earlier messages in this workout (set reports, corrections, rest changes) were already handled by the " +
+      'app, which answered each one itself; everything that came of them is in this block. Never work sets out of those ' +
+      'messages, never quiz the user about them, and answer what they ask now. If a count they mention differs from this ' +
+      'saved record, say what is saved in one line and carry on.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+};
 
 export interface LiveSessionSnapshot {
   target: SessionTarget;
@@ -24,9 +50,11 @@ export interface LiveSessionSnapshot {
     statedWeight?: number | null;
   } | null;
   upcomingExercises: string[];
+  earlierExercises?: { name: string; totalSets: number; loggedSets: LoggedSet[] }[];
   restTargetSec: number | null;
   restRemainingSec: number | null;
   restOverrideSec?: number | null;
+  restLines?: string[];
   lastSetLoggedAt?: number | null;
   restFinishedAt?: number | null;
 }
@@ -46,6 +74,8 @@ interface SnapshotInput {
   elapsedSec: number;
   statedWeight?: { exerciseIndex: number; weight: number } | null;
   restOverrideSec?: number | null;
+  restByExercise?: Record<string, number> | null;
+  savedRestByExercise?: Record<string, number> | null;
   restFinishedAt?: number | null;
 }
 
@@ -86,12 +116,21 @@ export const buildLiveSessionSnapshot = (input: SnapshotInput): LiveSessionSnaps
             input.statedWeight?.exerciseIndex === input.currentExerciseIndex ? input.statedWeight.weight : null,
         }
       : null,
+    earlierExercises: input.exercises
+      .map((e, index) => ({ name: e.name, totalSets: e.sets, loggedSets: input.loggedSets[index] ?? [], index }))
+      .filter((e) => e.index !== input.currentExerciseIndex && e.loggedSets.length > 0)
+      .map(({ index: _index, ...e }) => e),
     upcomingExercises: input.exercises
       .slice(input.currentExerciseIndex + 1)
       .map((e) => `${e.name} (${e.sets} sets of ${e.repScheme}${e.loadScheme ? `, ${normalizeLoadScheme(e.loadScheme)}` : ''})`),
     restTargetSec: input.resting ? input.restTargetSec : null,
     restRemainingSec,
     restOverrideSec: typeof input.restOverrideSec === 'number' ? input.restOverrideSec : null,
+    restLines: describeRestRules(input.exercises ?? [], input.currentExerciseIndex, {
+      restByExercise: input.restByExercise,
+      restOverrideSec: input.restOverrideSec,
+      savedRestByExercise: input.savedRestByExercise,
+    }),
     lastSetLoggedAt: latestSetTime(input.loggedSets),
     restFinishedAt: typeof input.restFinishedAt === 'number' ? input.restFinishedAt : null,
   };
@@ -165,11 +204,15 @@ export const describeLiveSessionSnapshot = (
     );
     lines.push(`- Loads logged so far on this exercise: ${loggedDesc}.`);
     if (provenance.warning) lines.push(provenance.warning);
+    const earlier = describeEarlierExercises(snapshot, units);
+    if (earlier) lines.push(earlier);
   } else {
     lines.push('- No current exercise (session not yet loaded or already finished).');
   }
 
-  if (snapshot.restOverrideSec) {
+  if (snapshot.restLines) {
+    lines.push(...snapshot.restLines);
+  } else if (snapshot.restOverrideSec) {
     lines.push(`- They asked for ${snapshot.restOverrideSec}s rests: every rest from here on is ${snapshot.restOverrideSec}s.`);
   }
 

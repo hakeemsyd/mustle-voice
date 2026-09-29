@@ -3,6 +3,7 @@ import { supabase } from '../lib/supabase';
 import type { SessionExercise } from '../session/ActiveSessionContext';
 import { normalizeLoadScheme } from '../../supabase/functions/_shared/load-intent';
 import type { ResumePlanEntry } from '../session/resumeSession';
+import { isOpenWorkout, LIFECYCLE_COLUMNS } from '../../supabase/functions/_shared/workout-lifecycle';
 
 interface LoggedExercise {
   name: string;
@@ -17,7 +18,7 @@ export interface SessionPreview {
   focus: string | null;
   exercises: SessionExercise[];
   /** Most recent run of this same plan session, for the "Last time" comparison — real history,
-   *  not a placeholder. When status is "partial", this is also what the Continue Session path
+   *  not a placeholder. When it can still be continued, this is also what the Continue Session path
    *  resumes from (see ActiveSessionContext.start's resumeExercisesDone param), and `id` is what
    *  Restart Instead deletes — choosing to restart is an explicit "discard this attempt", so the
    *  partial row it was offered from must not survive as accepted history once declined. */
@@ -28,6 +29,9 @@ export interface SessionPreview {
     exercises: LoggedExercise[];
     sessionPlan: ResumePlanEntry[] | null;
     durationSec: number | null;
+    restOverrideSec: number | null;
+    restByExercise: Record<string, number> | null;
+    canContinue: boolean;
   } | null;
 }
 
@@ -77,7 +81,7 @@ export function useSessionPreview(planSessionId: string): SessionPreview {
           .maybeSingle(),
         supabase
           .from('workout_log')
-          .select('id, at, status, exercises_done, vs_planned, duration_sec')
+          .select(`id, at, status, exercises_done, vs_planned, duration_sec, ${LIFECYCLE_COLUMNS}`)
           .eq('user_id', userId)
           .eq('plan_session_id', planSessionId)
           .order('at', { ascending: false })
@@ -111,6 +115,13 @@ export function useSessionPreview(planSessionId: string): SessionPreview {
               ? (lastRow.vs_planned.exercises as ResumePlanEntry[])
               : null,
             durationSec: typeof lastRow.duration_sec === 'number' ? lastRow.duration_sec : null,
+            restOverrideSec:
+              typeof lastRow.vs_planned?.rest_override_sec === 'number' ? lastRow.vs_planned.rest_override_sec : null,
+            restByExercise:
+              lastRow.vs_planned?.rest_by_exercise && typeof lastRow.vs_planned.rest_by_exercise === 'object'
+                ? (lastRow.vs_planned.rest_by_exercise as Record<string, number>)
+                : null,
+            canContinue: isOpenWorkout(lastRow) && (lastRow.exercises_done ?? []).length > 0,
           }
         : null;
 

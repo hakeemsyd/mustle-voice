@@ -1,10 +1,12 @@
+import { endsTheDay, isOpenWorkout, type LifecycleRow } from '../../supabase/functions/_shared/workout-lifecycle';
+
 export interface PlanSessionRow {
   id: string;
   day_order: number;
   weekday: number | null;
 }
 
-export interface WorkoutLogRow {
+export interface WorkoutLogRow extends LifecycleRow {
   id?: string;
   at: string;
   plan_session_id: string | null;
@@ -40,7 +42,7 @@ function isPartial(log: WorkoutLogRow): boolean {
 
 export function wasFinishedToday(logs: WorkoutLogRow[], sessionId: string, now: Date): boolean {
   return logs.some(
-    (log) => log.plan_session_id === sessionId && !isPartial(log) && sameLocalDay(new Date(log.at), now),
+    (log) => log.plan_session_id === sessionId && endsTheDay(log, now.getTime()) && sameLocalDay(new Date(log.at), now),
   );
 }
 
@@ -57,17 +59,16 @@ export function wasFinishedToday(logs: WorkoutLogRow[], sessionId: string, now: 
 /**
  * Whether an unfinished session should still block the rotation from advancing.
  *
- * Only on the day it happened. Resuming is a real option for a few hours: you stepped away
- * mid-workout and came back. It stops being one overnight — nobody finishes Tuesday's session on
- * Thursday — and an unbounded hold made the app read as stuck, offering the same workout every day
- * until something was completed. Confirmed live: an interrupted Tuesday session left Home showing
- * "Upper Pull" for the rest of the week while the plan had moved on.
+ * Only while it can still be continued: left or disconnected, not ended, and less than 24 hours
+ * since its last set (Damion, 29 Sep). Ending early, or 24 hours going by, closes it, and the
+ * schedule moves on as planned. An unbounded hold made the app read as stuck, offering the same
+ * workout every day until something was completed.
  *
- * The log itself is untouched either way. What lapses is only the offer to resume; the sets stay
- * in history, and the coach still raises the unfinished session for reconciliation separately.
+ * The log itself is untouched either way. What lapses is only the offer to continue; the sets stay
+ * in history, and the coach asks once how the rest of a timed-out workout went.
  */
 export function holdsRotation(log: WorkoutLogRow, now: Date): boolean {
-  return isUnfinishedWorkout(log.status) && sameLocalDay(new Date(log.at), now);
+  return isOpenWorkout(log, now.getTime());
 }
 
 export function byMostRecentFinishedFirst(a: WorkoutLogRow, b: WorkoutLogRow): number {
@@ -119,7 +120,7 @@ export function resolveTodaySession<T extends PlanSessionRow>(
   if (!flexible) return null;
   if (trainingDays && trainingDays.length > 0 && !trainingDays.includes(now.getDay())) return null;
 
-  const completedToday = logs.some((log) => !isPartial(log) && sameLocalDay(new Date(log.at), now));
+  const completedToday = logs.some((log) => endsTheDay(log, now.getTime()) && sameLocalDay(new Date(log.at), now));
   if (completedToday) return null;
 
   const rotation = sessions.slice().sort((a, b) => a.day_order - b.day_order);

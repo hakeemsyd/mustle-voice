@@ -3,12 +3,13 @@ import { AppActionListener, type AppAction } from './AppActionListener';
 import { useActiveSessionContext, type RestLengthScope, type SessionStatus } from './ActiveSessionContext';
 import { navigateFromAppAction } from '../navigation/navigationRef';
 import { notifyHomeRefresh } from '../lib/homeRefreshBridge';
+import { fetchResumableWorkout } from '../lib/resumeWorkout';
 
 interface AppActionBridgeProps {
   userId: string | null;
 }
 
-const REST_SCOPES = new Set<RestLengthScope>(['current', 'upcoming', 'both']);
+const REST_SCOPES = new Set<RestLengthScope>(['current', 'exercise', 'workout', 'always']);
 
 export const AppActionBridge = ({ userId }: AppActionBridgeProps) => {
   const session = useActiveSessionContext();
@@ -20,6 +21,8 @@ export const AppActionBridge = ({ userId }: AppActionBridgeProps) => {
   // reads whatever session is current at call time without onAction's own identity ever changing.
   const sessionRef = useRef(session);
   sessionRef.current = session;
+  const userIdRef = useRef(userId);
+  userIdRef.current = userId;
 
   const onAction = useCallback((action: AppAction) => {
     const session = sessionRef.current;
@@ -50,6 +53,15 @@ export const AppActionBridge = ({ userId }: AppActionBridgeProps) => {
         );
         break;
       }
+      case 'amend_set': {
+        const exerciseIndex = Number(action.payload?.exercise_index);
+        const setIndex = Number(action.payload?.set_index);
+        const reps = Number(action.payload?.reps);
+        const weight = Number(action.payload?.weight_kg);
+        if (!Number.isInteger(exerciseIndex) || !Number.isInteger(setIndex) || !(reps > 0)) break;
+        session.amendSet(exerciseIndex, setIndex, Number.isFinite(weight) && weight > 0 ? weight : null, Math.round(reps));
+        break;
+      }
       case 'end_workout':
         session.endSession(
           (action.payload?.status as SessionStatus) ?? 'completed',
@@ -61,10 +73,12 @@ export const AppActionBridge = ({ userId }: AppActionBridgeProps) => {
         break;
       case 'start_workout': {
         const planSessionId = String(action.payload?.plan_session_id ?? '');
-        if (planSessionId) {
-          session.start({ type: 'strength', planSessionId });
+        if (!planSessionId) break;
+        const owner = userIdRef.current;
+        void (owner ? fetchResumableWorkout(owner, planSessionId) : Promise.resolve(null)).then((resumable) => {
+          sessionRef.current.start({ type: 'strength', planSessionId }, resumable?.resume);
           navigateFromAppAction('ActiveSession');
-        }
+        });
         break;
       }
       case 'swap_exercise': {
@@ -79,6 +93,11 @@ export const AppActionBridge = ({ userId }: AppActionBridgeProps) => {
             loadScheme: typeof action.payload?.load_scheme === 'string' ? action.payload.load_scheme : null,
           });
         }
+        break;
+      }
+      case 'set_hold_target': {
+        const seconds = Number(action.payload?.seconds);
+        if (Number.isFinite(seconds) && seconds > 0) session.setHoldTarget(Math.round(seconds));
         break;
       }
       case 'refresh_home':

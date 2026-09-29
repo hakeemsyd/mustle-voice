@@ -247,9 +247,12 @@ logs before proposing or changing anything, and before answering a question abou
 schedule, progress, or history — never ask the user for something you can read yourself. \
 Exception: show_plan_breakdown already fetches the plan itself, so for a plain "show/break down \
 my plan" request call it directly without read_state first. Likewise, show_daily_workout already \
-resolves which session is actually due, so for "what's today's/next workout" (a single day, not \
-the whole plan) call it directly instead of read_state — it returns a structured card, so pair it \
-with one short sentence rather than describing the exercises in text. The same goes for \
+resolves which session is actually due on any day, so for "what's today's/next workout", "what am \
+I doing tomorrow", "what's on next Sunday" or "my workout on Oct 15" (a single day, not the whole \
+plan) call it directly instead of read_state, passing the user's own words in the day field \
+(leave it out for today). It returns a structured card, so pair it with one short sentence that \
+names the date from the result rather than describing the exercises in text. Never answer a \
+question about another day with today's session. The same goes for \
 show_nutrition_summary (any way of asking about today's food/macros/calories — "nutrition \
 summary", "how am I doing on food", "what's my nutrition today", "how many calories do I have \
 left", "how's my macros looking" — don't require the exact phrase, the intent is what matters), \
@@ -270,8 +273,7 @@ their own screen or a card you just displayed — you have the exact number, say
 which session is due today changes as workouts get logged, so a plan mentioned five messages \
 ago is not evidence of what is due now. Never answer "what's today's/next workout" from memory \
 of an earlier read_state, show_plan_breakdown, or show_daily_workout result in this conversation \
-— call show_daily_workout (or read_state, for a voice turn where no card can render) again, \
-every time, with no exception for it feeling redundant.
+— call show_daily_workout again, every time, with no exception for it feeling redundant.
 - generate_training_plan, update_training_plan and create_custom_session only accept exercises \
 from this exact catalog — use these names verbatim, character for character, never a close \
 variant or synonym: ${CATALOG_NAMES}.
@@ -501,7 +503,9 @@ const VOICE_PHRASING_NOTE =
   'of fat" or "about two and a half grams" not "2.5g fat", "eight to ten reps" not "8-10 reps", ' +
   "spelled-out units always (grams, kilograms, pounds, minutes, seconds, calories) never glued " +
   'abbreviations. Sets and reps always read as "N sets of M reps" (e.g. "two sets of eight reps") ' +
-  '— never "M reps at N" or any other order, which reads as a different, wrong number entirely.';
+  '— never "M reps at N" or any other order, which reads as a different, wrong number entirely. ' +
+  'Nothing renders on screen during a voice turn, so when show_daily_workout returns a card, say ' +
+  "the date from its `day`, the session name and the exercises briefly instead of pointing at a card.";
 
 export const buildSystemPrompt = (
   hasHistory: boolean,
