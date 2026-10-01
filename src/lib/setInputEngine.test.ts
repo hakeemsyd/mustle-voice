@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { looksLikeUndoRequest, looksLikeMisheardUndo } from '../../supabase/functions/_shared/set-report.ts';
 import {
   decideConfirmTap,
   decideSetInput,
@@ -36,7 +37,8 @@ class Workout {
   restOverride: number | null = null;
   restByExercise: Record<string, number> = {};
   saved: Record<string, number> = {};
-  stated: { exerciseIndex: number; weight: number } | null = null;
+  stated: { exerciseIndex: number; weight: number; at: number } | null = null;
+  lastTyped: { text: string; at: number } | null = null;
   ended = false;
   holds: EngineHolds = NO_HOLDS;
   lines: string[] = [];
@@ -81,8 +83,16 @@ class Workout {
       statedWeight: this.stated,
       units: this.units,
       lastCoachLine: this.coachLine,
+      lastTypedLog: this.lastTyped,
       now: this.now,
     };
+  }
+
+  restOver() {
+    this.resting = false;
+    this.restEndAt = null;
+    this.restFinishedAt = this.now;
+    return this;
   }
 
   restFor(index: number) {
@@ -166,7 +176,7 @@ class Workout {
           break;
         }
         case 'remember_weight':
-          this.stated = { exerciseIndex: this.index, weight: effect.weight };
+          this.stated = { exerciseIndex: this.index, weight: effect.weight, at: this.now };
           break;
         case 'tell_coach':
           this.toCoach.push(effect.text);
@@ -178,6 +188,7 @@ class Workout {
   send(text: string, source: EngineSource = 'typed') {
     const before = this.lines.length;
     const result = decideSetInput(text, source, this.state(), this.holds);
+    if (source !== 'voice' && result.effects.some((e) => e.type === 'log')) this.lastTyped = { text, at: this.now };
     this.holds = result.holds;
     this.apply(result.effects);
     return { ...result, newLines: this.lines.slice(before) };
@@ -308,7 +319,7 @@ test('no weight anywhere: the weight question escalates, a bare number answers i
   r = w.at('2026-09-26T10:01:05Z').send('12 reps');
   assert.match(r.newLines[0], /^I still need the weight for those 12 reps before I can log set 1 of 3 on Lat Pulldown/);
   r = w.at('2026-09-26T10:01:07Z').tapConfirm();
-  assert.match(r.newLines[0], /^Type the weight for those 12 reps/);
+  assert.match(r.newLines[0], /^Say or type the weight for those 12 reps/);
   w.draft = '100';
   w.at('2026-09-26T10:01:10Z').tapConfirm();
   assert.deepEqual(w.record(0), ['100 lbx12']);
@@ -613,15 +624,34 @@ test('"undo" while the app is asking about a set cancels the question, never a s
   );
   w.wait(60).send('done 12');
   assert.equal(w.index, 1);
-  assert.match(w.wait(11).send('ten at forty, done').newLines[0], /was logged 11s ago\. Log another one now as set 1 of 3 on Hammer Curl/);
+  w.wait(120).send('ten at forty, done');
+  assert.deepEqual(w.record(1), ['40 lbx10'], 'the first set of the new exercise logs without being challenged');
+
+  assert.match(w.wait(11).send('ten at forty, done').newLines[0], /was logged 11s ago\. Log another one now as set 2 of 3 on Hammer Curl/);
   const r = w.wait(3).send('undo');
   assert.deepEqual(w.record(0), ['55 lbx12'], 'the saved pushdown set stays');
+  assert.deepEqual(w.record(1), ['40 lbx10'], 'the saved hammer curl set stays');
   assert.equal(w.index, 1);
-  assert.equal(r.newLines[0], 'Okay, not logged. Set 1 of 3 on Hammer Curl is still open.');
+  assert.equal(r.newLines[0], 'Okay, not logged. Set 2 of 3 on Hammer Curl is still open.');
   w.wait(120).send('ten at forty, done');
   w.wait(20).send('undo');
-  assert.deepEqual(w.record(1), [], 'with nothing pending, undo removes the last saved set');
+  assert.deepEqual(w.record(1), ['40 lbx10'], 'with nothing pending, undo removes the last saved set');
   assert.deepEqual(w.record(0), ['55 lbx12']);
+});
+
+test('1 Oct: the first set of a new exercise is never challenged as a repeat of the last one', () => {
+  const w = new Workout(
+    [
+      { name: 'Cable Tricep Pushdown', sets: 1, repScheme: '12', loadScheme: '55 lb' },
+      { name: 'Hammer Curl', sets: 3, repScheme: '8-10', loadScheme: '40 lb each' },
+    ],
+    '2026-10-01T18:00:00Z',
+  );
+  w.wait(60).send('done 12');
+  assert.equal(w.index, 1, 'the app moved on by itself');
+  const next = w.wait(13).send('done 10');
+  assert.ok(!next.newLines.some((line) => /Reply "yes" to log it/.test(line)), 'no confirm prompt at a transition');
+  assert.deepEqual(w.record(1), ['40 lbx10']);
 });
 
 test('the undo message names the set it removed', () => {
@@ -713,4 +743,544 @@ test('rest changes out loud never log a set, and a timed hold ignores rest instr
   assert.equal(r.newLines[0], 'No rest is running right now, so there is nothing to add time to.');
   w.wait(1).send('45 seconds');
   assert.deepEqual(w.record(1), ['bwx45s'], 'a plain duration still logs the hold');
+});
+
+const LOWER: EngineExercise[] = [
+  { name: 'Hip Thrust', sets: 4, repScheme: '5-6', loadScheme: 'light — find your working weight' },
+  { name: 'Glute Bridge', sets: 3, repScheme: '8-10', loadScheme: 'bodyweight' },
+  { name: 'Leg Curl', sets: 3, repScheme: '8-10', loadScheme: 'light — find your working weight' },
+  { name: 'Calf Raise', sets: 3, repScheme: '10-12', loadScheme: 'light — find your working weight' },
+];
+
+test('29 Sep: "Okay. Start set three now." ends the rest, the way the button does', () => {
+  const w = new Workout(LOWER, '2026-09-30T03:13:00Z');
+  w.send('70 pounds');
+  w.wait(10).send('Done');
+  w.wait(3).send('8');
+  assert.equal(w.resting, true);
+
+  const r = w.wait(20).send('Okay. Start set three now.', 'voice');
+  assert.ok(r.handled, 'the spoken start command was not recognised');
+  assert.deepEqual(r.effects, [{ type: 'start_next_set' }]);
+  assert.equal(w.resting, false, 'the rest timer kept running after he asked to start');
+
+  for (const phrase of ['Start set three now', 'start set 3 now', "I'm ready for set three now", 'skip the rest please']) {
+    const fresh = new Workout(LOWER, '2026-09-30T03:13:00Z');
+    fresh.send('70 pounds');
+    fresh.wait(10).send('Done');
+    fresh.wait(3).send('8');
+    assert.equal(fresh.wait(20).send(phrase, 'voice').effects[0]?.type, 'start_next_set', phrase);
+  }
+});
+
+test('29 Sep: changing the weight before set three moves the card and the saved set', () => {
+  const w = new Workout(LOWER, '2026-09-30T03:13:00Z');
+  w.send('70 pounds');
+  w.wait(10).send('Done');
+  w.wait(3).send('8');
+  w.wait(110).send('Done');
+  w.wait(3).send('6');
+  assert.deepEqual(w.record(0), ['70 lbx8', '70 lbx6']);
+
+  const r = w.wait(10).send("At the end of the next set, I'm gonna go to 80 pound.", 'voice');
+  assert.deepEqual(r.effects, [{ type: 'remember_weight', weight: 36.3 }], 'the weight change was not picked up');
+  assert.equal(w.stated?.weight, 36.3);
+
+  w.wait(30).send("Let's go", 'voice');
+  w.wait(20).send('Done', 'voice');
+  w.wait(3).send('Six.', 'voice');
+  assert.deepEqual(w.record(0), ['70 lbx8', '70 lbx6', '80 lbx6'], 'set three saved at the old weight');
+  assert.match(describeNextSetLine(w.state()) ?? '', /80 lb/, 'the card still offers the old weight');
+});
+
+test('29 Sep: "I asked for 80 pounds, you still said 70" is never a 70-rep set', () => {
+  const w = new Workout(LOWER, '2026-09-30T03:13:00Z');
+  w.send('70 pounds');
+  w.wait(10).send('Done');
+  w.wait(3).send('8');
+  w.wait(120);
+
+  const r = w.send('I remember I asked for 80 pounds, you still said 70.', 'voice');
+  assert.deepEqual(r.effects, [{ type: 'remember_weight', weight: 36.3 }]);
+  assert.equal(w.holds.done, null, 'the app held a set and the coach was told to ask "Is that set done?"');
+  assert.equal(w.total(), 1, 'nothing new should be logged by a complaint about the weight');
+});
+
+test('29 Sep: a weight the app is waiting on never traps the workout', () => {
+  const w = new Workout(LOWER, '2026-09-30T03:22:00Z');
+  w.index = 2;
+
+  const first = w.send('10 reps');
+  assert.match(first.newLines[0], /What weight was that\?/);
+  assert.equal(
+    first.effects.filter((e) => e.type === 'tell_coach').length,
+    1,
+    'the coach was not told the app is blocked, so it carried on with its own script',
+  );
+  assert.match(w.toCoach.at(-1) ?? '', /holding 10 reps/);
+
+  const taps = [w.wait(1).tapConfirm(), w.wait(1).tapConfirm(), w.wait(1).tapConfirm()];
+  for (const tap of taps) assert.match(tap.newLines[0], /Say or type the weight for those 10 reps/);
+  assert.match(taps[0].newLines[0], /"skip" to drop them/, 'the nag offers no way out');
+  assert.doesNotMatch(taps[0].newLines[0], /^Type /, 'a hands-free user was told to type');
+
+  const out = w.wait(2).send('skip');
+  assert.ok(out.handled);
+  assert.equal(w.holds.weight, null, 'the hold survived an explicit "skip"');
+  assert.equal(w.total(), 0);
+  assert.match(out.newLines[0], /Dropped those 10 reps/);
+
+  w.wait(2).send('Done 45 lb x 10');
+  assert.deepEqual(w.record(2), ['45 lbx10'], 'the workout could not move on after the hold cleared');
+});
+
+test('29 Sep: Damion\'s whole session replays clean, start to finish', () => {
+  const w = new Workout(LOWER, '2026-09-30T03:13:30Z');
+
+  w.at('2026-09-30T03:13:34Z').send('70 pounds');
+  assert.equal(w.stated?.weight, 31.8, 'the opening weight was not remembered');
+  w.at('2026-09-30T03:13:47Z').send('Done');
+  w.at('2026-09-30T03:13:50Z').send('8');
+  assert.deepEqual(w.record(0), ['70 lbx8']);
+
+  w.at('2026-09-30T03:14:08Z').send('It’s supposed to be 90 seconds rest');
+  assert.equal(w.restFor(0), 90, 'the 90s rest request did not stick to Hip Thrust');
+
+  w.at('2026-09-30T03:14:38Z').send('All right, done.', 'voice');
+  assert.equal(w.total(), 1, '"All right, done." must not skip the rest or log on its own');
+  w.at('2026-09-30T03:14:44Z').send('Six.', 'voice');
+  assert.deepEqual(w.record(0), ['70 lbx8', '70 lbx6']);
+
+  w.at('2026-09-30T03:14:54Z').send("At the end of the next set, I'm gonna go to 80 pound.", 'voice');
+  assert.equal(w.stated?.weight, 36.3, 'the jump to 80 lb was dropped');
+
+  const start = w.at('2026-09-30T03:15:21Z').send('Okay. Start set three now.', 'voice');
+  assert.deepEqual(start.effects, [{ type: 'start_next_set' }]);
+  assert.equal(w.resting, false, 'the screen stayed on rest after he asked to start');
+
+  const complaint = w.at('2026-09-30T03:16:19Z').send('I remember I asked for 80 pounds, you still said 70.', 'voice');
+  assert.deepEqual(complaint.effects, [{ type: 'remember_weight', weight: 36.3 }]);
+  assert.equal(w.holds.done, null, 'the complaint was held as a set awaiting "Is that set done?"');
+  assert.equal(w.total(), 2, 'the complaint logged something');
+
+  w.at('2026-09-30T03:16:34Z').send("No, it's not done.", 'voice');
+  w.at('2026-09-30T03:16:43Z').send('Done.', 'voice');
+  w.at('2026-09-30T03:16:47Z').send('Six.', 'voice');
+  assert.deepEqual(w.record(0), ['70 lbx8', '70 lbx6', '80 lbx6'], 'set three saved at the old 70 lb');
+
+  w.at('2026-09-30T03:16:54Z').restOver();
+  w.at('2026-09-30T03:16:57Z').send('Done.', 'voice');
+  w.at('2026-09-30T03:17:10Z').send('Done.', 'voice');
+  w.at('2026-09-30T03:17:16Z').send('Six.', 'voice');
+  assert.deepEqual(w.record(0), ['70 lbx8', '70 lbx6', '80 lbx6', '80 lbx6'], 'Hip Thrust did not finish on 80 lb');
+  assert.equal(w.index, 1, 'the workout did not advance to Glute Bridge');
+
+  w.at('2026-09-30T03:17:37Z').restOver();
+  w.at('2026-09-30T03:17:47Z').send('Done.', 'voice');
+  w.at('2026-09-30T03:17:51Z').send('Ten.', 'voice');
+  assert.deepEqual(w.record(1), ['bwx10']);
+
+  w.at('2026-09-30T03:19:23Z').restOver();
+  w.coachLine = 'How many reps did you get?';
+  w.at('2026-09-30T03:22:35Z').send('10 reps');
+  const second = w.at('2026-09-30T03:22:37Z').send('10 reps');
+  const third = w.at('2026-09-30T03:22:39Z').send('10 reps');
+  for (const dup of [second, third]) assert.match(dup.newLines[0], /same message twice/);
+  assert.deepEqual(w.record(1), ['bwx10', 'bwx10'], 'a phantom Glute Bridge set was logged from a double send');
+  assert.equal(w.index, 1, 'the duplicates pushed him onto the next exercise mid-sentence');
+
+  w.at('2026-09-30T03:23:42Z').send('Mm-hmm.', 'voice');
+  assert.equal(w.total(), 6, 'a filler word changed the record');
+  assert.equal(w.holds.weight, null, 'the workout is sitting in a weight hold it cannot leave');
+});
+
+test('1 Oct: a weight stated in the same breath as "start set one" is kept, not thrown away', () => {
+  const w = new Workout(LOWER, '2026-10-01T03:23:00Z');
+  w.resting = true;
+  w.restEndAt = w.now + 60_000;
+
+  const start = w.at('2026-10-01T03:23:10Z').send('Start set one. 95 pounds');
+  assert.deepEqual(start.effects, [{ type: 'remember_weight', weight: 43.1 }, { type: 'start_next_set' }]);
+  assert.equal(w.stated?.weight, 43.1, 'the card must carry the weight they just gave');
+
+  const done = w.at('2026-10-01T03:23:40Z').send('Done 10 reps');
+  assert.equal(w.holds.weight, null, 'it must not ask for a weight it was already given');
+  assert.deepEqual(w.record(0), ['95 lbx10']);
+  assert.ok(!done.newLines.some((line) => /what weight/i.test(line)), 'the weight question must not be asked');
+});
+
+test('1 Oct: a plain "start set two" with no weight still just starts the set', () => {
+  const w = new Workout(LOWER, '2026-10-01T03:23:00Z');
+  w.resting = true;
+  w.restEndAt = w.now + 60_000;
+  assert.deepEqual(w.at('2026-10-01T03:23:05Z').send('Okay. Start set two now.').effects, [{ type: 'start_next_set' }]);
+});
+
+test('1 Oct: "I didn’t do that set" while reps are held never deletes a real set from an earlier exercise', () => {
+  const w = new Workout(LOWER, '2026-10-01T03:20:00Z');
+  w.at('2026-10-01T03:20:05Z').send('60 pounds');
+  w.at('2026-10-01T03:20:10Z').send('Done 8 reps');
+  assert.deepEqual(w.record(0), ['60 lbx8'], 'Hip Thrust set 1 is genuinely logged');
+
+  w.index = 2;
+  w.resting = false;
+  w.at('2026-10-01T03:21:00Z').send('Done 10 reps');
+  assert.ok(w.holds.weight, 'Leg Curl has no weight yet, so the reps are held');
+  assert.match(w.toCoach.join(' '), /NEVER call undo_last_set/);
+
+  const undo = w.at('2026-10-01T03:21:20Z').send("No wait, I didn't do that set. Undo it");
+  assert.ok(!undo.effects.some((e) => e.type === 'undo'), 'it must not undo a set that was never logged');
+  assert.deepEqual(w.record(0), ['60 lbx8'], 'the real Hip Thrust set must survive');
+  assert.equal(w.holds.weight, null, 'the held reps are dropped');
+});
+
+test('1 Oct: while reps are held, the coach is told the app already asked so it cannot ask twice', () => {
+  const w = new Workout(LOWER, '2026-10-01T03:21:00Z');
+  w.index = 2;
+  const held = w.at('2026-10-01T03:21:10Z').send('Done 10 reps');
+  const appLine = held.newLines.find((line) => /what weight was that/i.test(line));
+  assert.ok(appLine, 'the app asks on screen');
+  const note = w.toCoach.join(' ');
+  assert.match(note, /ALREADY asked them for the weight on screen/);
+  assert.match(note, /do not ask again/);
+});
+
+test('1 Oct voice: the first set of a new exercise logs during the transition rest, it is not queried as a repeat', () => {
+  const w = new Workout(LOWER, '2026-10-01T04:43:00Z');
+  w.at('2026-10-01T04:43:05Z').send('Sixty pounds', 'voice');
+  w.at('2026-10-01T04:43:10Z').send('Done twelve reps', 'voice');
+  assert.deepEqual(w.record(0), ['60 lbx12']);
+
+  w.index = 1;
+  w.resting = true;
+  w.restEndAt = Date.parse('2026-10-01T04:44:00Z');
+  const first = w.at('2026-10-01T04:43:40Z').send('Using 60 pounds, done 12 reps.', 'voice');
+  assert.ok(
+    !first.newLines.some((line) => /another set done/i.test(line)),
+    'a complete report on an exercise with nothing logged must not be queried as a repeat',
+  );
+  assert.deepEqual(w.record(1), ['60 lbx12'], 'it logs first time');
+});
+
+test('1 Oct voice: on an exercise that already has a set, a report during rest is still confirmed first', () => {
+  const w = new Workout(LOWER, '2026-10-01T04:43:00Z');
+  w.at('2026-10-01T04:43:05Z').send('Sixty pounds', 'voice');
+  w.at('2026-10-01T04:43:10Z').send('Done twelve reps', 'voice');
+  w.resting = true;
+  w.restEndAt = Date.parse('2026-10-01T04:45:00Z');
+  const again = w.at('2026-10-01T04:44:30Z').send('Done, twelve reps.', 'voice');
+  assert.deepEqual(w.record(0), ['60 lbx12'], 'nothing extra is logged until they confirm');
+  assert.ok(!again.effects.some((e) => e.type === 'log'));
+});
+
+test('1 Oct voice: naming the exercise ends the rest, the way "start set two" does', () => {
+  const w = new Workout(
+    [
+      { name: 'Barbell Curl', sets: 3, repScheme: '8-10', loadScheme: 'light' },
+      { name: 'Overhead Tricep Extension', sets: 3, repScheme: '10-12', loadScheme: 'light' },
+    ],
+    '2026-10-01T04:43:00Z',
+  );
+  w.index = 1;
+  w.resting = true;
+  w.restEndAt = Date.parse('2026-10-01T04:44:00Z');
+
+  for (const line of [
+    'Start Overhead Triceps Extension.',
+    'start overhead tricep extension',
+    "Okay, let's start overhead tricep extension",
+    'Go to overhead tricep extension',
+    'Start the next exercise',
+    'Start the next one',
+  ]) {
+    w.resting = true;
+    w.restEndAt = Date.parse('2026-10-01T04:44:00Z');
+    const r = w.at('2026-10-01T04:43:20Z').send(line, 'voice');
+    assert.deepEqual(r.effects, [{ type: 'start_next_set' }], line);
+  }
+
+  w.resting = true;
+  w.restEndAt = Date.parse('2026-10-01T04:44:00Z');
+  const wrong = w.at('2026-10-01T04:43:25Z').send('Start barbell curl', 'voice');
+  assert.deepEqual(wrong.effects, [], 'naming a DIFFERENT exercise is not a start command for this one');
+
+  w.resting = true;
+  w.restEndAt = Date.parse('2026-10-01T04:44:00Z');
+  const partial = w.at('2026-10-01T04:43:30Z').send("Let's start the tricep extension", 'voice');
+  assert.deepEqual(
+    partial.effects,
+    [],
+    'a partial name is deliberately NOT matched: every word of the exercise must be said, so "curl" cannot pick the wrong curl',
+  );
+});
+
+test('1 Oct voice: complaining about what the coach SAID never rewrites a logged set', () => {
+  const w = new Workout(
+    [{ name: 'Barbell Curl', sets: 3, repScheme: '8-10', loadScheme: 'light' }],
+    '2026-10-01T04:56:00Z',
+  );
+  w.at('2026-10-01T04:56:20Z').send('Done 10 reps.', 'voice');
+  w.at('2026-10-01T04:56:26Z').send('40 pounds.', 'voice');
+  assert.deepEqual(w.record(0), ['40 lbx10']);
+
+  w.at('2026-10-01T04:57:56Z').send('Okay, start set two now.', 'voice');
+  w.at('2026-10-01T04:58:07Z').send("At the end of next set, I'm gonna go to 50 pound.", 'voice');
+  w.at('2026-10-01T04:58:19Z').send('Done eight reps.', 'voice');
+  const afterSetTwo = w.record(0);
+
+  const complaint = w
+    .at('2026-10-01T04:58:38Z')
+    .send('I remember I asked for 40 pounds. You still said 40. Uh, sorry. I remember I asked for 50 pounds. You still said 40.', 'voice');
+
+  assert.ok(
+    !complaint.effects.some((e) => e.type === 'amend'),
+    'a sentence about what was SAID must never amend a saved set',
+  );
+  assert.deepEqual(w.record(0), afterSetTwo, 'the saved sets are untouched by the complaint');
+  assert.equal(w.total(), 2, 'and it logs nothing new');
+});
+
+test('2 Oct voice: "I\'m gonna use 90 pounds for the rest of the sets" moves the card, not just the coach', () => {
+  const w = new Workout(
+    [{ name: 'Incline Dumbbell Press', sets: 3, repScheme: '9-11', loadScheme: 'moderate' }],
+    '2026-10-02T06:55:00Z',
+  );
+  w.at('2026-10-02T06:55:20Z').send('Eleven reps at seventy pounds.', 'voice');
+  w.at('2026-10-02T06:55:26Z').send('Yes.', 'voice');
+  assert.deepEqual(w.record(0), ['70 lbx11']);
+
+  const stated = w.at('2026-10-02T06:56:10Z').send("I'm gonna use 90 pounds for the rest of set.", 'voice');
+  assert.deepEqual(stated.effects, [{ type: 'remember_weight', weight: 40.8 }], 'the app heard nothing and only the coach replied');
+  assert.equal(w.stated?.weight, 40.8, 'the card must read 90 lb the moment they say it');
+  assert.match(describeNextSetLine(w.state()) ?? '', /90 lb/);
+
+  w.at('2026-10-02T06:56:40Z').send('Start set two.', 'voice');
+  w.at('2026-10-02T06:57:10Z').send('Done ten.', 'voice');
+  assert.deepEqual(w.record(0), ['70 lbx11', '90 lbx10'], 'set two saved at the old weight');
+});
+
+test('2 Oct voice: a stated weight carrying trailing words is still only a weight, never a set', () => {
+  const w = new Workout(
+    [{ name: 'Incline Dumbbell Press', sets: 3, repScheme: '9-11', loadScheme: 'moderate' }],
+    '2026-10-02T06:55:00Z',
+  );
+  for (const line of [
+    "I'm gonna use 90 pounds for the rest of the sets.",
+    'Using 90 pounds from here on.',
+    "Let's go with 90 pounds for the next few.",
+    "I'm staying at 90 pounds for the rest of this one.",
+  ]) {
+    const r = w.wait(30).send(line, 'voice');
+    assert.deepEqual(r.effects, [{ type: 'remember_weight', weight: 40.8 }], `"${line}" was not read as a weight`);
+    assert.equal(w.total(), 0, `"${line}" logged a set`);
+  }
+});
+
+test('2 Oct: "use" phrasing about reps or sets is never mistaken for a weight', () => {
+  const w = new Workout(
+    [{ name: 'Incline Dumbbell Press', sets: 3, repScheme: '9-11', loadScheme: 'moderate' }],
+    '2026-10-02T06:55:00Z',
+  );
+  for (const line of ["Let's use 12 reps this time.", "I'm gonna use 4 sets instead."]) {
+    const r = w.wait(30).send(line, 'voice');
+    assert.ok(
+      !r.effects.some((e) => e.type === 'remember_weight'),
+      `"${line}" was read as a weight`,
+    );
+    assert.equal(w.total(), 0);
+  }
+});
+
+const PUSH: EngineExercise[] = [
+  { name: 'Bench Press', sets: 3, repScheme: '8-10', loadScheme: 'moderate' },
+  { name: 'Incline Dumbbell Press', sets: 3, repScheme: '9-11', loadScheme: 'moderate' },
+  { name: 'Overhead Press', sets: 3, repScheme: '8-10', loadScheme: 'moderate' },
+];
+
+test('2 Oct voice: "the weight was not 80, it was 100" corrects the set it names, across a transition', () => {
+  const w = new Workout(PUSH, '2026-10-02T06:40:00Z');
+  w.index = 1;
+  w.wait(5).send('Eleven reps at seventy pounds.', 'voice');
+  w.wait(4).send('Yes.', 'voice');
+  w.wait(60).send('Done ten at ninety.', 'voice');
+  w.wait(4).send('Yes.', 'voice');
+  w.wait(60).send('Set 3, done 11 reps at eighty.', 'voice');
+  w.wait(4).send('Yes.', 'voice');
+  assert.deepEqual(w.record(1), ['70 lbx11', '90 lbx10', '80 lbx11']);
+
+  w.index = 2;
+  const fix = w.wait(10).send('Actually, the weight was not, uh, 80, it was 100.', 'voice');
+  assert.deepEqual(
+    fix.effects.filter((e) => e.type === 'amend'),
+    [{ type: 'amend', exerciseIndex: 1, setIndex: 2, weight: 45.4, reps: 11 }],
+    'the correction did not reach the set it named',
+  );
+  assert.deepEqual(w.record(1), ['70 lbx11', '90 lbx10', '100 lbx11']);
+  assert.equal(w.record(2).length, 0, 'a correction invented a set on the exercise that just started');
+  assert.match(w.toCoach.join(' '), /ALREADY corrected/);
+});
+
+test('2 Oct voice: an unclear correction is held, so the answer amends instead of logging a new set', () => {
+  const w = new Workout(PUSH, '2026-10-02T06:40:00Z');
+  w.index = 1;
+  w.wait(5).send('Eleven reps at eighty pounds.', 'voice');
+  w.wait(4).send('Yes.', 'voice');
+  assert.deepEqual(w.record(1), ['80 lbx11']);
+
+  w.index = 2;
+  const ask = w.wait(10).send('Sorry, the last set was wrong.', 'voice');
+  assert.ok(ask.handled, 'the app let an explicit correction fall through to the coach');
+  assert.match(ask.newLines.join(' '), /What should Incline Dumbbell Press set 1 be\?/, 'the question never reached the screen on voice');
+  assert.match(w.toCoach.join(' '), /waiting on a correction to Incline Dumbbell Press set 1/);
+
+  const reply = w.wait(11).send('It was 100 pounds, 11 reps.', 'voice');
+  assert.deepEqual(
+    reply.effects.filter((e) => e.type === 'log'),
+    [],
+    'the answer to a correction was logged as a brand new set',
+  );
+  assert.deepEqual(
+    reply.effects.filter((e) => e.type === 'amend'),
+    [{ type: 'amend', exerciseIndex: 1, setIndex: 0, weight: 45.4, reps: 11 }],
+  );
+  assert.deepEqual(w.record(1), ['100 lbx11']);
+  assert.equal(w.record(2).length, 0, 'the phantom set landed on Overhead Press');
+  assert.match(w.toCoach.join(' '), /never say you have no tool for it/);
+});
+
+test('2 Oct: a held correction expires rather than swallowing a real set two minutes later', () => {
+  const w = new Workout(PUSH, '2026-10-02T06:40:00Z');
+  w.index = 1;
+  w.wait(5).send('Eleven reps at eighty pounds.', 'voice');
+  w.wait(4).send('Yes.', 'voice');
+  w.wait(10).send('Sorry, the last set was wrong.', 'voice');
+
+  w.wait(200).send('Done ten at eighty.', 'voice');
+  w.wait(4).send('Yes.', 'voice');
+  assert.deepEqual(w.record(1), ['80 lbx11', '80 lbx10'], 'a stale correction hold ate a real set');
+});
+
+test('2 Oct: a real set reported while a correction is held is logged, not swallowed as the answer', () => {
+  const w = new Workout(PUSH, '2026-10-02T06:40:00Z');
+  w.index = 1;
+  w.wait(5).send('Eleven reps at eighty pounds.', 'voice');
+  w.wait(4).send('Yes.', 'voice');
+  w.wait(100).send('Sorry, the last set was wrong.', 'voice');
+
+  w.wait(20).send('Done ten reps at eighty.', 'voice');
+  w.wait(4).send('Yes.', 'voice');
+  assert.deepEqual(w.record(1), ['80 lbx11', '80 lbx10'], 'the correction hold ate a genuine new set');
+});
+
+test('2 Oct voice: a garbled "undo last set" asks before removing anything', () => {
+  const w = new Workout(PUSH, '2026-10-02T06:40:00Z');
+  w.index = 2;
+  w.wait(5).send('Eleven reps at a hundred pounds.', 'voice');
+  w.wait(4).send('Yes.', 'voice');
+
+  const heard = w.wait(20).send('A new last set.', 'voice');
+  assert.ok(!heard.effects.some((e) => e.type === 'undo'), 'a misheard phrase deleted a real set outright');
+  assert.match(
+    heard.newLines.join(' '),
+    /Did you mean undo\?/,
+    'on voice the question only went to the coach, which is free to ignore it',
+  );
+  assert.deepEqual(w.record(2), ['100 lbx11'], 'nothing may be removed before they confirm');
+  assert.match(w.toCoach.join(' '), /Nothing has been removed/);
+
+  const yes = w.wait(5).send('Yes.', 'voice');
+  assert.ok(yes.effects.some((e) => e.type === 'undo'));
+  assert.equal(w.record(2).length, 0);
+  assert.match(w.toCoach.join(' '), /Set 1 of 3 on Overhead Press is open again/);
+});
+
+test('2 Oct voice: declining a garbled undo leaves the set alone', () => {
+  const w = new Workout(PUSH, '2026-10-02T06:40:00Z');
+  w.index = 2;
+  w.wait(5).send('Eleven reps at a hundred pounds.', 'voice');
+  w.wait(4).send('Yes.', 'voice');
+  w.wait(20).send('And do the last set.', 'voice');
+  w.wait(5).send('No.', 'voice');
+  assert.deepEqual(w.record(2), ['100 lbx11']);
+});
+
+test('2 Oct: "I can\'t undo that" is never an undo request', () => {
+  const w = new Workout(PUSH, '2026-10-02T06:40:00Z');
+  w.index = 2;
+  w.wait(5).send('Eleven reps at a hundred pounds.', 'voice');
+  w.wait(4).send('Yes.', 'voice');
+  const r = w.wait(20).send("I can't undo that.", 'voice');
+  assert.ok(!r.effects.some((e) => e.type === 'undo'));
+  assert.deepEqual(w.record(2), ['100 lbx11']);
+});
+
+test('2 Oct: polite and garbled undo requests are told apart from each other and from a refusal', () => {
+  for (const line of [
+    'Uh, the last set, can you undo that?',
+    'Can you undo that?',
+    'Could you delete that last set?',
+    'Take the last set off.',
+  ]) {
+    assert.ok(looksLikeUndoRequest(line), `not read as an undo request: "${line}"`);
+    assert.ok(!looksLikeMisheardUndo(line), `wrongly read as garbled: "${line}"`);
+  }
+  for (const line of [
+    'A new last set.',
+    'And do the last set.',
+    'Undue the last set.',
+    'Until the last set.',
+    'Under the last set.',
+    'Into the last set.',
+  ]) {
+    assert.ok(looksLikeMisheardUndo(line), `not read as a garbled undo: "${line}"`);
+  }
+  for (const line of [
+    "I can't undo that.",
+    'Done 10 reps.',
+    'Start set two.',
+    "I'm staying at 80 until the last set.",
+    'Keep this weight until the last set.',
+  ]) {
+    assert.ok(!looksLikeUndoRequest(line), `wrongly read as an undo request: "${line}"`);
+    assert.ok(!looksLikeMisheardUndo(line), `wrongly read as a garbled undo: "${line}"`);
+  }
+});
+
+const LOWER_DAY: EngineExercise[] = [
+  { name: 'Back Squat', sets: 4, repScheme: '6-8', loadScheme: 'moderate' },
+  { name: 'Romanian Deadlift', sets: 3, repScheme: '8-10', loadScheme: 'moderate' },
+];
+
+test('2 Oct: "that last one was at 100, not 80" corrects to 100, never to 1', () => {
+  const w = new Workout(LOWER_DAY, '2026-10-02T09:35:00Z');
+  w.wait(5).send('Eight reps at eighty pounds.', 'voice');
+  w.wait(4).send('Yes.', 'voice');
+  assert.deepEqual(w.record(0), ['80 lbx8']);
+
+  const fix = w.wait(15).send('That last one was at 100, not 80.', 'voice');
+  assert.deepEqual(
+    fix.effects.filter((e) => e.type === 'amend'),
+    [{ type: 'amend', exerciseIndex: 0, setIndex: 0, weight: 45.4, reps: 8 }],
+    'the pronoun "one" was read as the weight',
+  );
+  assert.deepEqual(w.record(0), ['100 lbx8']);
+
+  w.wait(30).send('Set two, done eight reps.', 'voice');
+  w.wait(4).send('Yes.', 'voice');
+  assert.deepEqual(w.record(0), ['100 lbx8', '100 lbx8'], 'set two carried a bogus weight forward');
+});
+
+test('2 Oct: every "last one" phrasing of a correction lands on the real number', () => {
+  for (const line of [
+    'That last one was at 100, not 80.',
+    'That last one was at a hundred, not eighty.',
+    'The last one was a hundred pounds, not eighty.',
+    'Actually that last one was 100.',
+  ]) {
+    const w = new Workout(LOWER_DAY, '2026-10-02T09:35:00Z');
+    w.wait(5).send('Eight reps at eighty pounds.', 'voice');
+    w.wait(4).send('Yes.', 'voice');
+    w.wait(15).send(line, 'voice');
+    assert.deepEqual(w.record(0), ['100 lbx8'], `"${line}" did not correct to 100 lb`);
+  }
 });

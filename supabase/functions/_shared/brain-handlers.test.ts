@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { looksLikeSameMeal } from './brain-handlers.ts';
+import { looksLikeSameMeal, asksToRemoveASet, describeRemovedSet } from './brain-handlers.ts';
 
 test('a correction with different quantities is recognized as the same meal', () => {
   assert.equal(looksLikeSameMeal('6 egg whites and turkey bacon', '4 egg whites and turkey bacon'), true);
@@ -34,4 +34,39 @@ test('the coach can only remove a set when the user asked for it (Hakeem, 29 Sep
   for (const said of ['undo that', 'remove the last set', 'You logged it twice', "I haven't done set 2 yet", 'take that one off', 'I only did 1 set']) {
     assert.equal(asksToRemoveASet(said), true, said);
   }
+});
+
+test('2 Oct: an undo names the exercise and set it actually removed', () => {
+  const state = {
+    exercises: [
+      { name: 'Incline Dumbbell Press', sets: 3 },
+      { name: 'Overhead Press', sets: 3 },
+    ],
+    loggedSets: [
+      [{ weight: 36.3, reps: 11, at: 1_000 }],
+      [{ weight: 45.4, reps: 11, at: 2_000 }],
+    ],
+  };
+  assert.deepEqual(describeRemovedSet(state), {
+    exerciseName: 'Overhead Press',
+    setNumber: 1,
+    totalSets: 3,
+  });
+});
+
+test('2 Oct: with nothing logged there is no set number to hand the coach', () => {
+  assert.equal(describeRemovedSet({ exercises: [{ name: 'Overhead Press', sets: 3 }], loggedSets: [[]] }), null);
+});
+
+test('2 Oct: a polite undo request still reaches the undo tool', () => {
+  for (const line of [
+    'Uh, the last set, can you undo that?',
+    'Can you undo that?',
+    'Could you delete that last set?',
+    'Take the last set off.',
+  ]) {
+    assert.ok(asksToRemoveASet(line), line);
+  }
+  assert.equal(asksToRemoveASet('Done 10 reps.'), false);
+  assert.equal(asksToRemoveASet('[[SYSTEM_CUE]] session_start'), false);
 });

@@ -199,19 +199,19 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
   // Plan data only carries a load *scheme* ("%1RM", "RPE 8"), never a number, so the collapsed
   // row shows the weight actually lifted this exercise once there is one and falls back to the
   // scheme until then.
-  const lastLoggedWeight = [...(loggedSets[currentExerciseIndex] ?? [])]
-    .reverse()
-    .find((set) => set.weight !== null)?.weight;
+  const lastWeightedSet = [...(loggedSets[currentExerciseIndex] ?? [])].reverse().find((set) => set.weight !== null);
+  const lastLoggedWeight = lastWeightedSet?.weight;
   const statedWeight = session.statedWeight;
-  const statedWeightForCard = statedWeight?.exerciseIndex === currentExerciseIndex ? statedWeight.weight : null;
+  const statedWeightForCard = statedWeight?.exerciseIndex === currentExerciseIndex ? statedWeight : null;
+  const statedWeightIsNewer =
+    statedWeightForCard != null && (lastWeightedSet?.at == null || statedWeightForCard.at > lastWeightedSet.at);
+  const cardWeight = statedWeightIsNewer ? statedWeightForCard!.weight : lastLoggedWeight ?? statedWeightForCard?.weight;
   const currentWeightLabel =
-    lastLoggedWeight != null
-      ? kgToDisplayWeight(lastLoggedWeight, units).toUpperCase()
-      : statedWeightForCard != null
-        ? kgToDisplayWeight(statedWeightForCard, units).toUpperCase()
-        : currentExercise?.loadScheme
-          ? convertLoadScheme(currentExercise.loadScheme, units)
-          : "—";
+    cardWeight != null
+      ? kgToDisplayWeight(cardWeight, units).toUpperCase()
+      : currentExercise?.loadScheme
+        ? convertLoadScheme(currentExercise.loadScheme, units)
+        : "—";
   // A weight the user says out loud before their first set ("80 kg", answering the coach's own
   // question) is not a set report and logs nothing, so it used to be forgotten by the time they
   // said "set one done" — and with no set yet logged on the exercise there was nothing to carry
@@ -221,11 +221,12 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
     statedWeightRef.current = statedWeight;
   }, [statedWeight]);
   const rememberStatedWeight = (weight: number) => {
-    statedWeightRef.current = { exerciseIndex: currentExerciseIndex, weight };
+    statedWeightRef.current = { exerciseIndex: currentExerciseIndex, weight, at: Date.now() };
     session.rememberStatedWeight(currentExerciseIndex, weight);
   };
   const currentIsBodyweight = isBodyweightWork(currentExercise?.name, currentExercise?.loadScheme);
   const holdsRef = useRef<EngineHolds>(NO_HOLDS);
+  const lastTypedRef = useRef<{ text: string; at: number } | null>(null);
   const [awaitingConfirm, setAwaitingConfirm] = useState(false);
   const setHolds = (holds: EngineHolds) => {
     holdsRef.current = holds;
@@ -257,6 +258,7 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
     statedWeight: statedWeightRef.current,
     units,
     lastCoachLine: session.messages.at(-1)?.role === "coach" ? session.messages.at(-1)!.text : null,
+    lastTypedLog: lastTypedRef.current,
     now: Date.now(),
   });
   const { alternatives: switchAlternatives } = usePlanAlternatives(
@@ -862,6 +864,7 @@ export const ActiveSessionScreen = ({ navigation }: Props) => {
       return;
     }
     const result = decideSetInput(text, "typed", engineStateRef.current(), holdsRef.current);
+    if (result.effects.some((e) => e.type === "log")) lastTypedRef.current = { text, at: Date.now() };
     setHolds(result.holds);
     setDraft("");
     if (!result.handled) {

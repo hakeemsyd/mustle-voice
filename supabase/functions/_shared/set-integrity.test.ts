@@ -386,3 +386,23 @@ test('an abandoned workout updates its own record instead of adding a second cop
   assert.ok(db.updates[0].values.last_activity_at);
   assert.equal(db.inserts.filter((i) => i.table === 'workout_log').length, 0);
 });
+
+test('1 Oct: a logged set names how many are left, so the coach cannot call the workout over early', () => {
+  const snap = buildLiveSessionSnapshot({
+    ...shoulders([{ ...coachSet, at: T0 - 120_000 }]),
+    resting: false,
+    restEndAt: null,
+  } as any);
+  const out = resolveTurnSetOutcome({
+    snapshot: snap,
+    units: 'imperial',
+    userText: 'Done, eight reps at 25 pounds.',
+    holdsMissingWeight: true,
+    appliesRestatementRule: true,
+    confirmsBareReps: true,
+    now: T0,
+  });
+  assert.equal(out?.kind, 'logged');
+  assert.match(out!.note, /more set.? still to go/);
+  assert.match(out!.note, /workout is NOT over/);
+});

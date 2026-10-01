@@ -206,10 +206,11 @@ export function FuelScreen() {
                       caloriesAreOver && styles.ringValueAlert,
                     ]}
                   >
-                    {caloriesAreOver ? `+${caloriesOver}` : caloriesRemaining}
+                    {Math.round(caloriesCurrent).toLocaleString()}
                   </Text>
+                  <Text style={styles.ringGoal}>/ {Math.round(caloriesGoal).toLocaleString()} kcal</Text>
                   <Text style={styles.ringLabel}>
-                    {caloriesAreOver ? "CAL OVER" : "CAL LEFT"}
+                    {caloriesAreOver ? `+${caloriesOver} KCAL OVER` : `${caloriesRemaining} KCAL REMAINING`}
                   </Text>
                 </ProgressRing>
               </View>
@@ -228,20 +229,39 @@ export function FuelScreen() {
                 ].map(({ label, macro }) => {
                   const goal = macro?.goal ?? 0;
                   const current = macro?.current ?? 0;
+                  const unit = macro?.unit ?? "g";
+                  const color = macro?.color ?? colors.muted;
                   const over = goal > 0 && current > goal;
+                  const pct = Math.min(1, Math.max(0, current / Math.max(1e-6, goal)));
                   return (
-                    <View key={label} style={styles.statChip}>
-                      <View
-                        style={[
-                          styles.statDot,
-                          { backgroundColor: macro?.color ?? colors.muted },
-                        ]}
-                      />
-                      <Text style={[styles.statValue, over && styles.ringValueAlert]}>
-                        {over ? `+${Math.round(current - goal)}` : Math.max(0, Math.round(goal - current))}
-                        {macro?.unit ?? "g"}
+                    <View key={label} style={styles.macroRow}>
+                      <View style={styles.macroTop}>
+                        <View style={[styles.statDot, { backgroundColor: color }]} />
+                        <Text style={styles.macroLabel}>{label}</Text>
+                        <View style={styles.macroValues}>
+                          <Text style={[styles.macroCurrent, over && styles.ringValueAlert]}>
+                            {Math.round(current).toLocaleString()}
+                          </Text>
+                          <Text style={styles.macroSep}>/</Text>
+                          <Text style={styles.macroGoal}>
+                            {Math.round(goal).toLocaleString()}
+                            {unit}
+                          </Text>
+                        </View>
+                      </View>
+                      <View style={styles.macroBar}>
+                        <View
+                          style={[
+                            styles.macroFill,
+                            { width: `${pct * 100}%`, backgroundColor: over ? colors.danger : color },
+                          ]}
+                        />
+                      </View>
+                      <Text style={styles.macroRemaining}>
+                        {over
+                          ? `${Math.round(current - goal).toLocaleString()}${unit} over`
+                          : `${Math.round(goal - current).toLocaleString()}${unit} remaining`}
                       </Text>
-                      <Text style={styles.statLabel}>{over ? `${label} over` : label}</Text>
                     </View>
                   );
                 })}
@@ -280,7 +300,7 @@ export function FuelScreen() {
           ) : (
             <View style={styles.logList}>
               {loggedEntries.map((entry) => {
-                const badge = MEAL_BADGE[inferMealBucket(entry.at)];
+                const badge = MEAL_BADGE[entry.mealType ?? inferMealBucket(entry.at)];
                 const MealIcon = getMealIcon(entry.description);
                 return (
                   <Pressable
@@ -447,10 +467,16 @@ const styles = StyleSheet.create({
   ringWrap: { alignItems: "center" },
   ringValue: { fontFamily: fonts.display, fontSize: 34, color: colors.text },
   ringValueAlert: { color: colors.danger },
-  ringLabel: {
+  ringGoal: {
     fontFamily: fonts.body,
     fontSize: 11,
-    letterSpacing: 0.6,
+    color: "rgba(255,255,255,0.35)",
+    marginTop: 1,
+  },
+  ringLabel: {
+    fontFamily: fonts.body,
+    fontSize: 9.5,
+    letterSpacing: 0.4,
     color: colors.muted,
     marginTop: 2,
   },
@@ -461,11 +487,18 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
 
-  statsRow: { flexDirection: "row", gap: 20, justifyContent: "center" },
-  statChip: { alignItems: "center", gap: 2 },
-  statDot: { width: 6, height: 6, borderRadius: 3, marginBottom: 2 },
-  statValue: { fontFamily: fonts.display, fontSize: 16, color: colors.text },
-  statLabel: { fontFamily: fonts.body, fontSize: 10, color: colors.muted },
+  statsRow: { flexDirection: "column", gap: 14, width: "100%" },
+  statDot: { width: 7, height: 7, borderRadius: 3.5 },
+  macroRow: { flexDirection: "column", gap: 6 },
+  macroTop: { flexDirection: "row", alignItems: "center", gap: 7 },
+  macroLabel: { fontFamily: fonts.body, fontSize: 13, fontWeight: "500", color: "rgba(255,255,255,0.7)", flex: 1 },
+  macroValues: { flexDirection: "row", alignItems: "baseline", gap: 2 },
+  macroCurrent: { fontFamily: fonts.display, fontSize: 19, letterSpacing: 0.4, color: colors.text },
+  macroSep: { fontFamily: fonts.body, fontSize: 11, color: "rgba(255,255,255,0.22)" },
+  macroGoal: { fontFamily: fonts.body, fontSize: 12, fontWeight: "500", color: "rgba(255,255,255,0.35)" },
+  macroBar: { height: 4, borderRadius: 2, backgroundColor: "rgba(255,255,255,0.07)", overflow: "hidden" },
+  macroFill: { height: "100%", borderRadius: 2 },
+  macroRemaining: { fontFamily: fonts.body, fontSize: 10.5, letterSpacing: 0.2, color: "rgba(255,255,255,0.28)" },
 
   emptyRingWrap: { alignItems: "center", gap: 14, paddingVertical: 8 },
   emptyRingText: {

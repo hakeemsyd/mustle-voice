@@ -226,12 +226,18 @@ export const BRAIN_TOOLS = [
       'required, just estimate). Confirmed live: calling this with the macro fields omitted silently ' +
       'saves a meal with zero nutrition value, which the Fuel screen and Home\'s macro totals then ' +
       'both read as truly zero — never leave them blank to avoid guessing. ' +
-      'ASK AT MOST ONE ROUND OF QUESTIONS before calling this, and only when the food itself is ' +
-      'unidentifiable. Portion size, cooking method, brand and sides are things you estimate, not ' +
-      'things you ask about: a typical serving is always a good enough answer, and the user can ' +
-      'correct it afterwards with update_food. Confirmed live: a second round of clarifying ' +
-      'questions after the user had already answered one made logging a single meal feel like an ' +
-      'interrogation. If you have already asked once, estimate and log.',
+      'DEFAULT TO ASKING NOTHING. If you can name the food, you can estimate it: go straight to the ' +
+      'preview. Portion size, cooking method, brand and sides are things you estimate, not things ' +
+      'you ask about — a typical serving is always a good enough answer, and the user can correct it ' +
+      'afterwards with update_food. Never fish for additional items they did not mention ("was that ' +
+      'everything?", "anything to drink with it?", "what else was it?"): log exactly what they said, ' +
+      'and if they ate more they will tell you. Confirmed live: "I also had a banana" was met with ' +
+      '"what else was it?" and then a second question after they answered, which turned logging one ' +
+      'banana into an interrogation. The ONLY case for a question is a food you genuinely cannot ' +
+      'identify at all, and then you get exactly one. ' +
+      'If the user explicitly tells you to log it ("log it", "just log it", "that\'s all", "nothing ' +
+      'else"), ask NOTHING under any circumstances — estimate and preview immediately, even if you ' +
+      'already had a question in mind.',
     input_schema: {
       type: 'object',
       properties: {
@@ -253,6 +259,15 @@ export const BRAIN_TOOLS = [
           description: 'Grams, your best realistic estimate — never omit even for a vaguely-described meal.',
         },
         modality: { type: 'string', enum: ['voice', 'text', 'image', 'file', 'live_photo'] },
+        meal_type: {
+          type: 'string',
+          enum: ['breakfast', 'lunch', 'dinner', 'snack'],
+          description:
+            'ONLY when the user said which meal it was ("for breakfast", "my lunch", "a snack"). ' +
+            'Leave it out entirely if they did not say — the app then labels it from the clock. ' +
+            'Never infer it from the time yourself: a night-shift user calling something breakfast ' +
+            'at 9pm is describing their meal, not the hour.',
+        },
         confirmed_new_meal: {
           type: 'boolean',
           description:
@@ -294,6 +309,11 @@ export const BRAIN_TOOLS = [
         protein_g: { type: 'number' },
         carbs_g: { type: 'number' },
         fat_g: { type: 'number' },
+        meal_type: {
+          type: 'string',
+          enum: ['breakfast', 'lunch', 'dinner', 'snack'],
+          description: 'Only when they are correcting which meal it was ("that was my lunch, not dinner").',
+        },
         confirm: {
           type: 'boolean',
           description:
@@ -944,3 +964,30 @@ const VOICE_DAY_WORKOUT_DESCRIPTION =
 export const VOICE_TOOLS = BRAIN_TOOLS.filter((tool) => tool.name === 'show_daily_workout' || !CARD_ONLY_TOOLS.has(tool.name)).map(
   (tool) => (tool.name === 'show_daily_workout' ? { ...tool, description: VOICE_DAY_WORKOUT_DESCRIPTION } : tool),
 );
+
+export const LIVE_SESSION_TOOLS: ReadonlySet<string> = new Set([
+  'swap_exercise',
+  'skip_exercise',
+  'go_to_exercise',
+  'add_set',
+  'undo_last_set',
+  'end_workout',
+  'discard_workout',
+  'adjust_rest_timer',
+]);
+
+export const NO_SESSION_TOOLS: ReadonlySet<string> = new Set([
+  'generate_training_plan',
+  'generate_nutrition_targets',
+  'estimate_body_fat_goal',
+  'update_plan_start_date',
+  'note_consultation_covered',
+  'start_todays_workout',
+  'open_todays_workout',
+  'resolve_interrupted_workout',
+  'log_workout',
+  'reschedule_today',
+]);
+
+export const toolsForMode = <T extends { name: string }>(tools: readonly T[], mode: 'live' | 'default'): T[] =>
+  tools.filter((tool) => (mode === 'live' ? !NO_SESSION_TOOLS.has(tool.name) : !LIVE_SESSION_TOOLS.has(tool.name)));

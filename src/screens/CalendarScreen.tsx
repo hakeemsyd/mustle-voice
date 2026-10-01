@@ -163,6 +163,7 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
             <View style={styles.todayWrap}>
               {(() => {
                 const completed = today.completedWorkout;
+                const stillDue = !today.isRestDay && !!today.session;
                 const isUpcoming = !completed && !!today.planStartsOn;
                 const noPlan = !today.hasPlan && !completed;
                 // "Rest day" and "already trained today" are both `!today.session`, but they are
@@ -171,7 +172,9 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                 // priority: a pinned-weekday plan still reports its session as due even once
                 // it's done, and a done session should never look identical to "not started."
                 const heroActive = !noPlan && (!!completed || isUpcoming || !today.isRestDay);
-                const heroLabel = completed
+                const heroLabel = stillDue
+                  ? titleCase(today.session!.focus)
+                  : completed
                   ? completed.focus
                     ? titleCase(completed.focus)
                     : "Workout Complete"
@@ -195,7 +198,9 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                               : `${new Date().toLocaleDateString("en-US", { weekday: "long" })} · Today`}
                         </Text>
                         <View style={[styles.todayIconBadge, heroActive && styles.todayIconBadgeActive]}>
-                          {completed ? (
+                          {stillDue ? (
+                            <DumbbellIcon size={18} color={colors.accent} />
+                          ) : completed ? (
                             <CheckCircleIcon size={18} color={colors.accent} />
                           ) : isUpcoming ? (
                             <CalendarIcon size={18} color={colors.accent} />
@@ -214,7 +219,7 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                         ).toLocaleDateString("en-US", { month: "long", day: "numeric" })}
                       </Text>
 
-                      {!today.isRestDay && !completed && !isUpcoming && (
+                      {stillDue && !isUpcoming && (
                         <View style={[styles.todayStatsRow, styles.todayStatsRowActive]}>
                           <View style={styles.todayStat}>
                             <Text style={[styles.todayStatValue, styles.todayStatValueActive]}>
@@ -256,7 +261,7 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                       </View>
                     )}
 
-                    {completed ? (
+                    {completed && !stillDue ? (
                       <Pressable
                         style={styles.startBtn}
                         onPress={() => navigation.navigate("SessionReport", { workoutLogId: completed.workoutLogId })}
@@ -326,6 +331,15 @@ export const CalendarScreen = ({ route, navigation }: Props) => {
                           <PlayIcon size={14} color={colors.accentOn} />
                           <Text style={styles.todayStartBtnText}>Start Session</Text>
                         </Pressable>
+                        {completed && (
+                          <Pressable
+                            style={styles.startBtn}
+                            onPress={() => navigation.navigate("SessionReport", { workoutLogId: completed.workoutLogId })}
+                          >
+                            <ChevronRightIcon size={13} color={colors.accentOn} />
+                            <Text style={styles.startBtnText}>View Session Summary</Text>
+                          </Pressable>
+                        )}
                       </>
                     )}
                   </>

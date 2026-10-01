@@ -4,7 +4,7 @@ import { APP_LINE_MODALITY, replayHistory } from '../_shared/replay-history.ts';
 import { dropLeadingConcession, dropSelfCorrection } from '../_shared/humanize.ts';
 import {
   buildStaticSystemPrompt,
-  createCallModel,
+  createModeCallModels,
   MODEL as BRAIN_MODEL,
   MESSAGE_HISTORY_LIMIT,
 } from '../_shared/brain-config.ts';
@@ -15,6 +15,7 @@ import {
   startOfLocalDayUtc,
 } from '../_shared/brain-context.ts';
 import { describeEarlierInConversation, loadConversationHistory } from '../_shared/conversation-history.ts';
+import { FOOD_TURN_NOTE, looksLikeFoodTurn, offTopicTurnNote } from '../_shared/food-intent.ts';
 import {
   amendSetFromServer,
   createHandlers,
@@ -25,7 +26,13 @@ import {
 } from '../_shared/brain-handlers.ts';
 import { describeDisputeOutcome, detectSetCountDispute } from '../_shared/set-dispute.ts';
 import { VOICE_TOOLS } from '../_shared/brain-tools.ts';
-import { buildLiveSessionSnapshot, describeLiveSessionSnapshot, LIVE_STATE_MAX_AGE_MS } from '../_shared/live-session-format.ts';
+import {
+  buildLiveSessionSnapshot,
+  describeLiveSessionSnapshot,
+  LIVE_STATE_MAX_AGE_MS,
+  NO_LIVE_SESSION_NOTE,
+  resolveTurnMode,
+} from '../_shared/live-session-format.ts';
 import { resolveTurnText } from '../_shared/system-cue.ts';
 import { verbalizeUnitsForSpeech } from '../_shared/verbalize-for-speech.ts';
 import { stripSystemNote, createSystemNoteFilter } from '../_shared/strip-system-note.ts';
@@ -72,7 +79,7 @@ import {
 
 const SETS_REST_LENGTH_FROM_VERSION = 5;
 
-const callModel = createCallModel(VOICE_TOOLS);
+const VOICE_CALL_MODELS = createModeCallModels(VOICE_TOOLS);
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SUPABASE_SECRET_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -209,7 +216,7 @@ const prepareTurn = async (userId: string, userText: string, timezone: string | 
   }
   const liveSnapshot = isLiveStateFresh ? buildLiveSessionSnapshot(liveRow!.state) : null;
   const units = profileRow?.unit_prefs === 'imperial' ? 'imperial' : 'metric';
-  const liveBlock = liveSnapshot ? describeLiveSessionSnapshot(liveSnapshot, units) : null;
+  const liveBlock = liveSnapshot ? describeLiveSessionSnapshot(liveSnapshot, units) : NO_LIVE_SESSION_NOTE;
 
   const lastCoachRow = (history ?? []).find(
     (m: any) => m.role === 'assistant' && !m.greeting_key && m.modality !== APP_LINE_MODALITY,
@@ -264,10 +271,18 @@ const prepareTurn = async (userId: string, userText: string, timezone: string | 
   const requiredAsk = dispute ? null : setOutcome?.requiredAsk ?? null;
   const resumeNote = isSessionStart ? describeResumedStart(liveSnapshot, units) : null;
   const cueFacts = describeCueFacts(cueName, liveSnapshot, units);
+  const offTopic =
+    !dispute && !restLengthNote && !setOutcome && cueName === null
+      ? liveStrength
+        ? offTopicTurnNote(looksLikeFoodTurn(userText))
+        : looksLikeFoodTurn(userText)
+          ? FOOD_TURN_NOTE
+          : null
+      : null;
   const turnNote =
     dispute && disputeResolution
       ? describeDisputeOutcome(dispute, disputeResolution, TURN_NOTE_HEADER, liveSnapshot ? liveSnapshot.status === 'resting' : null)
-      : restLengthNote ?? setOutcome?.note;
+      : (restLengthNote ?? setOutcome?.note ?? offTopic);
   const contextParts = [contextBlock, describeEarlierInConversation(earlier), liveBlock, turnNote, resumeNote, cueFacts].filter(Boolean);
   const fullContextBlock = contextParts.join('\n\n');
 
@@ -334,8 +349,9 @@ const prepareTurn = async (userId: string, userText: string, timezone: string | 
   // later call of the same day. isFirstTurnOfCall instead comes from ElevenLabs' own growing
   // transcript for *this* call (see Deno.serve below), so a brand new call greets regardless of
   // how much history exists, and a mid-call turn never re-greets.
+  const turnMode = resolveTurnMode(liveBlock);
   const systemPrompt = {
-    static: buildStaticSystemPrompt(!isFirstTurnOfCall, 'voice'),
+    static: buildStaticSystemPrompt(!isFirstTurnOfCall, 'voice', false, turnMode),
     dynamic: fullContextBlock,
   };
   console.log(`[voice-timing:server] prepareTurn: done, +${Date.now() - tPrepare0}ms total`);
@@ -346,7 +362,7 @@ const prepareTurn = async (userId: string, userText: string, timezone: string | 
     );
   }
 
-  return { supabase, handlers, turnMessages, systemPrompt, askedAt, guardState, fallbackReply, requiredAsk, requiredMention };
+  return { supabase, handlers, turnMessages, systemPrompt, turnMode, askedAt, guardState, fallbackReply, requiredAsk, requiredMention };
 };
 
 const guardReply = (reply: string, state: ClaimGuardState, fallback: string): string => {
@@ -575,14 +591,14 @@ const resolveReplyBuffered = async (
   // TEMPORARY — voice-timing instrumentation. Remove once the slow phase is identified.
   const tTurn0 = Date.now();
   try {
-    const { supabase, handlers, turnMessages, systemPrompt, askedAt, guardState, fallbackReply } = await prepareTurn(
+    const { supabase, handlers, turnMessages, systemPrompt, turnMode, askedAt, guardState, fallbackReply } = await prepareTurn(
       userId,
       userText,
       timezone,
       isFirstTurnOfCall,
     );
     console.log(`[voice-timing:server] runBrainTurn: starting, +${Date.now() - tTurn0}ms since resolveReplyBuffered began`);
-    const result = await runBrainTurn({ systemPrompt, messages: turnMessages, handlers, callModel });
+    const result = await runBrainTurn({ systemPrompt, messages: turnMessages, handlers, callModel: VOICE_CALL_MODELS[turnMode] });
     console.log(`[voice-timing:server] runBrainTurn: done, +${Date.now() - tTurn0}ms total, ${result.toolCalls.length} tool call(s): ${result.toolCalls.map((t) => t.name).join(',')}`);
     const reply = guardReply(result.reply, guardState(), fallbackReply);
     const turnBlocks = withGuardedFinalText(result.messages.slice(turnMessages.length), reply);
@@ -801,6 +817,7 @@ Deno.serve(async (req) => {
               handlers,
               turnMessages,
               systemPrompt,
+              turnMode,
               askedAt,
               guardState,
               fallbackReply,
@@ -812,7 +829,7 @@ Deno.serve(async (req) => {
               systemPrompt,
               messages: turnMessages,
               handlers,
-              callModel,
+              callModel: VOICE_CALL_MODELS[turnMode],
               onTextDelta: (delta) => {
                 pending += delta;
                 emitChunk(takeFlushable(false));

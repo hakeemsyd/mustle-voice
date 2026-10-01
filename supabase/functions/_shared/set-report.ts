@@ -33,6 +33,7 @@ export interface SpokenSetContext {
   resting?: boolean;
   version?: number;
   confirmed?: boolean;
+  exerciseHasLoggedSets?: boolean;
 }
 
 export const SET_PARSER_VERSION = 7;
@@ -231,8 +232,8 @@ export const parseSetReport = (
   units: SetReportUnits = 'metric',
   options: ParseSetOptions = {},
 ): ParsedSet | null => {
-  const normalized = normalizeSpokenNumbers(straightenQuotes(raw));
   const strict = isStrict(options.version);
+  const normalized = normalizeSpokenNumbers(strict ? straightenQuotes(raw).replace(PRONOUN_ONE, ' ') : straightenQuotes(raw));
 
   if (options.timedExercise) {
     const durationMatch = normalized.match(
@@ -321,6 +322,34 @@ export const parseStatedWeight = (raw: string, units: SetReportUnits = 'metric',
   if (parseSetReport(raw, units, { version }) !== null) return null;
   const match = normalizeSpokenNumbers(straightenQuotes(raw)).trim().match(STATED_WEIGHT_PATTERN);
   if (!match) return null;
+  const weight = toKg(Number(match[1]), match[2] ?? null, units);
+  return weight > 0 ? weight : null;
+};
+
+export const SPEECH_REFERENCE =
+  /\b(?:i\s+(?:remember|already)\s+(?:said|asked|told)|i\s+(?:asked|told)\s+(?:you\s+)?for|you\s+(?:said|told\s+me|heard|put|had)|i\s+remember\s+i|asked\s+for)\b/i;
+
+const WEIGHT_CHANGE_VERB =
+  /\b(?:go(?:ing)?|gonna\s+go|move|moving|switch(?:ing)?|bump(?:ing)?|jump(?:ing)?|take|taking|push(?:ing)?|drop(?:ping)?|come|coming|step(?:ping)?)\s+(?:it\s+|up\s+|down\s+|back\s+){0,2}(?:to|at|with)\s+|\b(?:use|using|stay(?:ing)?\s+(?:at|on)|stick(?:ing)?\s+(?:to|with|at))\s+(?:it\s+|up\s+|down\s+|back\s+){0,2}(?:to\s+|at\s+|with\s+)?|\b(?:make|set|put|load|change)\s+(?:it|the\s+weight|the\s+load|that)?\s*(?:to|at|on)?\s*|\bi\s+(?:asked|told\s+you)\s+for\s+|\bup\s+it\s+to\s+|\bi\s+want\s+(?:it\s+)?(?:to\s+be\s+|at\s+)?/i;
+
+const REPS_OR_SETS_AFTER = /^\s*(?:reps?|sets?|times|seconds?|secs?|minutes?|mins?|%|percent)\b/i;
+
+export const parseWeightChangeRequest = (
+  raw: string,
+  units: SetReportUnits = 'metric',
+  version?: number,
+  options?: { ignoreSetReport?: boolean },
+): number | null => {
+  const text = normalizeSpokenNumbers(straightenQuotes(raw).replace(PRONOUN_ONE, ' '));
+  if (COMPLETION.test(withoutNegatedCompletion(text))) return null;
+  if (!options?.ignoreSetReport && parseSetReport(text, units, { version }) !== null) return null;
+  const verb = WEIGHT_CHANGE_VERB.exec(text);
+  if (!verb) return null;
+  const rest = text.slice(verb.index + verb[0].length);
+  const match = rest.match(/^\s*(\d+(?:\.\d+)?)\s*(kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?)?/i);
+  if (!match) return null;
+  if (!match[2] && REPS_OR_SETS_AFTER.test(rest.slice(match[0].length))) return null;
+  if (!match[2] && /\bset\s*$/i.test(text.slice(0, verb.index + verb[0].length))) return null;
   const weight = toKg(Number(match[1]), match[2] ?? null, units);
   return weight > 0 ? weight : null;
 };
@@ -506,6 +535,12 @@ export const classifySpokenSet = (
   const intended =
     !completed && ((legacy ? LEGACY_FUTURE_INTENT : FUTURE_INTENT).test(text) || (strict && STRICT_FUTURE_INTENT.test(text)));
   if (strict && !completed && PAST_CONTEXT.test(text)) return { kind: 'ignore' };
+  if (strict && !completed && !reported) {
+    const aboutSpeech = SPEECH_REFERENCE.test(text);
+    const change = parseWeightChangeRequest(text, units, context.version, { ignoreSetReport: aboutSpeech });
+    if (change != null) return { kind: 'stated_weight', weight: change };
+    if (aboutSpeech) return { kind: 'ignore' };
+  }
   const asked = !legacy && text.endsWith('?');
 
   const parsed = parseSetReport(text, units, {
@@ -515,7 +550,12 @@ export const classifySpokenSet = (
     version: context.version,
   });
 
-  const holdsDuringRest = !!context.confirmsBareReps && !!context.resting && !context.typed && !context.awaitingDetails;
+  const holdsDuringRest =
+    !!context.confirmsBareReps &&
+    !!context.resting &&
+    !context.typed &&
+    !context.awaitingDetails &&
+    context.exerciseHasLoggedSets !== false;
   const logOrHold = (set: ParsedSet): SpokenSetIntent =>
     holdsDuringRest ? { kind: 'unconfirmed', set } : { kind: 'log', set };
 
@@ -584,18 +624,45 @@ export const describesPlannedSet = (text: string): boolean => {
   return !COMPLETION.test(withoutNegatedCompletion(raw)) && FUTURE_INTENT.test(raw) && extractReportedSet(raw, 'metric') === null;
 };
 
+const SET_NUMBER_WORD = /(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)/.source;
+
 const START_SET_PATTERNS = [
-  /^(?:ok(?:ay)?|alright|right|yeah|yep)?\s*,?\s*(?:let'?s\s+)?(?:go|start|begin|do|move)(?:ing)?\s*(?:on\s+)?(?:to\s+)?(?:the\s+)?(?:next\s+)?(?:set)?\s*(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)?\s*$/,
-  /^(?:i'?m\s+)?(?:ready|done)(?:\s+(?:for|with)\s+(?:the\s+)?(?:next\s+)?(?:set|rest)\s*(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)?)?\s*$/,
-  /^(?:next\s+set|set\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten))\s*$/,
-  /^(?:skip|end|stop)\s+(?:the\s+)?rest\s*$/,
-  /^rest\s+(?:is\s+)?(?:done|over|finished)\s*$/,
+  new RegExp(
+    `^(?:let'?s\\s+)?(?:go|start|begin|do|move)(?:ing)?\\s*(?:on\\s+)?(?:to\\s+)?(?:the\\s+)?(?:next\\s+)?(?:set)?\\s*(?:${SET_NUMBER_WORD})?$`,
+  ),
+  new RegExp(`^(?:i'?m\\s+)?(?:ready|done)(?:\\s+(?:for|with)\\s+(?:the\\s+)?(?:next\\s+)?(?:set|rest)\\s*(?:${SET_NUMBER_WORD})?)?$`),
+  new RegExp(`^(?:next\\s+set|set\\s+(?:${SET_NUMBER_WORD}))$`),
+  /^(?:skip|end|stop|cut|kill)\s+(?:the\s+)?rest$/,
+  /^rest\s+(?:is\s+)?(?:done|over|finished)$/,
 ];
 
+const START_SET_LEAD = /^(?:(?:ok(?:ay)?|alright|all\s+right|right|yeah|yep|yes|so|and|hey|cool|good|great|well|um+|uh+)\b[\s.,!?]*)+/;
+
+const START_SET_TAIL = /[\s.,!?]*\b(?:now|please|already|then|too|man|bro|coach|go\s+ahead|i\s+guess|ok(?:ay)?|alright|yeah|yep)\b[\s.,!?]*$/;
+
+const stripStartSetTail = (text: string): string => {
+  let out = text;
+  for (let i = 0; i < 3; i++) {
+    const trimmed = out.replace(START_SET_TAIL, '').trim();
+    if (trimmed === out) break;
+    out = trimmed;
+  }
+  return out.replace(/[.!?,]+$/g, '').trim();
+};
+
+const READY_OR_DONE_PATTERN = 1;
+
 export const looksLikeStartSetCommand = (raw: string): boolean => {
-  const normalized = straightenQuotes(raw).trim().toLowerCase().replace(/[.!?,]+$/g, '');
+  const normalized = straightenQuotes(raw).trim().toLowerCase().replace(/[.!?,]+$/g, '').trim();
   if (!normalized) return false;
-  return START_SET_PATTERNS.some((pattern) => pattern.test(normalized));
+  const matches = (text: string, skipReadyOrDone: boolean): boolean =>
+    START_SET_PATTERNS.some((pattern, i) => (skipReadyOrDone && i === READY_OR_DONE_PATTERN ? false : pattern.test(text)));
+  if (matches(normalized, false)) return true;
+  const tailless = stripStartSetTail(normalized);
+  if (tailless && tailless !== normalized && matches(tailless, false)) return true;
+  const stripped = stripStartSetTail(normalized.replace(START_SET_LEAD, '').trim());
+  if (!stripped || stripped === normalized) return false;
+  return matches(stripped, true);
 };
 
 export const AFFIRMATION = /\b(yes|yeah|yep|yup|correct|that['\u2019]?s right|right|confirm(?:ed)?|i did|sure|affirmative)\b/i;
@@ -651,11 +718,16 @@ export const plannedWeightKg = (scheme: string | null | undefined): number | nul
   return parseLoadSchemeKg(scheme);
 };
 
-export const resolveReportedWeight = (
-  set: ParsedSet,
-  known: { lastLogged: number | null; stated: number | null; planned: number | null },
-): number | null => {
+export interface KnownWeights {
+  lastLogged: number | null;
+  stated: number | null;
+  planned: number | null;
+  statedIsNewer?: boolean;
+}
+
+export const resolveReportedWeight = (set: ParsedSet, known: KnownWeights): number | null => {
   if (set.unit === 'seconds' || set.weight !== null) return set.weight;
+  if (known.statedIsNewer && known.stated !== null) return known.stated;
   return known.lastLogged ?? known.stated ?? known.planned ?? null;
 };
 
@@ -689,7 +761,7 @@ const CORRECTION_SUBJECT = /\b(?:set|weight|reps?|lbs?|pounds?|kgs?|kilos?|logge
 
 const SET_REFERENCE = /\bsets?\s*#?\s*\d+\b|\b(?:first|second|third|fourth|fifth|\d+(?:st|nd|rd|th))\s+set\b/i;
 
-const CORRECTION_NUMBER = /(?<![\d.])(\d+(?:\.\d+)?)(?![\d.])\s*(kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?|reps?)?/gi;
+const CORRECTION_NUMBER = /(?<![\d.])(\d+(?:\.\d+)?)(?![\d.]\d)\s*(kilogrammes?|kilograms?|kgs?|kilos?|pounds?|lbs?|reps?)?/gi;
 
 const WRONG_MARKER = /\b(?:not|instead\s+of)\b/i;
 
@@ -712,9 +784,10 @@ export const detectSetCorrection = (
   options: { resting?: boolean } = {},
 ): SetCorrection | null => {
   if (!last || !isStrict(version) || last.unit === 'seconds') return null;
-  const text = normalizeSpokenNumbers(straightenQuotes(raw)).trim();
+  const text = normalizeSpokenNumbers(straightenQuotes(raw).replace(PRONOUN_ONE, ' ')).trim();
   if (!hasCorrectionCue(text, !!options.resting)) return null;
   if (NOT_ABOUT_A_SET.test(text)) return null;
+  if (SPEECH_REFERENCE.test(text)) return null;
   if (SET_REFERENCE.test(text) || NEGATED_COMPLETION.test(text)) {
     NEGATED_COMPLETION.lastIndex = 0;
     return null;
@@ -795,7 +868,34 @@ export const looksLikeRestQuery = (raw: string): boolean => REST_QUERY.test(stra
 const UNDO_REQUEST =
   /^(?:please\s+)?(?:undo|remove|delete|scratch|cancel|take\s+(?:off|out))(?:\s+(?:that|the\s+last|last|my\s+last|this|the\s+previous))?(?:\s+(?:set|one|entry|log))?(?:\s+please)?[\s.!]*$/i;
 
-export const looksLikeUndoRequest = (raw: string): boolean => UNDO_REQUEST.test(straightenQuotes(raw).trim());
+const UNDO_LEAD =
+  /^(?:(?:no|nope|wait|hang\s+on|hold\s+on|actually|sorry|oops|scratch\s+that|my\s+bad|uh|um|er|erm|okay|ok|hey|so)\b[\s.,!?]*)+/i;
+
+const UNDO_NEGATED =
+  /\b(?:can'?t|cannot|could\s*n'?t|do\s*n'?t|does\s*n'?t|did\s*n'?t|wo\s*n'?t|would\s*n'?t|never|unable\s+to|no\s+way\s+to)\s+(?:\w+\s+){0,2}(?:undo|remove|delete|scratch|cancel)\b/i;
+
+const UNDO_PHRASE =
+  /\b(?:undo|scratch)\s+(?:that|it|this|the\s+last|last|my\s+last|the\s+previous)(?:\s+(?:set|one|entry|log))?\b|\b(?:remove|delete|cancel)\s+(?:that|the\s+last|my\s+last|the\s+previous|last)\s*(?:set|one|entry|log)?\b|\btake\s+(?:that|the\s+last|my\s+last|last)\s*(?:set|one|entry)?\s+off\b|\b(?:undo|scratch|delete|remove)\s+(?:set\s*#?\s*\d+|the\s+\w+\s+set)\b/i;
+
+const MISHEARD_UNDO =
+  /^(?:a\s+new|and\s+do|undue|un\s+do|and\s+to|a\s+do|hand\s+do|i\s+knew|until|till|til|under|unto|into|in\s+to|and\s+you)\s+(?:the\s+|my\s+|that\s+)?last\s+(?:set|one)\b[\s.,!?]*$/i;
+
+export const looksLikeMisheardUndo = (raw: string): boolean =>
+  MISHEARD_UNDO.test(straightenQuotes(raw).trim().replace(UNDO_LEAD, '').trim());
+
+const DID_NOT_DO_SET =
+  /\b(?:i\s+(?:did\s*n[o']?t|didnt|never)\s+(?:actually\s+)?(?:do|finish|complete)\s+(?:that|this|the\s+last|it))\b/i;
+
+export const looksLikeUndoRequest = (raw: string): boolean => {
+  const text = straightenQuotes(raw).trim();
+  if (!text) return false;
+  if (UNDO_NEGATED.test(text)) return false;
+  if (UNDO_REQUEST.test(text)) return true;
+  if (DID_NOT_DO_SET.test(text)) return true;
+  if (UNDO_PHRASE.test(text)) return true;
+  const clauses = text.split(/[.;!?]+/).map((part) => part.trim()).filter(Boolean);
+  return clauses.some((clause) => UNDO_REQUEST.test(clause.replace(UNDO_LEAD, '').trim()));
+};
 
 export const REST_WORD = /\b(?:rest|rests|resting\s+time|rest\s+time|rest\s+period|timer|break)\b/i;
 const REST_CHANGE_BY = /\b(?:extend|add|more|another|extra|longer|shorter|less|by|skip|pause|resume|stop|end)\b/i;

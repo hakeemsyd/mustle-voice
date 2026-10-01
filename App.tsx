@@ -89,6 +89,8 @@ const App = () => {
     (async () => {
       const { data } = await supabase.auth.getSession();
       if (cancelled || !data.session) return;
+      setUserId(data.session.user.id);
+      setSessionReady(true);
       const { error } = await supabase.auth.getUser();
       if (cancelled || !isDeletedUserError(error)) return;
       console.warn('[App] stored session belongs to a deleted account — clearing it');

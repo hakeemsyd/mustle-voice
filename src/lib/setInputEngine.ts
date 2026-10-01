@@ -13,6 +13,7 @@ import {
   normalizeSpokenNumbers,
   looksLikeStartSetCommand,
   looksLikeUndoRequest,
+  looksLikeMisheardUndo,
   needsWeightBeforeLogging,
   parseRestChangeRequest,
   parseSetReport,
@@ -20,6 +21,7 @@ import {
   plannedWeightKg,
   resolveReportedWeight,
   SET_PARSER_VERSION,
+  type KnownWeights,
   type ParsedSet,
   type RestChangeRequest,
 } from '../../supabase/functions/_shared/set-report';
@@ -51,11 +53,21 @@ export interface EngineState {
   resting: boolean;
   restRemainingSec: number | null;
   restFinishedAt: number | null;
-  statedWeight: { exerciseIndex: number; weight: number } | null;
+  statedWeight: { exerciseIndex: number; weight: number; at?: number } | null;
   units: Units;
   lastCoachLine: string | null;
+  lastTypedLog?: { text: string; at: number } | null;
   now: number;
 }
+
+export const DUPLICATE_SEND_MS = 6_000;
+
+const isDuplicateSend = (text: string, source: EngineSource, state: EngineState): boolean => {
+  if (source === 'voice') return false;
+  const previous = state.lastTypedLog;
+  if (!previous || !carriesNumbers(text)) return false;
+  return previous.text.trim().toLowerCase() === text.trim().toLowerCase() && state.now - previous.at < DUPLICATE_SEND_MS;
+};
 
 interface Hold {
   exerciseIndex: number;
@@ -67,9 +79,18 @@ export interface EngineHolds {
   done: (Hold & { set: ParsedSet }) | null;
   weightCheck: (Hold & { set: ParsedSet }) | null;
   details: Hold | null;
+  amend: (Hold & { setIndex: number; set: ParsedSet }) | null;
+  undoCheck: Hold | null;
 }
 
-export const NO_HOLDS: EngineHolds = { weight: null, done: null, weightCheck: null, details: null };
+export const NO_HOLDS: EngineHolds = {
+  weight: null,
+  done: null,
+  weightCheck: null,
+  details: null,
+  amend: null,
+  undoCheck: null,
+};
 
 export type EngineSource = 'typed' | 'voice' | 'tap';
 
@@ -94,10 +115,71 @@ export interface EngineResult {
 
 const PRONOUN_ONE = /\b(?:that|this|the|last|each|another|which)\s+one\b/gi;
 
+const ABANDON_HOLD =
+  /^(?:skip(?:\s+it)?|drop\s+(?:it|them|that)|forget\s+(?:it|them|that)|cancel(?:\s+(?:it|that))?|never\s*mind|leave\s+it|don'?t\s+log\s+(?:it|that|them))[\s.!]*$/i;
+
 const carriesNumbers = (text: string): boolean => /\d/.test(normalizeSpokenNumbers(text.replace(PRONOUN_ONE, ' ')));
+
+const EXPLICIT_START = /\b(?:start|begin|starting|kick\s+off)\b/i;
+const EXPLICIT_WEIGHT_UNIT = /\b(?:lb|lbs|pound|pounds|kg|kgs|kilo|kilos|kilogram|kilograms)\b/i;
+
+const START_VERB = /^(?:(?:ok(?:ay)?|alright|all\s+right|right|so|and|yeah|yep|now|hey)\b[\s.,!?]*)*(?:let'?s\s+)?(?:start(?:ing)?|begin(?:ning)?|do|go\s+to|jump\s+to|move\s+to|on\s+to)\b/i;
+const NEXT_THING = /^(?:the\s+|my\s+|this\s+|that\s+)?(?:next\s+)?(?:exercise|one|movement|lift)\b/i;
+
+const wordsOf = (text: string): string[] =>
+  (text ?? '')
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => (word.length > 3 && word.endsWith('s') ? word.slice(0, -1) : word));
+
+const STOPWORDS = new Set(['the', 'a', 'my', 'this', 'that', 'now', 'please', 'up', 'on', 'to']);
+
+const namesExercise = (text: string, exerciseName: string): boolean => {
+  const wanted = wordsOf(exerciseName).filter((word) => !STOPWORDS.has(word));
+  if (wanted.length === 0) return false;
+  const said = new Set(wordsOf(text));
+  return wanted.every((word) => said.has(word));
+};
+
+const startsNamedExercise = (text: string, exerciseName: string): boolean => {
+  const trimmed = text.trim();
+  const verb = trimmed.match(START_VERB);
+  if (!verb) return false;
+  const rest = trimmed.slice(verb[0].length).trim().replace(/[.!?]+$/, '').trim();
+  if (!rest) return false;
+  return NEXT_THING.test(rest) || namesExercise(rest, exerciseName);
+};
+
+const readStartSetCommand = (text: string, units: Units, exerciseName: string): { start: boolean; weight: number | null } => {
+  if (looksLikeStartSetCommand(text)) return { start: true, weight: null };
+  if (startsNamedExercise(text, exerciseName)) return { start: true, weight: null };
+  const clauses = text.split(/[.;,!?]+/).map((part) => part.trim()).filter(Boolean);
+  if (clauses.length < 2) return { start: false, weight: null };
+  let start = false;
+  let weight: number | null = null;
+  for (const clause of clauses) {
+    if (EXPLICIT_START.test(clause) && looksLikeStartSetCommand(clause)) {
+      if (start) return { start: false, weight: null };
+      start = true;
+      continue;
+    }
+    if (!EXPLICIT_WEIGHT_UNIT.test(clause)) return { start: false, weight: null };
+    const reply = parseWeightReply(clause, units);
+    if (reply?.weight == null || reply.weight <= 0 || weight !== null) return { start: false, weight: null };
+    weight = reply.weight;
+  }
+  return start && weight !== null ? { start, weight } : { start: false, weight: null };
+};
 
 const isFresh = <T extends Hold>(hold: T | null, state: EngineState): hold is T =>
   !!hold && hold.exerciseIndex === state.currentExerciseIndex && state.now - hold.at < HOLD_MS;
+
+const AMEND_HOLD_MS = 45_000;
+
+const isPending = <T extends Hold>(hold: T | null, state: EngineState): hold is T =>
+  !!hold && state.now - hold.at < AMEND_HOLD_MS;
 
 const describeRepScheme = (scheme: string): string =>
   /^\d+(\s*[-–]\s*\d+)?$/.test(scheme.trim()) ? `${scheme.trim()} reps` : scheme.trim();
@@ -144,7 +226,7 @@ interface Context {
   index: number;
   setsHere: EngineLoggedSet[];
   setNumber: number;
-  known: { lastLogged: number | null; stated: number | null; planned: number | null };
+  known: KnownWeights;
   bodyweight: boolean;
   timed: boolean;
 }
@@ -153,8 +235,9 @@ const contextOf = (state: EngineState): Context | null => {
   const exercise = state.exercises[state.currentExerciseIndex];
   if (!exercise) return null;
   const setsHere = state.loggedSets[state.currentExerciseIndex] ?? [];
-  const lastLogged =
-    [...setsHere].reverse().find((set) => set.weight !== null && set.unit !== 'seconds')?.weight ?? null;
+  const lastWeighted = [...setsHere].reverse().find((set) => set.weight !== null && set.unit !== 'seconds');
+  const lastLogged = lastWeighted?.weight ?? null;
+  const stated = state.statedWeight?.exerciseIndex === state.currentExerciseIndex ? state.statedWeight : null;
   return {
     state,
     exercise,
@@ -163,8 +246,9 @@ const contextOf = (state: EngineState): Context | null => {
     setNumber: setsHere.length + 1,
     known: {
       lastLogged,
-      stated: state.statedWeight?.exerciseIndex === state.currentExerciseIndex ? state.statedWeight.weight : null,
+      stated: stated?.weight ?? null,
       planned: plannedWeightKg(exercise.loadScheme),
+      statedIsNewer: stated?.at != null && (lastWeighted?.at == null || stated.at > lastWeighted.at),
     },
     bodyweight: isBodyweightWork(exercise.name, exercise.loadScheme),
     timed: isTimedExercise(exercise.name),
@@ -173,7 +257,7 @@ const contextOf = (state: EngineState): Context | null => {
 
 export const knownWeightFor = (state: EngineState): number | null => {
   const ctx = contextOf(state);
-  return ctx ? ctx.known.lastLogged ?? ctx.known.stated ?? ctx.known.planned : null;
+  return ctx ? resolveReportedWeight({ weight: null, reps: 0 }, ctx.known) : null;
 };
 
 const setLabel = (ctx: Context): string => `set ${ctx.setNumber} of ${ctx.exercise.sets} on ${ctx.exercise.name}`;
@@ -195,13 +279,36 @@ const settle = (
       ...holds,
       weight: { exerciseIndex: ctx.index, at: state.now, reps: set.reps, asks: previous + 1 },
     };
-    if (source === 'voice') return { handled: true, effects, holds: next };
+    const heldNote =
+      `The app is holding ${set.reps} reps for ${setLabel(ctx)} and has NOT logged them, because it has no ` +
+      `weight for this exercise yet. Nothing is saved and the workout cannot move on until they give one. ` +
+      `These reps are NOT a logged set: if they say they did not do it, or ask to undo or remove it, there is ` +
+      `nothing to undo — say so and drop the held reps. NEVER call undo_last_set here; the most recent logged ` +
+      `set belongs to an earlier exercise and deleting it would destroy real data. Do not ask if they are ` +
+      `ready for this set, do not announce the set, and do not move to another exercise.`;
+    if (source === 'voice') {
+      return {
+        handled: true,
+        effects: [
+          ...effects,
+          { type: 'tell_coach', text: `${heldNote} Ask them only for the weight, in a few words.` },
+        ],
+        holds: next,
+      };
+    }
     const text =
       previous === 0
         ? `Got ${set.reps} reps. What weight was that? Nothing logged yet.`
-        : `I still need the weight for those ${set.reps} reps before I can log ${setLabel(ctx)}. Type just the ` +
-          `weight, like "${state.units === 'imperial' ? '25 lb' : '10 kg'}", or "bodyweight".`;
-    return { handled: true, effects: [...effects, { type: 'announce', text }], holds: next };
+        : `I still need the weight for those ${set.reps} reps before I can log ${setLabel(ctx)}. Say or type just ` +
+          `the weight, like "${state.units === 'imperial' ? '25 lb' : '10 kg'}", or "bodyweight", or "skip" to drop them.`;
+    const coachNote: EngineEffect = {
+      type: 'tell_coach',
+      text:
+        `${heldNote} The app has ALREADY asked them for the weight on screen, in these words: "${text}" — ` +
+        `so do not ask again and do not rephrase it. Reply with nothing at all unless they asked you something ` +
+        `else in this message.`,
+    };
+    return { handled: true, effects: [...effects, { type: 'announce', text }, coachNote], holds: next };
   }
   const reference = ctx.known.lastLogged ?? ctx.known.planned;
   if (!weightGiven || set.weight !== null) {
@@ -274,9 +381,82 @@ export const decideSetInput = (
   const text = raw.trim();
   const ctx = contextOf(state);
   if (!text || !ctx) return { handled: false, effects: [], holds: inHolds };
+  if (isDuplicateSend(text, source, state)) {
+    return {
+      handled: true,
+      effects: [
+        {
+          type: 'announce',
+          text: `That's the same message twice within a few seconds, so I logged it once. Send it again if it really was another set.`,
+        },
+      ],
+      holds: inHolds,
+    };
+  }
   const { units } = state;
   const typed = source !== 'voice';
   let holds: EngineHolds = { ...inHolds };
+
+  if (isPending(holds.undoCheck, state)) {
+    holds = { ...holds, undoCheck: null };
+    if (isAffirmation(text)) {
+      const last = mostRecentSet(state);
+      return {
+        handled: true,
+        effects: last
+          ? [
+              { type: 'undo' },
+              {
+                type: 'tell_coach',
+                text:
+                  `The app has just removed a set. ${describeUndo(state)} The "Sets COMPLETED" count above was ` +
+                  `written BEFORE this and is now one too high. Say only that it is removed and which set is open ` +
+                  `again, using those exact numbers. Do not work the set number out yourself and do not say the ` +
+                  `workout is finished.`,
+              },
+            ]
+          : announce(source, 'Nothing is logged yet, so there is nothing to undo.'),
+        holds: NO_HOLDS,
+      };
+    }
+    if (isNegation(text)) {
+      return { handled: true, effects: announce(source, 'Okay, nothing removed.'), holds };
+    }
+  }
+
+  if (isPending(holds.amend, state) && !confirmsSetDone(text)) {
+    const held = holds.amend;
+    holds = { ...holds, amend: null };
+    if (isNegation(text)) {
+      return { handled: true, effects: announce(source, 'Okay, left as it was.'), holds };
+    }
+    const parsed =
+      parseSetReport(text, units, { allowPositional: true, version: SET_PARSER_VERSION }) ??
+      (() => {
+        const reply = parseWeightReply(text, units);
+        return reply ? { weight: reply.weight, reps: held.set.reps } : null;
+      })();
+    if (parsed) {
+      const name = state.exercises[held.exerciseIndex]?.name ?? 'that exercise';
+      const weight = parsed.weight !== null ? parsed.weight : held.set.weight;
+      const summary = describeSetForUser({ weight, reps: parsed.reps }, units);
+      return {
+        handled: true,
+        effects: [
+          { type: 'amend', exerciseIndex: held.exerciseIndex, setIndex: held.setIndex, weight, reps: parsed.reps },
+          ...announce(source, `Fixed: ${name} set ${held.setIndex + 1} is now ${summary}. Nothing new was logged.`),
+          {
+            type: 'tell_coach',
+            text:
+              `The app has ALREADY corrected this: ${name} set ${held.setIndex + 1} is now ${summary}, and nothing ` +
+              `new was logged. It is done, so never say you cannot change it, never say you have no tool for it, and ` +
+              `never ask what their screen shows. Acknowledge the corrected numbers in a few words and move on.`,
+          },
+        ],
+        holds: { ...holds, done: null, weight: null, weightCheck: null, details: null },
+      };
+    }
+  }
 
   if (isFresh(holds.weightCheck, state)) {
     const held = holds.weightCheck;
@@ -314,6 +494,48 @@ export const decideSetInput = (
     if (reply) {
       return settle(ctx, { weight: reply.weight, reps: holds.weight.reps }, true, source, { ...holds, weight: null }, []);
     }
+    if (ABANDON_HOLD.test(text)) {
+      return {
+        handled: true,
+        effects: [
+          ...announce(source, `Dropped those ${holds.weight.reps} reps — nothing logged. ${capitalize(setLabel(ctx))} is still open.`),
+          {
+            type: 'tell_coach',
+            text:
+              `They chose not to give a weight, so the app dropped the reps it was holding. Nothing was logged and ` +
+              `${setLabel(ctx)} is still open. Acknowledge in a few words and carry on.`,
+          },
+        ],
+        holds: { ...holds, weight: null },
+      };
+    }
+  }
+
+  if (looksLikeMisheardUndo(text)) {
+    const last = mostRecentSet(state);
+    const exercise = last ? state.exercises[last.exerciseIndex] : null;
+    if (!last || !exercise) {
+      return {
+        handled: true,
+        effects: announce(source, 'Nothing is logged yet, so there is nothing to undo.'),
+        holds: NO_HOLDS,
+      };
+    }
+    const described = `${exercise.name} set ${last.setIndex + 1} (${describeSetForUser(last.set, units)})`;
+    return {
+      handled: true,
+      effects: [
+        { type: 'announce', text: `Did you mean undo? That would remove ${described}. Say "yes" to remove it.` },
+        {
+          type: 'tell_coach',
+          text:
+            `That came through garbled and may have been "undo the last set". The app has ALREADY asked them ` +
+            `"Did you mean undo? That would remove ${described}." — do not ask anything of your own and do not ` +
+            `remove anything yourself. Nothing has been removed. Say nothing unless they asked something else.`,
+        },
+      ],
+      holds: { ...NO_HOLDS, undoCheck: { exerciseIndex: ctx.index, at: state.now } },
+    };
   }
 
   const restChange = parseRestChangeRequest(text, { resting: state.resting, timedExercise: ctx.timed });
@@ -336,7 +558,17 @@ export const decideSetInput = (
       return {
         handled: true,
         effects: last
-          ? [{ type: 'undo' }]
+          ? [
+              { type: 'undo' },
+              {
+                type: 'tell_coach',
+                text:
+                  `The app has just removed a set. ${describeUndo(state)} The "Sets COMPLETED" count above was ` +
+                  `written BEFORE this and is now one too high. Say only that it is removed and which set is open ` +
+                  `again, using those exact numbers. Do not work the set number out yourself and do not say the ` +
+                  `workout is finished.`,
+              },
+            ]
           : [{ type: 'announce', text: 'Nothing is logged yet, so there is nothing to undo.' }],
         holds: NO_HOLDS,
       };
@@ -384,8 +616,16 @@ export const decideSetInput = (
     }
   }
 
-  if (state.resting && looksLikeStartSetCommand(text)) {
-    return { handled: true, effects: [{ type: 'start_next_set' }], holds: { ...holds, done: null } };
+  const startSet = state.resting ? readStartSetCommand(text, state.units, state.exercises[ctx.index]?.name ?? '') : { start: false, weight: null };
+  if (startSet.start) {
+    return {
+      handled: true,
+      effects:
+        startSet.weight === null
+          ? [{ type: 'start_next_set' }]
+          : [{ type: 'remember_weight', weight: startSet.weight }, { type: 'start_next_set' }],
+      holds: { ...holds, done: null },
+    };
   }
 
   const last = mostRecentSet(state);
@@ -403,23 +643,39 @@ export const decideSetInput = (
           source,
           `Fixed: ${exerciseName} set ${last.setIndex + 1} is now ${summary}. Nothing new was logged.`,
         ),
+        {
+          type: 'tell_coach',
+          text:
+            `The app has ALREADY corrected this: ${exerciseName} set ${last.setIndex + 1} is now ${summary}, and ` +
+            `nothing new was logged. It is done, so never say you cannot change it, never ask them to confirm it, ` +
+            `and never ask what their screen shows. Acknowledge the corrected numbers in a few words and move on.`,
+        },
       ],
       holds: { ...holds, weight: null, weightCheck: null, done: null },
     };
   }
-  if (last && correction?.kind === 'unclear' && typed) {
+  if (last && correction?.kind === 'unclear') {
     const exerciseName = state.exercises[last.exerciseIndex]?.name ?? 'that exercise';
+    const saved = describeSetForUser(last.set, units);
     return {
       handled: true,
       effects: [
         {
           type: 'announce',
           text:
-            `What should ${exerciseName} set ${last.setIndex + 1} be? It's saved as ` +
-            `${describeSetForUser(last.set, units)}. Type it like "${units === 'imperial' ? '40 lb' : '20 kg'}, 8 reps".`,
+            `What should ${exerciseName} set ${last.setIndex + 1} be? It's saved as ${saved}.` +
+            (typed ? ` Type it like "${units === 'imperial' ? '40 lb' : '20 kg'}, 8 reps".` : ''),
+        },
+        {
+          type: 'tell_coach',
+          text:
+            `The app is waiting on a correction to ${exerciseName} set ${last.setIndex + 1}, currently saved as ` +
+            `${saved}. The app has ALREADY asked them "What should ${exerciseName} set ${last.setIndex + 1} be?" — ` +
+            `do not ask it again and do not add a question of your own. Whatever numbers they give next will correct ` +
+            `THAT set; it is NOT a new set. Say nothing unless they asked something else.`,
         },
       ],
-      holds,
+      holds: { ...holds, amend: { exerciseIndex: last.exerciseIndex, setIndex: last.setIndex, set: last.set, at: state.now } },
     };
   }
 
@@ -433,6 +689,7 @@ export const decideSetInput = (
     resting: state.resting,
     version: SET_PARSER_VERSION,
     confirmed: source === 'tap',
+    exerciseHasLoggedSets: (state.loggedSets[ctx.index]?.length ?? 0) > 0,
   });
 
   if (intent.kind === 'ignore') {
@@ -461,9 +718,10 @@ export const decideSetInput = (
     };
   }
 
-  if (isRestatement(latestSetTime(state.loggedSets), state.now, state.restFinishedAt)) {
+  const restatableAt = latestSetTime([state.loggedSets[ctx.index] ?? []]);
+  if (isRestatement(restatableAt, state.now, state.restFinishedAt)) {
     if (!typed) return { handled: true, effects: [], holds: { ...holds, details: null } };
-    const lastAt = latestSetTime(state.loggedSets) ?? state.now;
+    const lastAt = restatableAt ?? state.now;
     const seconds = Math.max(1, Math.round((state.now - lastAt) / 1000));
     const lastLogged = mostRecentSet(state);
     const lastName = lastLogged ? state.exercises[lastLogged.exerciseIndex]?.name : null;
@@ -517,8 +775,8 @@ export const decideConfirmTap = (draft: string, state: EngineState, holds: Engin
           {
             type: 'announce',
             text:
-              `Type the weight for those ${holds.weight.reps} reps, like "${state.units === 'imperial' ? '25 lb' : '10 kg'}", ` +
-              `or "bodyweight", then tap Confirm set.`,
+              `Say or type the weight for those ${holds.weight.reps} reps, like ` +
+              `"${state.units === 'imperial' ? '25 lb' : '10 kg'}", or "bodyweight". Say "skip" to drop them and move on.`,
           },
         ],
         holds,
@@ -570,7 +828,7 @@ export const formatRestLength = (seconds: number): string => {
 export const describeNextSetLine = (state: EngineState): string | null => {
   const ctx = contextOf(state);
   if (!ctx) return null;
-  const weight = ctx.timed ? null : ctx.known.lastLogged ?? ctx.known.stated ?? ctx.known.planned;
+  const weight = ctx.timed ? null : resolveReportedWeight({ weight: null, reps: 0 }, ctx.known);
   return (
     `Set ${ctx.setNumber} of ${ctx.exercise.sets} on ${ctx.exercise.name}: ${describeRepScheme(ctx.exercise.repScheme)}` +
     `${weight != null ? ` at ${kgToDisplayWeight(weight, state.units)}` : ''}.`

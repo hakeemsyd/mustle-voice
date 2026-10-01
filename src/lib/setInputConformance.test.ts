@@ -80,6 +80,12 @@ const DAMION_VOICE_LINES = [
   'Done forty for eight.',
   "I'm going to do ten reps at forty.",
   "I'll try for eight.",
+  "I'm gonna use 90 pounds for the rest of set.",
+  "I'm gonna use 90 pounds for the rest of the sets.",
+  'Using 90 pounds from here on.',
+  "Let's go with 90 pounds for the next few.",
+  "I'm staying at 90 pounds for the rest of this one.",
+  "Let's use 12 reps this time.",
 ];
 
 const VARIED_VOICE_LINES = [
@@ -123,6 +129,26 @@ const VARIED_VOICE_LINES = [
   'Can I go up to forty five?',
   'Wait, that was only eight.',
   'Last set, nine reps.',
+];
+
+const SEP_29_VOICE_LINES = [
+  'Okay. Start set three now.',
+  'Start set three now.',
+  "I'm ready for set three now.",
+  'The screen is still on rest.',
+  "At the end of the next set, I'm gonna go to 80 pound.",
+  'Just 10 pounds.',
+  'I remember I asked for 80 pounds, you still said 70.',
+  'No, it is not done.',
+  'Mm-hmm.',
+  'I have to get a ride.',
+  "I don't wanna go.",
+  'All right, done.',
+  'Go up to 80 pounds.',
+  'Switch to 60 lb.',
+  'Bump it to 90 pounds.',
+  'Skip.',
+  'Make it 80 pounds for the rest of these.',
 ];
 
 const EXERCISES = [
@@ -292,6 +318,26 @@ test('phone and coach agree on every one of Damion\'s spoken lines, in every wor
   assert.deepEqual(disagreements, []);
 });
 
+test('phone and coach agree on the lines from Damion\'s 29 Sep run, in every workout state', () => {
+  const disagreements: string[] = [];
+  for (const scenario of SCENARIOS) {
+    for (const line of SEP_29_VOICE_LINES) {
+      const { phone, server, phoneKind, serverKind } = run(scenario, line);
+      if (phoneKind !== serverKind) {
+        disagreements.push(`[${scenario.name}] "${line}": phone=${phoneKind} coach=${serverKind}`);
+        continue;
+      }
+      if (phoneKind === 'logged') {
+        const log = phone.effects.find((e) => e.type === 'log') as any;
+        if (log.weight !== server!.set!.weight || log.reps !== server!.set!.reps) {
+          disagreements.push(`[${scenario.name}] "${line}": phone logged ${log.weight}x${log.reps}, coach told ${server!.set!.weight}x${server!.set!.reps}`);
+        }
+      }
+    }
+  }
+  assert.deepEqual(disagreements, []);
+});
+
 test('phone and coach agree on varied spoken lines from other lifters, in every workout state', () => {
   const disagreements: string[] = [];
   for (const scenario of SCENARIOS) {
@@ -350,7 +396,16 @@ test('what the phone does with Damion\'s key spoken lines', () => {
   assert.equal(kind(2, "Let's go."), 'rest_ended');
   assert.equal(kind(3, 'Eight.'), 'logged');
   assert.equal(kind(3, 'Five.'), 'logged');
-  assert.equal(kind(4, 'Done, twelve reps.'), 'needs_confirmation');
+  assert.equal(
+    kind(4, 'Done, twelve reps.'),
+    'logged',
+    'first set of a new exercise during the transition rest: nothing on it to restate, so it logs first time',
+  );
+  assert.equal(
+    kind(2, 'Done, twelve reps.'),
+    'needs_confirmation',
+    'same exercise with a set already on it: still ambiguous, still confirmed first',
+  );
   assert.equal(kind(5, 'Done, ten reps.'), 'needs_weight');
   const pushdown = run(SCENARIOS[1], 'Done, ten reps.').phone.effects.find((e) => e.type === 'log') as any;
   assert.equal(pushdown.weight, 18.1, 'the reps-only report takes the weight on the card');

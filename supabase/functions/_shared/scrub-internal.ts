@@ -12,11 +12,15 @@ const INTERNAL_PHRASES = [
   'function call',
   'confirm token',
   'confirmation token',
+  'token mismatch',
+  'token',
+  'preview call',
+  'tool result',
   'dynamic variable',
   'system prompt',
 ];
 
-const TOOL_REFERENCE = /\b(?:my|the|this|that|its|our)\s+(?:\w+\s+){0,2}tools?\b/i;
+const TOOL_REFERENCE = /\b(?:my|the|this|that|its|our|a|an|any|no|another|other)\s+(?:\w+\s+){0,2}tools?\b/i;
 
 const SNAKE_CASE = /\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/;
 

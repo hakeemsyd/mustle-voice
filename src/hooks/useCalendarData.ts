@@ -202,7 +202,7 @@ export const useTodayCalendar = (): TodayCalendarData => {
         fetchPlanAndLogs(userId),
         supabase
           .from("food_log")
-          .select("id, description, calories, protein_g, carbs_g, fat_g, at")
+          .select("id, description, calories, protein_g, carbs_g, fat_g, at, meal_type")
           .eq("user_id", userId)
           .gte("at", startOfDay.toISOString())
           .order("at", { ascending: true }),
@@ -232,7 +232,7 @@ export const useTodayCalendar = (): TodayCalendarData => {
       setState({
         loading: false,
         session:
-          today && !completedLog
+          today
             ? {
                 planSessionId: today.id,
                 focus: today.focus,
@@ -270,6 +270,7 @@ export const useTodayCalendar = (): TodayCalendarData => {
           carbsG: row.carbs_g ?? 0,
           fatG: row.fat_g ?? 0,
           at: row.at,
+          mealType: row.meal_type ?? null,
         })),
       });
     })();

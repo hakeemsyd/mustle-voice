@@ -18,6 +18,7 @@ import {
   parseWeightReply,
   plannedWeightKg,
   STRICT_REPORTS_FROM_VERSION,
+  resolveReportedWeight,
   type ParsedSet,
   type SetReportUnits,
 } from './set-report.ts';
@@ -170,6 +171,13 @@ type CurrentExercise = NonNullable<LiveSessionSnapshot['currentExercise']>;
 const lastLoggedWeightOf = (current: CurrentExercise): number | null =>
   [...current.loggedSets].reverse().find((s) => s.weight != null && s.unit !== 'seconds')?.weight ?? null;
 
+const statedWeightIsNewerThanLastSet = (current: CurrentExercise): boolean => {
+  const statedAt = current.statedWeightAt ?? null;
+  if (statedAt == null || current.statedWeight == null) return false;
+  const lastAt = [...current.loggedSets].reverse().find((s) => s.weight != null && s.unit !== 'seconds')?.at ?? null;
+  return lastAt == null || statedAt > lastAt;
+};
+
 const isBodyweightWorkOf = (current: CurrentExercise): boolean =>
   String(current.loadScheme ?? '').trim().toLowerCase() === 'bodyweight' || isBodyweightExercise(current.name);
 
@@ -281,9 +289,12 @@ const logged = (
   const setNumber = current.loggedSets.length + 1;
   const finishesExercise = setNumber >= current.totalSets;
   const next = snapshot.upcomingExercises[0] ?? null;
+  const remaining = current.totalSets - setNumber;
   const after = !finishesExercise
-    ? 'The rest timer has started on screen. Confirm this set in one short line and say rest has started. Do not ' +
-      'name or announce the next set yet; the app prompts you for it when rest ends.'
+    ? `${remaining} more set${remaining === 1 ? '' : 's'} still to go on ${current.name}, so the exercise is NOT ` +
+      'finished and the workout is NOT over — never say it is. The rest timer has started on screen. Confirm this ' +
+      'set in one short line and say rest has started. Do not name or announce the next set yet; the app prompts ' +
+      'you for it when rest ends.'
     : next
       ? restsBetweenExercises
         ? `That was the last set of ${current.name}, so the app has moved on to ${next} and started a rest timer ` +
@@ -317,7 +328,15 @@ export const resolveTurnSetOutcome = (input: TurnSetOutcomeInput): TurnSetOutcom
 
   const lastLogged = lastLoggedWeightOf(current);
   const planned = strict ? plannedWeightKg(current.loadScheme) : null;
-  const knownWeight = lastLogged ?? current.statedWeight ?? planned ?? null;
+  const knownWeight = resolveReportedWeight(
+    { weight: null, reps: 0 },
+    {
+      lastLogged,
+      stated: current.statedWeight ?? null,
+      planned,
+      statedIsNewer: statedWeightIsNewerThanLastSet(current),
+    },
+  );
   const bodyweightWork = isBodyweightWorkOf(current);
 
   const settle = (set: ParsedSet, weightGiven: boolean): TurnSetOutcome => {
@@ -468,6 +487,7 @@ export const resolveTurnSetOutcome = (input: TurnSetOutcomeInput): TurnSetOutcom
     confirmsBareReps: input.confirmsBareReps,
     resting,
     version,
+    exerciseHasLoggedSets: (current.loggedSets?.length ?? 0) > 0,
   });
 
   const reportsASet = intent.kind === 'log' || intent.kind === 'unconfirmed';
@@ -513,11 +533,17 @@ export const resolveTurnSetOutcome = (input: TurnSetOutcomeInput): TurnSetOutcom
   }
 
   if (intent.kind === 'stated_weight') {
+    const stale =
+      knownWeight != null && Math.abs(knownWeight - intent.weight) > 0.05
+        ? ` The weight shown for ${current.name} in the live block above (${formatWeight(knownWeight, units)}) is now ` +
+          `OUT OF DATE — the app has already moved the card to ${formatWeight(intent.weight, units)}. Never say ` +
+          `${formatWeight(knownWeight, units)} back to them; every set from here is at ${formatWeight(intent.weight, units)}.`
+        : '';
     return {
       kind: 'stated_weight',
       note:
         `${TURN_NOTE_HEADER}\n- The app noted ${formatWeight(intent.weight, units)} as their working weight for ` +
-        `${current.name}. NOTHING was logged; the "Sets COMPLETED" count above is exact and set ` +
+        `${current.name}.${stale} NOTHING was logged; the "Sets COMPLETED" count above is exact and set ` +
         `${setNumber} has not happened yet. ${NOT_LOGGED_RULE}`,
     };
   }

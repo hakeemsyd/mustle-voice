@@ -49,3 +49,22 @@ test('empty and whitespace input is returned as-is', () => {
 test('a single clean sentence survives', () => {
   assert.equal(scrubInternalLanguage('Rest is on.'), 'Rest is on.');
 });
+
+test('2 Oct: "I don\'t have a tool for that" never reaches the user', () => {
+  const said =
+    "I don't have a tool to correct that one since it's already logged. " +
+    'But I\'ve got it, set 3 was 100 pounds for 11 reps, not 80.';
+  const out = scrubInternalLanguage(said);
+  assert.doesNotMatch(out, /tool/i);
+  assert.match(out, /set 3 was 100 pounds/);
+});
+
+test("'no tool', 'any tool' and 'another tool' are all internal", () => {
+  for (const line of [
+    "There's no tool for that.",
+    "I don't have any tool to change it.",
+    'I would need another tool for that.',
+  ]) {
+    assert.equal(scrubInternalLanguage(`${line} Rest is on.`), 'Rest is on.', line);
+  }
+});

@@ -48,6 +48,7 @@ export interface LiveSessionSnapshot {
     loadScheme: string | null;
     loggedSets: LoggedSet[];
     statedWeight?: number | null;
+    statedWeightAt?: number | null;
   } | null;
   upcomingExercises: string[];
   earlierExercises?: { name: string; totalSets: number; loggedSets: LoggedSet[] }[];
@@ -72,7 +73,7 @@ interface SnapshotInput {
   ended: boolean;
   paused: boolean;
   elapsedSec: number;
-  statedWeight?: { exerciseIndex: number; weight: number } | null;
+  statedWeight?: { exerciseIndex: number; weight: number; at?: number } | null;
   restOverrideSec?: number | null;
   restByExercise?: Record<string, number> | null;
   savedRestByExercise?: Record<string, number> | null;
@@ -114,6 +115,8 @@ export const buildLiveSessionSnapshot = (input: SnapshotInput): LiveSessionSnaps
           loggedSets: input.loggedSets[input.currentExerciseIndex] ?? [],
           statedWeight:
             input.statedWeight?.exerciseIndex === input.currentExerciseIndex ? input.statedWeight.weight : null,
+          statedWeightAt:
+            input.statedWeight?.exerciseIndex === input.currentExerciseIndex ? input.statedWeight.at ?? null : null,
         }
       : null,
     earlierExercises: input.exercises

@@ -18,6 +18,7 @@ import { greetingIsFreshToday as isGreetingFreshToday } from '../lib/greetingFre
 import { alignGreetingToTimeBand } from '../lib/greetingTimeOfDay';
 import { useLocalDayRollover } from './useLocalDayRollover';
 import { useActiveSessionContext } from '../session/ActiveSessionContext';
+import { useSharedVoiceSession } from '../session/VoiceSessionProvider';
 import { resolveTrainingDays } from '../../supabase/functions/_shared/training-schedule';
 import {
   describeSetCount,
@@ -316,6 +317,9 @@ export function useHomeData(): HomeData {
   const activeSession = useActiveSessionContext();
   const workoutRunningRef = useRef(false);
   workoutRunningRef.current = !!activeSession.target && !activeSession.ended;
+  const voice = useSharedVoiceSession();
+  const voiceLiveRef = useRef(false);
+  voiceLiveRef.current = voice.status === 'connected' || voice.status === 'connecting';
 
   // Runs once, in parallel with the real fetch below — an AsyncStorage read resolves in a few ms,
   // long before any network round-trip, so this reliably wins the race and replaces the plain
@@ -512,17 +516,15 @@ export function useHomeData(): HomeData {
       let todaySession: TodaySession | null = null;
       let greetingSession: { focus: string | null; exerciseNames: string[] } | null = null;
       if (plan || overrideSession) {
-        const sessionToday = completedLog
-          ? null
-          : resolveTodaySession(
-              (plan?.plan_session ?? []) as any[],
-              (workoutRes.data ?? []) as any[],
-              new Date(),
-              restDayDates,
-              overrideSession,
-              planStartDate,
-              resolveTrainingDays(plan, (plan?.plan_session ?? []) as any[]),
-            );
+        const sessionToday = resolveTodaySession(
+          (plan?.plan_session ?? []) as any[],
+          (workoutRes.data ?? []) as any[],
+          new Date(),
+          restDayDates,
+          overrideSession,
+          planStartDate,
+          resolveTrainingDays(plan, (plan?.plan_session ?? []) as any[]),
+        );
         todaySession = sessionToday
           ? {
               hasSession: true,
@@ -616,7 +618,7 @@ export function useHomeData(): HomeData {
         coachMessage = DEFAULT_COACH_MESSAGE_NO_PLAN;
       } else if (greetingInFlightRef.current) {
         coachMessage = DEFAULT_COACH_MESSAGE_HAS_PLAN;
-      } else if (workoutRunningRef.current) {
+      } else if (workoutRunningRef.current || voiceLiveRef.current) {
         coachMessage =
           lastGreeting?.content && !looksLikeMetaLeak(lastGreeting.content)
             ? sanitizeCoachMessage(lastGreeting.content)

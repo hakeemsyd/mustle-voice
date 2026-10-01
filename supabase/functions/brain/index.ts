@@ -2,7 +2,7 @@ import { createClient } from 'npm:@supabase/supabase-js@2';
 import { runBrainTurn } from '../_shared/brain-orchestrator.ts';
 import { APP_LINE_MODALITY, replayHistory } from '../_shared/replay-history.ts';
 import { dropLeadingConcession, dropSelfCorrection } from '../_shared/humanize.ts';
-import { buildSystemPrompt, callModel, MESSAGE_HISTORY_LIMIT } from '../_shared/brain-config.ts';
+import { buildSystemPrompt, callModelForMode, MESSAGE_HISTORY_LIMIT } from '../_shared/brain-config.ts';
 import {
   buildContextBlock,
   markFollowupAskedIfRaised,
@@ -10,6 +10,7 @@ import {
   startOfLocalDayUtc,
 } from '../_shared/brain-context.ts';
 import { describeEarlierInConversation, loadConversationHistory } from '../_shared/conversation-history.ts';
+import { FOOD_TURN_NOTE, looksLikeFoodTurn, offTopicTurnNote } from '../_shared/food-intent.ts';
 import {
   amendSetFromServer,
   createHandlers,
@@ -64,6 +65,8 @@ import {
   buildLiveSessionSnapshot,
   describeEarlierExercises,
   describeLiveSessionSnapshot,
+  NO_LIVE_SESSION_NOTE,
+  resolveTurnMode,
   LIVE_STATE_MAX_AGE_MS,
 } from '../_shared/live-session-format.ts';
 
@@ -291,8 +294,10 @@ Deno.serve(async (req) => {
           : chatSetOutcome
             ? chatSetOutcome.note
             : liveStrengthSession && cueName === null
-              ? describeTypedTurnSetOutcome(restActive, messageText)
-              : null;
+              ? `${describeTypedTurnSetOutcome(restActive, messageText)}\n\n${offTopicTurnNote(looksLikeFoodTurn(messageText))}`
+              : cueName === null && looksLikeFoodTurn(messageText)
+                ? FOOD_TURN_NOTE
+                : null;
     const typedRestRequest =
       !chatSetOutcome &&
       !dispute &&
@@ -305,10 +310,11 @@ Deno.serve(async (req) => {
     const requiredAsk = dispute ? null : chatSetOutcome?.requiredAsk ?? (typedRestRequest ? TYPED_REST_REQUEST_ASK : null);
     const resumeNote = cueName === SESSION_START_CUE ? describeResumedStart(liveSnapshot, turnUnits) : null;
     const cueFacts = describeCueFacts(cueName, liveSnapshot, turnUnits);
-    const fullContextBlock = [contextBlock, earlierNote, turnLiveBlock || null, typedSetNote, resumeNote, cueFacts]
+    const fullContextBlock = [contextBlock, earlierNote, turnLiveBlock || NO_LIVE_SESSION_NOTE, typedSetNote, resumeNote, cueFacts]
       .filter(Boolean)
       .join('\n\n');
-    const systemPrompt = buildSystemPrompt((history ?? []).length > 0, fullContextBlock, 'text', isDailyGreeting);
+    const turnMode = resolveTurnMode(turnLiveBlock);
+    const systemPrompt = buildSystemPrompt((history ?? []).length > 0, fullContextBlock, 'text', isDailyGreeting, turnMode);
 
     const { error: askedLogError } = await supabase.from('message').insert({
       user_id: userId,
@@ -322,7 +328,7 @@ Deno.serve(async (req) => {
     });
     if (askedLogError) console.error('[brain] failed to log the user turn:', askedLogError.message);
 
-    const result = await runBrainTurn({ systemPrompt, messages, handlers, callModel });
+    const result = await runBrainTurn({ systemPrompt, messages, handlers, callModel: callModelForMode(turnMode) });
 
     const injuryOnFile = contextHasInjuryGate(fullContextBlock);
     const userReportedSet =

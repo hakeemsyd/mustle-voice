@@ -41,6 +41,7 @@ const REST_SAVE_FAILED_MESSAGE =
 // new set. Generous because logging a set immediately starts a rest period, so a real second set
 // of the same load and reps cannot physically arrive inside this window.
 const DUPLICATE_SET_WINDOW_MS = 10_000;
+const REPEAT_ANNOUNCEMENT_MS = 15_000;
 
 const LIVE_STATE_HEARTBEAT_MS = 5 * 60_000;
 
@@ -278,14 +279,14 @@ interface ActiveSessionValue {
   submitFeedback: (note: string, tags: string[]) => Promise<void>;
   askCoach: (text: string) => Promise<void>;
   noteSetLogged: (summary: string, followUp?: string | null) => void;
-  announce: (text: string, options?: { persist?: boolean }) => void;
+  announce: (text: string, options?: { persist?: boolean; allowRepeat?: boolean }) => void;
   describeForCoach: () => string | undefined;
   publishLiveState: () => Promise<unknown>;
   setPaused: (paused: boolean) => void;
   clear: () => void;
 }
 
-type StatedWeight = { exerciseIndex: number; weight: number };
+type StatedWeight = { exerciseIndex: number; weight: number; at: number };
 
 const ActiveSessionCtx = createContext<ActiveSessionValue | null>(null);
 
@@ -312,6 +313,7 @@ export const ActiveSessionProvider = ({
   const [loggedSets, setLoggedSets] = useState<LoggedSet[][]>([]);
   const [lastSetLoggedAt, setLastSetLoggedAt] = useState<number | null>(null);
   const [statedWeight, setStatedWeight] = useState<StatedWeight | null>(null);
+  const lastAnnouncementRef = useRef<{ text: string; at: number } | null>(null);
   const [resting, setResting] = useState(false);
   const [restKey, setRestKey] = useState(0);
   const [restTargetSec, setRestTargetSec] = useState(DEFAULT_REST_SEC);
@@ -332,6 +334,8 @@ export const ActiveSessionProvider = ({
   const [coachThinking, setCoachThinking] = useState(false);
   const [messages, setMessages] = useState<SessionThreadMessage[]>([]);
   const [elapsedSec, setElapsedSec] = useState(0);
+  const elapsedSecRef = useRef(0);
+  elapsedSecRef.current = elapsedSec;
   const [startedAt, setStartedAt] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
   const [minimized, setMinimized] = useState(false);
@@ -629,8 +633,14 @@ export const ActiveSessionProvider = ({
   // elapsed time too — it's what the log's duration_sec records either way.
   useEffect(() => {
     if (!target || ended || paused) return;
-    const id = setInterval(() => setElapsedSec((s) => s + 1), 1000);
-    return () => clearInterval(id);
+    const anchor = Date.now();
+    const base = elapsedSecRef.current;
+    const tick = () => setElapsedSec(base + Math.floor((Date.now() - anchor) / 1000));
+    const id = setInterval(tick, 1000);
+    return () => {
+      tick();
+      clearInterval(id);
+    };
   }, [target, ended, paused]);
 
   // A workout that finishes by logging or skipping its last exercise never calls endSession, and
@@ -983,7 +993,7 @@ export const ActiveSessionProvider = ({
       .slice(restored[restoredIndex]?.length ?? 0)
       .reverse()
       .find((set) => set.weight != null && set.unit !== "seconds")?.weight;
-    if (removedWeight != null) setStatedWeight({ exerciseIndex: restoredIndex, weight: removedWeight });
+    if (removedWeight != null) setStatedWeight({ exerciseIndex: restoredIndex, weight: removedWeight, at: Date.now() });
     setLoggedSets(restored);
     setRestReasonLabel(null);
     setEnded(false);
@@ -1005,7 +1015,7 @@ export const ActiveSessionProvider = ({
   );
 
   const rememberStatedWeight = useCallback((exerciseIndex: number, weight: number) => {
-    setStatedWeight({ exerciseIndex, weight });
+    setStatedWeight({ exerciseIndex, weight, at: Date.now() });
   }, []);
 
   const skipExercise = useCallback(() => {
@@ -1471,7 +1481,11 @@ export const ActiveSessionProvider = ({
   );
 
   const announce = useCallback(
-    (text: string, options?: { persist?: boolean }) => {
+    (text: string, options?: { persist?: boolean; allowRepeat?: boolean }) => {
+      const now = Date.now();
+      const previous = lastAnnouncementRef.current;
+      if (!options?.allowRepeat && previous?.text === text && now - previous.at < REPEAT_ANNOUNCEMENT_MS) return;
+      lastAnnouncementRef.current = { text, at: now };
       setCoachMessage(text);
       appendMessage("coach", text);
       if (options?.persist !== false) persistChatLine(userIdRef.current, "coach", text);
@@ -1482,7 +1496,7 @@ export const ActiveSessionProvider = ({
 
   const noteSetLogged = useCallback(
     (summary: string, followUp?: string | null) => {
-      announce(`Logged — ${summary}.${followUp ? ` ${followUp}` : ""}`);
+      announce(`Logged — ${summary}.${followUp ? ` ${followUp}` : ""}`, { allowRepeat: true });
     },
     [announce],
   );

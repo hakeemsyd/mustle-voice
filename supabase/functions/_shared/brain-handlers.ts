@@ -38,7 +38,7 @@ import {
   straightenQuotes,
   type RestChangeRequest,
 } from './set-report.ts';
-import { TURN_NOTE_HEADER } from './turn-set-outcome.ts';
+import { TURN_NOTE_HEADER, lastLoggedSetOf } from './turn-set-outcome.ts';
 import {
   CONSULTATION_TOPICS,
   missingConsultationTopics,
@@ -479,17 +479,30 @@ export const amendSetFromServer = async (
 
 export type UndoLastSetResult = 'undone' | 'not_confirmed' | 'no_session' | 'no_set_to_undo';
 
+export type RemovedSet = { exerciseName: string; setNumber: number; totalSets: number };
+
+export const describeRemovedSet = (state: any): RemovedSet | null => {
+  const last = lastLoggedSetOf(state);
+  if (!last) return null;
+  const exercise = Array.isArray(state?.exercises) ? state.exercises[last.exerciseIndex] : null;
+  const totalSets = typeof exercise?.sets === 'number' ? exercise.sets : last.setIndex + 1;
+  return { exerciseName: last.exerciseName, setNumber: last.setIndex + 1, totalSets };
+};
+
 export const undoLastLiveSet = async (
   supabase: any,
   userId: string,
-): Promise<{ status: UndoLastSetResult; setsLoggedNow: number | null }> => {
+): Promise<{ status: UndoLastSetResult; setsLoggedNow: number | null; removed: RemovedSet | null }> => {
   const live = await readLiveSession(supabase, userId);
-  if (!live.running) return { status: 'no_session', setsLoggedNow: null };
+  if (!live.running) return { status: 'no_session', setsLoggedNow: null, removed: null };
   const before = totalLoggedSets(live.state);
-  if (before === 0) return { status: 'no_set_to_undo', setsLoggedNow: 0 };
+  if (before === 0) return { status: 'no_set_to_undo', setsLoggedNow: 0, removed: null };
+  const removed = describeRemovedSet(live.state);
   await writeAppAction(supabase, userId, 'undo_last_set', {});
   const landed = await waitForLiveState(supabase, userId, (state) => totalLoggedSets(state) < before);
-  return landed ? { status: 'undone', setsLoggedNow: before - 1 } : { status: 'not_confirmed', setsLoggedNow: before };
+  return landed
+    ? { status: 'undone', setsLoggedNow: before - 1, removed }
+    : { status: 'not_confirmed', setsLoggedNow: before, removed: null };
 };
 
 export const resolveDispute = async (
@@ -864,7 +877,7 @@ const resolveTodaysExercises = async (
 export type UndoLock = 'already_removed' | 'count_correct';
 
 const REMOVE_A_SET =
-  /\b(?:undo|remove|delete|scratch|cancel|erase|take\s+(?:it\s+|that\s+(?:one\s+)?|this\s+(?:one\s+)?|one\s+)?(?:off|out|away)|get\s+rid\s+of|drop\s+(?:it|that|the|one))\b/i;
+  /\b(?:undo|remove|delete|scratch|cancel|erase|take\s+(?:it\s+|that\s+(?:one\s+)?|this\s+(?:one\s+)?|one\s+|(?:the|that|my)\s+(?:last\s+)?(?:set|one)\s+)?(?:off|out|away)|get\s+rid\s+of|drop\s+(?:it|that|the|one))\b/i;
 const COUNT_IS_WRONG =
   /\b(?:twice|double[-\s]?(?:counted|logged)?|extra\s+set|one\s+too\s+many|too\s+many\s+sets|didn'?t\s+do|did\s+not\s+do|haven'?t\s+(?:done|finished|started)|have\s+not\s+(?:done|finished)|never\s+did|only\s+(?:did|done|finished)|should\s+be\s+(?:on\s+)?set|i'?m\s+(?:still\s+|only\s+)?on\s+set|(?:count|counter)\s+is\s+wrong|wrong\s+(?:count|set\s+number))\b/i;
 
@@ -1294,14 +1307,27 @@ export const createHandlers = (
         };
       }
 
-      const tokenKey = JSON.stringify({
-        d: String(input.description ?? '').trim().toLowerCase(),
-        c: input.calories,
-        p: input.protein_g,
-        cb: input.carbs_g,
-        f: input.fat_g,
-      });
-      if (!input.confirm || !(await verifyConfirmToken(confirmSecret, 'log_food', tokenKey, input.confirm_token))) {
+      const tokenKey = JSON.stringify({ c: Math.round(Number(input.calories ?? 0) / 10) });
+      const tokenOk = await verifyConfirmToken(confirmSecret, 'log_food', tokenKey, input.confirm_token);
+      if (!input.confirm || !tokenOk) {
+        const freshToken = await issueConfirmToken(confirmSecret, 'log_food', tokenKey);
+        if (input.confirm) {
+          return {
+            status: 'confirm_rejected',
+            description: input.description,
+            calories: input.calories,
+            protein_g: input.protein_g,
+            carbs_g: input.carbs_g,
+            fat_g: input.fat_g,
+            confirm_token: freshToken,
+            instruction:
+              'NOT SAVED YET, and this is NOT a reason to ask the user anything — they already agreed. ' +
+              'Call log_food ONE more time right now with confirm:true, this exact confirm_token, and ' +
+              'these exact same field values, changing nothing. Say NOTHING to the user about this ' +
+              'step: never mention tokens, confirming again, retrying, or anything going wrong. Once ' +
+              'that call returns "logged", reply only with a short natural acknowledgement of the meal.',
+          };
+        }
         return {
           status: 'preview',
           description: input.description,
@@ -1309,13 +1335,14 @@ export const createHandlers = (
           protein_g: input.protein_g,
           carbs_g: input.carbs_g,
           fat_g: input.fat_g,
-          confirm_token: await issueConfirmToken(confirmSecret, 'log_food', tokenKey),
+          confirm_token: freshToken,
           instruction:
             'NOTHING HAS BEEN SAVED. Read the estimate back to the user in one short line (the food, ' +
             'the calories and the macros), say plainly that it is your estimate, and wait for them to ' +
             'agree in their NEXT message. Only then call log_food again with the same fields plus ' +
-            'confirm:true and this exact confirm_token. Never say "logged" until that second call ' +
-            'returns status "logged".',
+            'confirm:true and this exact confirm_token — copy the description and every macro across ' +
+            'unchanged, because the token is bound to those exact values. Never say "logged" until ' +
+            'that second call returns status "logged".',
         };
       }
 
@@ -1857,10 +1884,16 @@ export const createHandlers = (
       return {
         status: 'undone',
         sets_logged_now: result.setsLoggedNow,
-        instruction:
-          'The most recent logged set is removed from the card and from the saved workout. Confirm ' +
-          'that in one short line and name the set that is next. Ask for corrected reps or weight only if ' +
-          'they said those numbers were wrong.',
+        instruction: result.removed
+          ? `Removed ${result.removed.exerciseName} set ${result.removed.setNumber}. Set ` +
+            `${result.removed.setNumber} of ${result.removed.totalSets} on ${result.removed.exerciseName} is open ` +
+            `again. Say exactly those numbers in one short line. Do NOT work the set number out yourself and do ` +
+            `not use any set number from earlier in this conversation — the card reads ` +
+            `${result.removed.setNumber} of ${result.removed.totalSets} now. Ask for corrected reps or weight ` +
+            `only if they said those numbers were wrong.`
+          : 'The most recent logged set is removed from the card and from the saved workout. Confirm ' +
+            'that in one short line. Do not name a set number, because you do not have one here. Ask for ' +
+            'corrected reps or weight only if they said those numbers were wrong.',
       };
     },
 

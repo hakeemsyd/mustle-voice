@@ -11,6 +11,7 @@ export interface FoodLogEntry {
   carbsG: number;
   fatG: number;
   at: string;
+  mealType: "breakfast" | "lunch" | "dinner" | "snack" | null;
 }
 
 const MACRO_COLUMNS: Record<MacroTarget["key"], string> = {
@@ -29,6 +30,7 @@ function mapFoodRows(rows: any[]): FoodLogEntry[] {
     carbsG: row.carbs_g ?? 0,
     fatG: row.fat_g ?? 0,
     at: row.at,
+    mealType: row.meal_type ?? null,
   }));
 }
 
@@ -86,7 +88,7 @@ export function useFuelData() {
           .maybeSingle(),
         supabase
           .from("food_log")
-          .select("id, description, calories, protein_g, carbs_g, fat_g, at")
+          .select("id, description, calories, protein_g, carbs_g, fat_g, at, meal_type")
           .eq("user_id", userId)
           .gte("at", dayStart.toISOString())
           .lt("at", dayEnd.toISOString())

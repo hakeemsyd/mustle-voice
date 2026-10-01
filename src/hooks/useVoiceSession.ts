@@ -11,6 +11,9 @@ import {
 import { supabase } from '../lib/supabase';
 import { setCachedDisplayName } from '../lib/profileStore';
 import { stripNonSpeechArtifacts } from '../lib/elevenLabsVoice';
+
+const VOICE_CHAT_REASSERT_MS = [400, 1500, 4000];
+import { isStopCommand } from '../lib/stopCommand';
 import type { OrbState } from '../components/VoiceOrb';
 
 export interface SpokenMessage {
@@ -77,50 +80,6 @@ const releaseMicrophone = async (): Promise<void> => {
 };
 
 export const SYSTEM_CUE_PREFIX = '[[SYSTEM_CUE]]';
-
-// A handful of short, deliberate stop phrases — matched as a WHOLE clause, never as a
-// substring anywhere in a longer sentence. "Done" is deliberately excluded: mid-workout it
-// means "done with this set," not "end the voice session" — see parseSetReport.
-const STOP_PHRASES = new Set([
-  'stop',
-  'stop talking',
-  'bye',
-  'goodbye',
-  'bye bye',
-  'hang up',
-  'quiet',
-  'be quiet',
-  'close',
-  "that's all",
-  "that'll be all",
-]);
-
-// Stripped one at a time off the front of the final clause — "okay so that's all" needs both
-// "okay" and "so" gone before it reduces to a listed phrase. Kept separate from STOP_PHRASES
-// itself: these are never a stop command on their own, only noise in front of one.
-const LEADING_FILLER_WORDS = new Set(['ok', 'okay', 'alright', 'so', 'well', 'please']);
-
-const isStopCommand = (text: string): boolean => {
-  // Confirmed live: "Okay, so that's all. Bye" never matched — the comma after "Okay" blocked
-  // the old single prefix-regex, and the fixed sentence-final-punctuation strip only looked at
-  // the very end of the whole utterance, never noticing the "Bye" was its own clause. Splitting
-  // into clauses and checking only the LAST one is also more correct on intent: if the user
-  // talks past an earlier "bye" ("bye, actually wait, one more thing"), that shouldn't end the
-  // call either.
-  const clauses = text
-    .toLowerCase()
-    .split(/[.!?]+/)
-    .map((c) => c.trim())
-    .filter(Boolean);
-  const last = clauses[clauses.length - 1];
-  if (!last) return false;
-
-  let words = last.replace(/,/g, ' ').split(/\s+/).filter(Boolean);
-  while (words.length > 1 && LEADING_FILLER_WORDS.has(words[0])) {
-    words = words.slice(1);
-  }
-  return STOP_PHRASES.has(words.join(' '));
-};
 
 // If the user hasn't said anything in this long, the conversation is almost certainly over —
 // close it rather than let the agent keep listening/checking in indefinitely (confirmed live:
@@ -372,7 +331,8 @@ export const useVoiceSession = (
   }, [reconnectTrigger]);
 
   useEffect(() => {
-    if (status === 'connected') {
+    if (status !== 'connected') return;
+    {
       hasConnectedRef.current = true;
       setVoiceDropped(false);
       setIdleClosed(false);
@@ -387,14 +347,18 @@ export const useVoiceSession = (
       // VoIP-style app wants. Applied on `connected` rather than right after startSession(), which
       // returns before the SDK has configured anything: mutating the audio session mid-setup, while
       // WebRTC was still bringing up its capture unit, is what left the mic open but deaf.
-      AudioSession.setAppleAudioConfiguration({ audioMode: 'voiceChat' }).catch((err) =>
-        console.warn('[voice] failed to set voiceChat audio mode:', err),
-      );
+      const applyVoiceChat = () =>
+        AudioSession.setAppleAudioConfiguration({ audioMode: 'voiceChat' }).catch((err) =>
+          console.warn('[voice] failed to set voiceChat audio mode:', err),
+        );
+      void applyVoiceChat();
+      const reassert = VOICE_CHAT_REASSERT_MS.map((delay) => setTimeout(() => void applyVoiceChat(), delay));
       void describeAudioSessionState().then((state) => {
         if (state && /activationCount=-/.test(state)) {
           console.warn('[voice] audio session activation count went negative, the mic may be deaf:', state);
         }
       });
+      return () => reassert.forEach(clearTimeout);
     }
   }, [status]);
 

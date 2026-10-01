@@ -50,7 +50,7 @@ test('a partial session from an earlier day lapses and the rotation moves on', (
 });
 
 test('a session completed earlier today yields a rest day, not a repeat', () => {
-  const now = new Date();
+  const now = new Date(2026, 7, 11, 12, 0, 0);
   const loggedMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
   const sessions = [session('push', 0, null), session('pull', 1, null)];
   const logs = [{ at: loggedMinutesAgo.toISOString(), plan_session_id: 'push', status: 'completed' }];

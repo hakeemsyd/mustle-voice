@@ -17,6 +17,23 @@ import { describeSetProvenance, type ProvenancedSet } from './set-dispute.ts';
 // threshold, not just a "stop treating it as live" cutoff.
 export const LIVE_STATE_MAX_AGE_MS = 60 * 60 * 1000;
 
+export type TurnMode = 'live' | 'default';
+
+const RUNNING_STATUS = /- Status: (?:training|resting|paused)\b/;
+
+export const resolveTurnMode = (liveBlock: string | null | undefined): TurnMode =>
+  liveBlock && RUNNING_STATUS.test(liveBlock) ? 'live' : 'default';
+
+export const NO_LIVE_SESSION_NOTE =
+  'LIVE WORKOUT STATE\n' +
+  '- NO workout is in progress right now. There is no current exercise, no set in play, and no rest ' +
+  'timer running.\n' +
+  '- Any sets, exercises, weights or rest talk earlier in this conversation belongs to a session ' +
+  'that has already ended. Do not continue it, do not ask which exercise they are on, do not ' +
+  'announce a set or a rest, and do not ask them to slow down.\n' +
+  '- If they want to train, they start a workout from Home; until then, answer whatever they ' +
+  'actually asked about.';
+
 type LoggedSet = ProvenancedSet;
 
 interface SessionExercise {
@@ -45,6 +62,7 @@ export interface LiveSessionSnapshot {
     loadScheme: string | null;
     loggedSets: LoggedSet[];
     statedWeight?: number | null;
+    statedWeightAt?: number | null;
   } | null;
   upcomingExercises: string[];
   earlierExercises?: { name: string; totalSets: number; loggedSets: LoggedSet[] }[];
@@ -69,7 +87,7 @@ export interface SnapshotInput {
   ended: boolean;
   paused: boolean;
   elapsedSec: number;
-  statedWeight?: { exerciseIndex: number; weight: number } | null;
+  statedWeight?: { exerciseIndex: number; weight: number; at?: number } | null;
   restOverrideSec?: number | null;
   restByExercise?: Record<string, number> | null;
   savedRestByExercise?: Record<string, number> | null;
@@ -107,6 +125,8 @@ export const buildLiveSessionSnapshot = (input: SnapshotInput): LiveSessionSnaps
           loggedSets: input.loggedSets[input.currentExerciseIndex] ?? [],
           statedWeight:
             input.statedWeight?.exerciseIndex === input.currentExerciseIndex ? input.statedWeight.weight : null,
+          statedWeightAt:
+            input.statedWeight?.exerciseIndex === input.currentExerciseIndex ? input.statedWeight.at ?? null : null,
         }
       : null,
     earlierExercises: input.exercises
@@ -124,7 +144,7 @@ export const buildLiveSessionSnapshot = (input: SnapshotInput): LiveSessionSnaps
       restOverrideSec: input.restOverrideSec,
       savedRestByExercise: input.savedRestByExercise,
     }),
-    lastSetLoggedAt: latestSetTime(input.loggedSets),
+    lastSetLoggedAt: latestSetTime([input.loggedSets?.[input.currentExerciseIndex] ?? []]),
     restFinishedAt: typeof input.restFinishedAt === 'number' ? input.restFinishedAt : null,
   };
 };

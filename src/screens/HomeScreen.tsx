@@ -29,6 +29,7 @@ import { getMomentumLine, getTimeBand, type TimeBand } from "./homeFormat";
 import { subscribeToHomeRefresh } from "../lib/homeRefreshBridge";
 import { titleCase } from "../lib/textFormat";
 import { startOfLocalDay } from "../lib/calendarDate";
+import { fetchResumableWorkout } from "../lib/resumeWorkout";
 
 const getGreeting = (band: TimeBand, name: string | null): string =>
   name ? `${band}, ${name}.` : `${band}.`;
@@ -118,9 +119,11 @@ export const HomeScreen = () => {
   };
 
   const resumable = activeSession.target ? null : todaySession?.resumable ?? null;
-  const handleContinue = () => {
+  const handleContinue = async () => {
     if (!resumable) return;
-    activeSession.start({ type: "strength", planSessionId: resumable.planSessionId }, resumable.resume);
+    const fresh = userId ? await fetchResumableWorkout(userId, resumable.planSessionId) : null;
+    const resume = fresh?.resume ?? resumable.resume;
+    activeSession.start({ type: "strength", planSessionId: resumable.planSessionId }, resume);
     navigation.navigate("ActiveSession");
   };
 
